@@ -62,8 +62,18 @@ the controller handle. Polling never refreshes session activity. Terminal boot f
 the reservation; transport/health errors return 502 `not_executed` without destroying it.
 Terminating pods retain quota until confirmed gone. Jail and profile images require SHA-256 pins.
 
+`GET /v1/sessions/{id}/artifacts` lists `{path, bytes, sha256}` for an already-booted,
+owned session. `GET /v1/sessions/{id}/artifacts/{path}` streams a file with `sha256`,
+`Content-Length` and `Accept-Ranges: bytes` headers. Encode the entire relative path as
+one URL segment (`nested/file.txt` → `nested%2Ffile.txt`). Range is forwarded unchanged;
+C7 supplies 200/206 or 416 with `Content-Range`. Traversal is refused. Listings are capped
+at 1 MiB; one active download per controller holds its lease until body completion/drop,
+returning 503 at capacity without blocking listings or general API admission. Downloads
+reuse the 30-second C7 HTTP deadline, stream without collecting the file, and refresh
+in-memory activity as chunks pass. Artifact requests do not boot unstarted sessions.
+
 Deployment also requires a C7-capable `jails.image`, the `vm-runner-jail` service account,
-KVM/TUN device resources, a writable node image cache, and controller RBAC for pod
+`smarter-devices/kvm` and `smarter-devices/net_tun` device resources, a writable node image cache, and controller RBAC for pod
 get/list/create/patch/delete and Secret create. Nodes must permit the pod's namespaced
 IP-forwarding/rp-filter sysctls. Low-port binding uses `ip_unprivileged_port_start=0`, not an
 extra capability. Pods drop ALL capabilities and add only NET_ADMIN/SETUID/SETGID, with

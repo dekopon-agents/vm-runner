@@ -2,6 +2,7 @@ use super::*;
 use poem_openapi::{OpenApi, Union, param::Path};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
+pub(crate) mod artifacts;
 
 #[derive(Debug, thiserror::Error)]
 pub(super) enum Error {
@@ -9,6 +10,10 @@ pub(super) enum Error {
     NotFound,
     #[error("jail boot failed")]
     Boot,
+    #[error("artifact path refused")]
+    Forbidden,
+    #[error("artifact service unavailable")]
+    Unavailable,
     #[error("invalid jail response or configuration")]
     Protocol,
     #[error("invalid projected token")]
@@ -65,6 +70,8 @@ impl From<reqwest::Error> for Error {
 }
 #[derive(ApiResponse)]
 enum ResponseError {
+    #[oai(status = 403)]
+    Forbidden(PlainText<String>),
     #[oai(status = 404)]
     NotFound(PlainText<String>),
     #[oai(status = 503)]
@@ -78,6 +85,8 @@ impl From<Error> for ResponseError {
         let body = PlainText(error.to_string());
         match error {
             Error::NotFound => Self::NotFound(body),
+            Error::Forbidden => Self::Forbidden(body),
+            Error::Unavailable => Self::Unavailable(body),
             _ => Self::Upstream(Json(refused(&error.to_string()))),
         }
     }
@@ -214,12 +223,11 @@ fn checked(response: reqwest::Response, status: u16) -> Result<reqwest::Response
     Ok(response)
 }
 impl Controller {
-    pub(super) async fn send(
+    async fn request(
         &self,
         method: reqwest::Method,
         url: url::Url,
-        exec: Option<&Exec>,
-    ) -> Result<reqwest::Response, Error> {
+    ) -> Result<reqwest::RequestBuilder, Error> {
         let jails = self.config.jails.as_ref().ok_or(Error::Boot)?;
         let bytes = super::pods::read(&jails.token_file).await?;
         let token = std::str::from_utf8(&bytes)?.trim();
@@ -237,6 +245,15 @@ impl Controller {
         for (name, value) in headers {
             request = request.header(name, value);
         }
+        Ok(request)
+    }
+    pub(super) async fn send(
+        &self,
+        method: reqwest::Method,
+        url: url::Url,
+        exec: Option<&Exec>,
+    ) -> Result<reqwest::Response, Error> {
+        let mut request = self.request(method, url).await?;
         if let Some(exec) = exec {
             request = request.json(exec);
         }

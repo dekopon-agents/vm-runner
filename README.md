@@ -60,4 +60,25 @@ escape between the check and open. Large reads may return fewer bytes than reque
 its JSON envelope within the 1 MiB frame cap; continue at the returned byte count until `eof`.
 A ping returns `{"ok":true}`. Other platforms print `linux only` and exit 2.
 
+## Release builds
+
+CI builds every package binary for native x86_64 and aarch64 Linux musl, then builds and
+smoke-tests the runtime image without pushing. To build locally on either Linux architecture:
+
+```sh
+sudo apt-get install musl-tools
+bash ci/build-release.sh "$(uname -m)-unknown-linux-musl"
+```
+
+The `dist/` directory contains target-suffixed binaries and individual SHA-256 checksums.
+The Dockerfile takes a prebuilt `vm-runnerd` in its build context, uses digest-pinned Debian
+trixie-slim with CA certificates, and defaults to uid/gid 1000; no compiler is included.
+
+Maintainer-created annotated `v<package-version>` tags must point at current `main` HEAD.
+The release workflow waits up to 20 minutes for that commit's CI checks, builds on both native
+architectures, pushes untagged per-arch manifests, and publishes an attested multi-arch index at
+`ghcr.io/dekopon-agents/vm-runner:<package-version>` plus binaries/checksums in a GitHub release.
+Only the publish job can sign attestations or create a release; image jobs can push package
+content but do not publish version tags. No workflow creates Git tags.
+
 Licensed under either of Apache-2.0 or MIT at your option.

@@ -30,6 +30,40 @@ jobs:
       - run: cargo machete
       - run: cargo deny --all-features --locked check
 
+  image:
+    name: Image (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: amd64
+            target: x86_64-unknown-linux-musl
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+            target: aarch64-unknown-linux-musl
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: bash ci/build-release.sh '${{ matrix.target }}'
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Build and smoke-test the native image without pushing
+        run: |
+          set -euo pipefail
+          (cd dist && sha256sum -c ./*.sha256)
+          mkdir image-context
+          cp Dockerfile image-context/
+          cp 'dist/vm-runnerd-${{ matrix.target }}' image-context/vm-runnerd
+          docker buildx build --platform 'linux/${{ matrix.arch }}' --load \
+            --tag vm-runner:ci image-context
+          [[ "$(docker image inspect vm-runner:ci --format '{{.Config.User}}')" == '1000:1000' ]]
+          docker run --rm vm-runner:ci --help
+          docker run --rm -v "$PWD/examples:/config:ro" vm-runner:ci check --config /config/vm-runner.yaml
+
   conformance:
     name: OTLP conformance
     runs-on: ubuntu-24.04

@@ -52,7 +52,7 @@ shapes:
 profiles:
   test:
     shape: small
-    image: test@sha256:abc
+    image: test@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
     browser: headless
     idleSeconds: 60
     maxSeconds: 120

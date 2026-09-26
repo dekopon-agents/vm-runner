@@ -12,7 +12,7 @@ shapes:
 profiles:
   travel:
     shape: pw-1c1g
-    image: <guest rootfs OCI ref @sha256>
+    image: ghcr.io/dekopon-agents/vm-runner-guest@sha256:0000000000000000000000000000000000000000000000000000000000000000 # replace with published digest
     browser: headless
     idleSeconds: 300
     maxSeconds: 1800

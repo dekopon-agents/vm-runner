@@ -1,5 +1,6 @@
 #![cfg(unix)]
 use super::*;
+mod resilience;
 use base64::{
     Engine,
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
@@ -17,6 +18,10 @@ struct Fixture {
     calls: Arc<AtomicUsize>,
     create_pause: Arc<tokio::sync::Semaphore>,
     create_started: Arc<tokio::sync::Notify>,
+    kube_status: Arc<AtomicUsize>,
+    health_status: Arc<AtomicUsize>,
+    patches: Arc<AtomicUsize>,
+    pod_status: Arc<Mutex<Option<Value>>>,
 }
 impl Fixture {
     async fn new() -> Self {
@@ -26,7 +31,7 @@ impl Fixture {
         tokio::fs::write(&token_file, &token).await.unwrap();
         let mut config: Config =
             serde_yaml_ng::from_str(include_str!("../../../examples/vm-runner.yaml")).unwrap();
-        config.jails = Some(serde_json::from_value(json!({"namespace":"jails","image":"runner@sha256:abc","imageCacheHostPath":"/var/cache/images","controllerAudience":"vm-runner-jail","controllerSubject":"system:serviceaccount:runner:controller","tokenFile":token_file})).unwrap());
+        config.jails = Some(serde_json::from_value(json!({"namespace":"jails","image":format!("runner@sha256:{}", "a".repeat(64)),"imageCacheHostPath":"/var/cache/images","controllerAudience":"vm-runner-jail","controllerSubject":"system:serviceaccount:runner:controller","tokenFile":token_file})).unwrap());
         let captured = Arc::new(Mutex::new(Vec::new()));
         let captures = Arc::clone(&captured);
         let (service, mut mock) = tower_test::mock::pair::<
@@ -38,6 +43,12 @@ impl Fixture {
         let pause = Arc::clone(&create_pause);
         let create_started = Arc::new(tokio::sync::Notify::new());
         let started = Arc::clone(&create_started);
+        let kube_status = Arc::new(AtomicUsize::new(200));
+        let kube_code = Arc::clone(&kube_status);
+        let patches = Arc::new(AtomicUsize::new(0));
+        let patch_count = Arc::clone(&patches);
+        let pod_status = Arc::new(Mutex::new(None::<Value>));
+        let current_status = Arc::clone(&pod_status);
         tasks.spawn(async move {
             let mut pod = Value::Null;
             let mut deleted = false;
@@ -46,7 +57,15 @@ impl Fixture {
                 let uri = request.uri().clone();
                 let body = request.into_body().collect().await.unwrap().to_bytes();
                 let mut status = 200;
+                if method == "GET" && kube_code.load(Ordering::SeqCst) == 0 {
+                    send.send_error(std::io::Error::from(std::io::ErrorKind::TimedOut));
+                    continue;
+                }
                 let response = match method.as_str() {
+                    "GET" if kube_code.load(Ordering::SeqCst) != 200 => {
+                        status = u16::try_from(kube_code.load(Ordering::SeqCst)).unwrap();
+                        json!({"kind":"Status","apiVersion":"v1","code":status,"status":"Failure","reason":"ServiceUnavailable","message":"transient"})
+                    }
                     "POST" if uri.path().ends_with("/pods") => {
                         started.notify_one();
                         let _permit = pause.acquire().await.unwrap();
@@ -54,6 +73,7 @@ impl Fixture {
                         captures.lock().unwrap().push(pod.clone());
                         pod["metadata"]["uid"] = json!("pod-uid");
                         pod["metadata"]["resourceVersion"] = json!("10");
+                        pod["metadata"]["creationTimestamp"] = serde_json::to_value(k8s_openapi::jiff::Timestamp::now()).unwrap();
                         pod.clone()
                     }
                     "POST" if uri.path().ends_with("/secrets") => {
@@ -65,12 +85,18 @@ impl Fixture {
                     }
                     "GET" if uri.path().ends_with("/pods") => json!({"apiVersion":"v1","kind":"PodList","metadata":{},"items":[]}),
                     "PATCH" => {
+                        patch_count.fetch_add(1, Ordering::SeqCst);
                         let patch: Value = serde_json::from_slice(&body).unwrap();
                         pod["metadata"]["annotations"][super::super::ACTIVE] = patch["metadata"]["annotations"][super::super::ACTIVE].clone();
                         pod.clone()
                     }
                     "GET" if deleted => { status = 404; json!({"kind":"Status","apiVersion":"v1","code":404,"status":"Failure","reason":"NotFound","message":"gone"}) }
-                    "GET" => pod.clone(),
+                    "GET" => {
+                        if let Some(status) = &*current_status.lock().unwrap() {
+                            pod["status"] = status.clone();
+                        }
+                        pod.clone()
+                    },
                     "DELETE" => { deleted = true; pod.clone() },
                     _ => panic!("unexpected Kubernetes method"),
                 };
@@ -81,6 +107,8 @@ impl Fixture {
         let port = listener.local_addr().unwrap().port();
         let calls = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&calls);
+        let health_status = Arc::new(AtomicUsize::new(200));
+        let health = Arc::clone(&health_status);
         tasks.spawn(async move {
             let jobs = Arc::new(AtomicUsize::new(0));
             loop {
@@ -88,22 +116,24 @@ impl Fixture {
                 let token_file = token_file.clone();
                 let counter = Arc::clone(&counter);
                 let jobs = Arc::clone(&jobs);
+                let health = Arc::clone(&health);
                 let service = hyper::service::service_fn(move |request: hyper::Request<hyper::body::Incoming>| {
                     let token_file = token_file.clone();
                     let counter = Arc::clone(&counter);
                     let jobs = Arc::clone(&jobs);
+                    let health = Arc::clone(&health);
                     async move {
                         let token = tokio::fs::read_to_string(token_file).await.unwrap();
                         assert_eq!(request.headers()["authorization"], format!("Bearer {}", token.trim()));
                         let mut response = hyper::Response::builder();
                         let body = match request.uri().path() {
-                            "/healthz" => "ok".into(),
+                            "/healthz" => { response = response.status(u16::try_from(health.load(Ordering::SeqCst)).unwrap()); "ok".into() },
                             "/exec" => {
                                 let bytes = request.into_body().collect().await.unwrap().to_bytes();
                                 let body: Value = serde_json::from_slice(&bytes).unwrap();
                                 assert_eq!(body["argv"], json!(["echo","ok"]));
                                 assert_eq!(body["stdin"], "input");
-                                assert_eq!(body["deadlineMs"], 25);
+                                assert_eq!(body["deadlineMs"], 1000);
                                 if counter.fetch_add(1, Ordering::SeqCst) == 0 {
                                     response = response.status(202);
                                     json!({"outcome":"unknown","jobId":"remote-id"}).to_string()
@@ -132,6 +162,10 @@ impl Fixture {
             calls,
             create_pause,
             create_started,
+            kube_status,
+            health_status,
+            patches,
+            pod_status,
         }
     }
     fn session(&self) -> String {
@@ -155,7 +189,7 @@ fn exec() -> Exec {
     Exec {
         argv: vec!["echo".into(), "ok".into()],
         stdin: Some("input".into()),
-        deadline_ms: 25,
+        deadline_ms: 1000,
     }
 }
 #[tokio::test]
@@ -181,18 +215,9 @@ async fn lazy_pods_proxy_exec_and_jobs_only_for_the_owner() {
         f.controller.job(SUBJECT, &pending.job_id).await.unwrap(),
         JobResponse::Ok(Json(JobStatus::Running(_)))
     ));
-    let JobResponse::Pending(Json(unknown)) =
-        f.controller.job(SUBJECT, &pending.job_id).await.unwrap()
-    else {
-        panic!("unknown job")
-    };
-    assert_eq!(unknown.job_id, pending.job_id);
     assert!(matches!(
         f.controller.job(SUBJECT, &pending.job_id).await.unwrap(),
-        JobResponse::Ok(Json(JobStatus::Complete(ExecResult::Executed(Executed {
-            exit_code: 0,
-            ..
-        }))))
+        JobResponse::Ok(Json(JobStatus::Complete(ExecResult::NotExecuted(_))))
     ));
     let token_file = &f.controller.config.jails.as_ref().unwrap().token_file;
     let old = tokio::fs::read_to_string(token_file).await.unwrap();
@@ -216,6 +241,16 @@ async fn lazy_pods_proxy_exec_and_jobs_only_for_the_owner() {
         ),
         (7, 65536, "err", true)
     );
+    f.tasks.shutdown().await;
+}
+#[tokio::test]
+async fn pod_spec_golden_has_0400_credentials_readonly_root_60s_grace_console_limit_and_net_tun() {
+    let mut f = Fixture::new().await;
+    let id = f.session();
+    assert!(matches!(
+        f.controller.exec(SUBJECT, &id, &exec()).await.unwrap(),
+        ExecResponse::Pending(_)
+    ));
     {
         let captured = f.captured.lock().unwrap();
         assert_eq!(captured.len(), 2);
@@ -224,7 +259,7 @@ async fn lazy_pods_proxy_exec_and_jobs_only_for_the_owner() {
         assert_eq!(c["resources"]["requests"], c["resources"]["limits"]);
         assert_eq!(
             c["resources"]["limits"],
-            json!({"cpu":"1","memory":"1152Mi","smarter-devices/kvm":"1","smarter-devices/net-tun":"1"})
+            json!({"cpu":"1","memory":"1152Mi","smarter-devices/kvm":"1","smarter-devices/net_tun":"1"})
         );
         assert_eq!(
             c["securityContext"]["capabilities"],
@@ -232,6 +267,25 @@ async fn lazy_pods_proxy_exec_and_jobs_only_for_the_owner() {
         );
         assert_eq!(pod["spec"]["securityContext"]["fsGroup"], 1000);
         assert_eq!(c["securityContext"]["allowPrivilegeEscalation"], false);
+        assert_eq!(c["securityContext"]["readOnlyRootFilesystem"], true);
+        assert_eq!(pod["spec"]["terminationGracePeriodSeconds"], 60);
+        for volume in pod["spec"]["volumes"].as_array().unwrap() {
+            for kind in ["secret", "projected", "configMap"] {
+                if let Some(source) = volume.get(kind) {
+                    assert_eq!(source["defaultMode"], 0o400);
+                }
+            }
+        }
+        assert_eq!(
+            pod["spec"]["volumes"][2],
+            json!({"name":"console","emptyDir":{"sizeLimit":"16Mi"}})
+        );
+        assert!(
+            c["volumeMounts"]
+                .as_array()
+                .unwrap()
+                .contains(&json!({"name":"console","mountPath":"/run/vm-runner/console"}))
+        );
         assert_eq!(
             pod["spec"]["securityContext"]["seccompProfile"]["type"],
             "RuntimeDefault"
@@ -273,7 +327,13 @@ async fn lazy_pods_proxy_exec_and_jobs_only_for_the_owner() {
         );
         assert!(config.conflicts().is_empty());
     }
-    f.controller.jobs.lock().unwrap().extend((0..1023).map(|n| {
+    f.tasks.shutdown().await;
+}
+#[tokio::test]
+async fn per_session_job_cap_still_admits_another_session() {
+    let mut f = Fixture::new().await;
+    let id = f.session();
+    f.controller.jobs.lock().unwrap().extend((0..64).map(|n| {
         (
             n.to_string(),
             Job {
@@ -288,7 +348,28 @@ async fn lazy_pods_proxy_exec_and_jobs_only_for_the_owner() {
         panic!("capacity")
     };
     assert_eq!(refused.reason, "job_capacity");
-    assert_eq!(f.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(f.calls.load(Ordering::SeqCst), 0);
+    let Created::New(Json(other)) = f
+        .controller
+        .create(
+            SUBJECT,
+            Create {
+                profile: "travel".into(),
+                name: Some("other".into()),
+            },
+        )
+        .unwrap()
+    else {
+        panic!("other session admitted")
+    };
+    assert!(matches!(
+        f.controller
+            .exec(SUBJECT, &other.session_id, &exec())
+            .await
+            .unwrap(),
+        ExecResponse::Pending(_)
+    ));
+    assert_eq!(f.calls.load(Ordering::SeqCst), 1);
     f.controller.reap(u64::MAX).await;
     assert!(!f.controller.sessions.lock().unwrap().is_empty());
     f.controller.reap(u64::MAX).await;
@@ -296,7 +377,7 @@ async fn lazy_pods_proxy_exec_and_jobs_only_for_the_owner() {
     f.tasks.shutdown().await;
 }
 #[tokio::test]
-async fn boot_failure_never_dispatches_exec_and_releases_the_reservation() {
+async fn invalid_token_never_dispatches_exec_but_keeps_the_reservation() {
     let mut f = Fixture::new().await;
     let id = f.session();
     let file = &f.controller.config.jails.as_ref().unwrap().token_file;
@@ -309,14 +390,12 @@ async fn boot_failure_never_dispatches_exec_and_releases_the_reservation() {
         )
     );
     tokio::fs::write(file, token).await.unwrap();
-    let ExecResponse::Complete(Json(ExecResult::NotExecuted(refused))) =
-        f.controller.exec(SUBJECT, &id, &exec()).await.unwrap()
-    else {
-        panic!("boot refusal")
-    };
-    assert_eq!(refused.reason, "boot_failure");
+    assert!(matches!(
+        f.controller.exec(SUBJECT, &id, &exec()).await,
+        Err(Error::Token)
+    ));
     assert_eq!(f.calls.load(Ordering::SeqCst), 0);
-    assert!(f.controller.sessions.lock().unwrap().is_empty());
+    assert!(!f.controller.sessions.lock().unwrap()[&id].retiring);
     f.tasks.shutdown().await;
 }
 #[tokio::test]

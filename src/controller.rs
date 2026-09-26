@@ -113,6 +113,7 @@ pub(crate) struct Controller {
     jail_port: u16,
     jobs: Mutex<HashMap<String, proxy::Job>>,
     pub(super) execution: Arc<tokio::sync::Semaphore>,
+    pub(super) reads: Arc<tokio::sync::Semaphore>,
 }
 pub(super) fn now() -> u64 {
     SystemTime::now()
@@ -241,6 +242,7 @@ impl Controller {
             jail_port: 8080,
             jobs: Mutex::new(HashMap::new()),
             execution: Arc::new(tokio::sync::Semaphore::new(1)),
+            reads: Arc::new(tokio::sync::Semaphore::new(1)),
         })
     }
     pub(crate) fn create(&self, subject: &str, request: Create) -> poem::Result<Created> {
@@ -250,10 +252,11 @@ impl Controller {
         }
         let mut sessions = self.sessions.lock().expect("session registry poisoned");
         if let Some(existing) = sessions
-            .values()
+            .values_mut()
             .find(|s| !s.retiring && s.subject == subject && s.body.name == name)
         {
             return Ok(if existing.body.profile == request.profile {
+                existing.active = now();
                 Created::Existing(Json(existing.body.clone()))
             } else {
                 Created::Conflict(Json(Conflict {

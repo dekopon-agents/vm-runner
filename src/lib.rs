@@ -183,6 +183,7 @@ impl Requests {
         let _idle = self.admission.acquire().await?;
         if let Some(controller) = &self.controller {
             let _executed = controller.execution.acquire().await?;
+            let _read = controller.reads.acquire().await?;
         }
         let _reaped = self.reaper_drain.acquire().await?;
         Ok(())
@@ -234,14 +235,19 @@ fn endpoint(
         .data(std::sync::Arc::clone(&state))
         .around(move |ep, mut req| {
             let state = std::sync::Arc::clone(&state);
-            // Slow C4 operations have one separate worker: kube I/O never owns API admission.
+            // Slow C4 operations never own API admission. GETs have their own worker
+            // so a cold boot or long exec cannot block job/artifact reads.
             // Poem matches literal path segments before percent-decoding captured parameters.
             let admission = match &state.controller {
                 Some(controller)
                     if req.uri().path().starts_with("/v1/sessions/")
                         || req.uri().path().starts_with("/v1/jobs/") =>
                 {
-                    std::sync::Arc::clone(&controller.execution)
+                    std::sync::Arc::clone(if req.method() == poem::http::Method::GET {
+                        &controller.reads
+                    } else {
+                        &controller.execution
+                    })
                 }
                 _ => std::sync::Arc::clone(&admission),
             };
@@ -286,11 +292,18 @@ fn endpoint(
                                 if req.method() == poem::http::Method::POST {
                                     let body = tokio::time::timeout(
                                         std::time::Duration::from_secs(30),
-                                        req.take_body().into_bytes_limit(1_048_576),
+                                        req.take_body()
+                                            .into_bytes_limit(controller::proxy::BODY_LIMIT),
                                     )
                                     .await
-                                    .map_err(poem::error::RequestTimeout)??;
-                                    req.set_body(body);
+                                    .map_err(poem::error::RequestTimeout)?;
+                                    match body {
+                                        Ok(body) => req.set_body(body),
+                                        Err(poem::error::ReadBodyError::PayloadTooLarge) => {
+                                            return Ok(controller::proxy::oversized());
+                                        }
+                                        Err(error) => return Err(error.into()),
+                                    }
                                 }
                                 ep.call(req).await
                             }

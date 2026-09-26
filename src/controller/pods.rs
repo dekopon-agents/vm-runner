@@ -8,6 +8,8 @@ use serde::Deserialize;
 use serde_json::json;
 use std::{collections::BTreeMap, path::Path, time::Duration};
 use tokio::io::AsyncReadExt;
+#[cfg(test)]
+mod tests;
 
 pub(super) async fn read(path: &Path) -> Result<Vec<u8>, Error> {
     let mut bytes = Vec::new();
@@ -20,6 +22,30 @@ pub(super) async fn read(path: &Path) -> Result<Vec<u8>, Error> {
         return Err(Error::Protocol);
     }
     Ok(bytes)
+}
+// Kubernetes timestamps survive controller restarts and repeated exec attempts: neither
+// retries nor a long image fetch reset or consume the guest's separate boot window.
+fn boot_window(pod: &Pod, fetch_seconds: u64, now: u64) -> Result<(), Error> {
+    let finished = pod
+        .status
+        .as_ref()
+        .and_then(|s| s.init_container_statuses.as_ref())
+        .and_then(|statuses| statuses.iter().find(|s| s.name == "fetch"))
+        .and_then(|s| s.state.as_ref())
+        .and_then(|s| s.terminated.as_ref());
+    let (start, limit) = if let Some(finished) = finished {
+        if finished.exit_code != 0 {
+            return Err(Error::Boot);
+        }
+        (finished.finished_at.as_ref(), 60)
+    } else {
+        (pod.metadata.creation_timestamp.as_ref(), fetch_seconds)
+    };
+    let start = start.ok_or(Error::Protocol)?.0.as_second();
+    if now.saturating_sub(u64::try_from(start)?) >= limit {
+        return Err(Error::Boot);
+    }
+    Ok(())
 }
 struct Starting<'a>(&'a Controller, &'a str);
 impl Drop for Starting<'_> {
@@ -40,12 +66,9 @@ impl Controller {
         self.sessions
             .lock()
             .expect("session registry poisoned")
-            .iter_mut()
+            .iter()
             .find(|(_, s)| !s.retiring && s.subject == subject && s.body.session_id == id)
-            .map(|(key, session)| {
-                session.active = now();
-                (key.clone(), session.clone())
-            })
+            .map(|(key, session)| (key.clone(), session.clone()))
             .ok_or(Error::NotFound)
     }
     pub(super) fn address(&self, pod: &Pod) -> Result<Option<url::Url>, Error> {
@@ -116,7 +139,7 @@ impl Controller {
             .pod
             .clone()
             .unwrap_or_else(|| format!("vm-runner-{}", session.body.session_id));
-        let result = tokio::time::timeout(Duration::from_secs(60), async {
+        let result = async {
             let mut pod = if session.pod.is_some() {
                 self.pods.get(&name).await?
             } else {
@@ -150,16 +173,25 @@ impl Controller {
                 {
                     return Err(Error::Boot);
                 }
-                if let Some(address) = self.address(&pod)? {
+                let address = self.address(&pod)?;
+                if let Some(address) = address {
                     let response = self
                         .send(reqwest::Method::GET, address.join("healthz")?, None)
                         .await?;
                     match response.status().as_u16() {
                         200 => break address,
-                        503 => (),
                         status => return Err(Error::Status(status)),
                     }
                 }
+                boot_window(
+                    &pod,
+                    self.config
+                        .jails
+                        .as_ref()
+                        .ok_or(Error::Boot)?
+                        .fetch_timeout_seconds,
+                    now(),
+                )?;
                 tick.tick().await;
                 pod = self.pods.get(&name).await?;
             };
@@ -175,19 +207,14 @@ impl Controller {
                 return Err(Error::Boot);
             }
             Ok(address)
-        })
+        }
         .instrument(tracing::info_span!(
             "vm_runner.boot",
             vm_runner.session_id = session.body.session_id
         ))
         .await;
         match result {
-            Ok(Ok(address)) => Ok(address),
-            failure => {
-                let error = match failure {
-                    Ok(Err(error)) => error,
-                    _ => Error::Boot,
-                };
+            Err(Error::Boot) => {
                 let registered = {
                     let mut sessions = self.sessions.lock().expect("session registry poisoned");
                     let stored = sessions.get_mut(key).ok_or(Error::NotFound)?;
@@ -204,8 +231,9 @@ impl Controller {
                         .expect("job registry poisoned")
                         .retain(|_, job| job.session != session.body.session_id);
                 }
-                Err(error)
+                Err(Error::Boot)
             }
+            other => other,
         }
     }
     async fn manifests(&self, session: &Session, name: &str) -> Result<(Pod, Secret), Error> {
@@ -276,12 +304,12 @@ impl Controller {
         let compute = json!({"cpu":shape.vcpus.to_string(), "memory":format!("{}Mi", u64::from(shape.memory.get())+128)});
         let mut resources = compute.clone();
         resources["smarter-devices/kvm"] = json!("1");
-        resources["smarter-devices/net-tun"] = json!("1");
+        resources["smarter-devices/net_tun"] = json!("1");
         let pod = serde_json::from_value(
             json!({"apiVersion":"v1", "kind":"Pod", "metadata":{"name":name,
             "labels":{SESSION:session.body.session_id, PROFILE:session.body.profile,SUBJECT_HASH:hash},
             "annotations":{SUBJECT:session.subject, NAME:session.body.name, CREATED:session.created.to_string(), ACTIVE:now().to_string()}},
-            "spec":{"restartPolicy":"Never", "serviceAccountName":"vm-runner-jail", "automountServiceAccountToken":false,
+            "spec":{"restartPolicy":"Never", "terminationGracePeriodSeconds":60, "serviceAccountName":"vm-runner-jail", "automountServiceAccountToken":false,
                 "securityContext":{"fsGroup":1000, "seccompProfile":{"type":"RuntimeDefault"}, "sysctls":[
                     {"name":"net.ipv4.ip_forward","value":"0"}, {"name":"net.ipv4.ip_unprivileged_port_start","value":"0"}, {"name":"net.ipv4.conf.all.rp_filter","value":"1"}, {"name":"net.ipv4.conf.default.rp_filter","value":"1"}]},
                 "initContainers":[{"name":"fetch", "image":jails.image, "args":["fetch-image","--digest",profile.image,"--cache","/images"], "resources":{"requests":compute,"limits":compute},
@@ -289,11 +317,12 @@ impl Controller {
                     "volumeMounts":[{"name":"images","mountPath":"/images"}]}],
                 "containers":[{"name":"jail","image":jails.image,"args":["jail","--config","/config/config.json","--profile",session.body.profile,"--session",session.body.session_id],
                     "env":[{"name":"OTEL_RESOURCE_ATTRIBUTES","value":format!("vm_runner.subject={}",session.subject)}],
-                    "securityContext":{"runAsUser":0,"runAsGroup":1000,"privileged":false,"allowPrivilegeEscalation":false,"capabilities":{"drop":["ALL"],"add":["NET_ADMIN","SETUID","SETGID"]}},
+                    "securityContext":{"runAsUser":0,"runAsGroup":1000,"privileged":false,"allowPrivilegeEscalation":false,"readOnlyRootFilesystem":true,"capabilities":{"drop":["ALL"],"add":["NET_ADMIN","SETUID","SETGID"]}},
                     "resources":{"requests":resources,"limits":resources}, "readinessProbe":{"tcpSocket":{"port":8080},"periodSeconds":1},
-                    "volumeMounts":[{"name":"images","mountPath":"/images","readOnly":true},{"name":"runtime","mountPath":"/run/vm-runner"},{"name":"config","mountPath":"/config","readOnly":true},{"name":"api","mountPath":"/kube","readOnly":true}]}],
+                    "volumeMounts":[{"name":"images","mountPath":"/images","readOnly":true},{"name":"runtime","mountPath":"/run/vm-runner"},{"name":"console","mountPath":"/run/vm-runner/console"},{"name":"config","mountPath":"/config","readOnly":true},{"name":"api","mountPath":"/kube","readOnly":true}]}],
                 "volumes":[{"name":"images","hostPath":{"path":jails.image_cache_host_path,"type":"DirectoryOrCreate"}},
                     {"name":"runtime","emptyDir":{"sizeLimit":format!("{}Mi",u64::from(shape.disk.get())+64)}},
+                    {"name":"console","emptyDir":{"sizeLimit":"16Mi"}},
                     {"name":"config","secret":{"secretName":name,"defaultMode":256}},
                     {"name":"api","projected":{"defaultMode":256,"sources":[{"serviceAccountToken":{"path":"token","expirationSeconds":3600}},{"configMap":{"name":"kube-root-ca.crt","items":[{"key":"ca.crt","path":"ca.crt"}]}}]}}]}}),
         )?;

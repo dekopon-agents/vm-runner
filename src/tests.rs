@@ -1,4 +1,5 @@
 use super::*;
+mod controller_contracts;
 mod controller_resilience;
 use aws_lc_rs::{
     encoding::AsDer,
@@ -147,7 +148,7 @@ async fn authenticated_oversized_session_id_is_exported_once_and_capped() {
     client
         .post(format!("/v1/sessions/{}/exec", "a".repeat(5000)))
         .header("Authorization", format!("Bearer {token}"))
-        .body_json(&json!({"argv":["true"],"deadlineMs":1}))
+        .body_json(&json!({"argv":["true"],"deadlineMs":1000}))
         .send()
         .with_subscriber(
             tracing_subscriber::registry()

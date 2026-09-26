@@ -25,6 +25,8 @@ pub(super) enum Error {
     Json(serde_json::error::Category),
     #[error("invalid UTF-8")]
     Utf8(#[from] std::str::Utf8Error),
+    #[error("invalid pod timestamp")]
+    Timestamp(#[from] std::num::TryFromIntError),
     #[error("invalid pod address")]
     Address(std::net::AddrParseError),
     #[error("invalid pod URL")]
@@ -68,7 +70,7 @@ enum ResponseError {
     #[oai(status = 503)]
     Unavailable(PlainText<String>),
     #[oai(status = 502)]
-    Upstream(PlainText<String>),
+    Upstream(Json<ExecResult>),
 }
 impl From<Error> for ResponseError {
     fn from(error: Error) -> Self {
@@ -76,7 +78,7 @@ impl From<Error> for ResponseError {
         let body = PlainText(error.to_string());
         match error {
             Error::NotFound => Self::NotFound(body),
-            _ => Self::Upstream(body),
+            _ => Self::Upstream(Json(refused(&error.to_string()))),
         }
     }
 }
@@ -87,7 +89,7 @@ pub(crate) struct Exec {
     argv: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stdin: Option<String>,
-    #[oai(validator(maximum(value = "25000")))]
+    #[oai(validator(minimum(value = "1000"), maximum(value = "25000")))]
     deadline_ms: u32,
 }
 #[derive(Object, Deserialize)]
@@ -152,17 +154,28 @@ enum ExecResponse {
     #[oai(status = 401)]
     Unauthorized(Json<crate::Refusal>),
     #[oai(status = 400)]
-    Invalid(PlainText<&'static str>),
+    Invalid(Json<ExecResult>),
+    #[oai(status = 413)]
+    TooLarge(Json<ExecResult>),
+}
+fn refused(reason: &str) -> ExecResult {
+    ExecResult::NotExecuted(ExecRefused {
+        reason: reason.into(),
+        truncated: false,
+    })
 }
 fn bad_request(_: poem::Error) -> ExecResponse {
-    ExecResponse::Invalid(PlainText("invalid exec request"))
+    ExecResponse::Invalid(Json(refused("invalid exec request")))
+}
+pub(crate) const BODY_LIMIT: usize = 1_048_576 - 64;
+pub(crate) fn oversized() -> poem::Response {
+    use poem::IntoResponse;
+    ExecResponse::TooLarge(Json(refused("request body too large"))).into_response()
 }
 #[derive(ApiResponse)]
 enum JobResponse {
     #[oai(status = 200)]
     Ok(Json<JobStatus>),
-    #[oai(status = 202)]
-    Pending(Json<Pending>),
     #[oai(status = 401)]
     Unauthorized(Json<crate::Refusal>),
 }
@@ -231,8 +244,20 @@ impl Controller {
     }
     async fn exec(&self, subject: &str, id: &str, exec: &Exec) -> Result<ExecResponse, Error> {
         let (key, session) = self.session(subject, id)?;
-        // The controller worker serializes admission; reserve capacity before any guest effect.
-        if self.jobs.lock().expect("job registry poisoned").len() >= 1024 {
+        if let Some(stored) = self
+            .sessions
+            .lock()
+            .expect("session registry poisoned")
+            .get_mut(&key)
+        {
+            stored.active = now();
+        }
+        // Exec admission serializes this check and dispatch; GETs can only remove entries.
+        let full = {
+            let jobs = self.jobs.lock().expect("job registry poisoned");
+            jobs.len() >= 1024 || jobs.values().filter(|job| job.session == id).count() >= 64
+        };
+        if full {
             return Ok(ExecResponse::Complete(Json(ExecResult::NotExecuted(
                 ExecRefused {
                     reason: "job_capacity".into(),
@@ -241,6 +266,9 @@ impl Controller {
             ))));
         }
         if let Err(error) = self.boot(&key, &session).await {
+            if !matches!(error, Error::Boot) {
+                return Err(error);
+            }
             tracing::warn!(cause = %error, "exec not started");
             return Ok(ExecResponse::Complete(Json(ExecResult::NotExecuted(
                 ExecRefused {
@@ -290,8 +318,12 @@ impl Controller {
             .get(id)
             .cloned()
             .ok_or(Error::NotFound)?;
-        let (key, session) = self.session(subject, &job.session)?;
-        let mut url = self.target(&key, &session).await?;
+        let (_, session) = self.session(subject, &job.session)?;
+        let pod = self
+            .pods
+            .get(session.pod.as_ref().ok_or(Error::NotFound)?)
+            .await?;
+        let mut url = self.address(&pod)?.ok_or(Error::Boot)?;
         url.path_segments_mut()
             .map_err(|()| Error::Protocol)?
             .extend(["jobs", &job.jail_id]);
@@ -302,10 +334,10 @@ impl Controller {
         }
         if response.status().as_u16() == 202 {
             let _: Pending = json(response).await?;
-            return Ok(JobResponse::Pending(Json(Pending {
-                outcome: Unknown::Unknown,
-                job_id: id.into(),
-            })));
+            self.jobs.lock().expect("job registry poisoned").remove(id);
+            return Ok(JobResponse::Ok(Json(JobStatus::Complete(refused(
+                "unknown",
+            )))));
         }
         let mut status = json(checked(response, 200)?).await?;
         if let JobStatus::Complete(ref mut result) = status {
@@ -335,6 +367,9 @@ impl Api {
             Ok(s) => s,
             Err(r) => return Ok(ExecResponse::Unauthorized(Json(r))),
         };
+        if body.argv.first().is_none_or(String::is_empty) {
+            return Ok(ExecResponse::Invalid(Json(refused("invalid exec request"))));
+        }
         Ok(controller(&state)?
             .exec(&subject, &id, &body)
             .instrument(tracing::info_span!(

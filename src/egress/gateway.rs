@@ -3,7 +3,11 @@ use hickory_proto::{
     op::{Message, MessageType, OpCode, ResponseCode},
     rr::{DNSClass, RData, Record, RecordType, rdata::A},
 };
-use std::net::{Ipv4Addr, SocketAddr};
+use std::{
+    collections::HashSet,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    time::Duration,
+};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream, UdpSocket},
@@ -21,6 +25,7 @@ pub(super) struct Listeners {
     pub(super) https: Option<TcpListener>,
     pub(super) dns: Option<(TcpListener, Ipv4Addr)>,
     pub(super) udp: Option<(UdpSocket, Ipv4Addr)>,
+    pub(super) dns_peers: HashSet<IpAddr>,
 }
 impl From<TcpListener> for Listeners {
     fn from(listener: TcpListener) -> Self {
@@ -30,8 +35,16 @@ impl From<TcpListener> for Listeners {
             https: None,
             dns: None,
             udp: None,
+            dns_peers: HashSet::new(),
         }
     }
+}
+pub(super) fn subnet_peers(gateway: Ipv4Addr) -> HashSet<IpAddr> {
+    let network = u32::from(gateway) & !3;
+    // Only usable host addresses in the gateway's /30, never network or broadcast.
+    [1, 2]
+        .map(|host| IpAddr::V4(Ipv4Addr::from(network | host)))
+        .into()
 }
 impl Listeners {
     pub(super) async fn bind(
@@ -40,6 +53,9 @@ impl Listeners {
     ) -> Result<Self, Error> {
         if explicit.is_none() && gateway.is_none() {
             return Err(super::RefusalError.into());
+        }
+        if let Some(address) = gateway {
+            super::validate_gateway(address)?;
         }
         let mut listeners = Self {
             explicit: match explicit {
@@ -50,6 +66,7 @@ impl Listeners {
             https: None,
             dns: None,
             udp: None,
+            dns_peers: gateway.map(subnet_peers).unwrap_or_default(),
         };
         if let Some(address) = gateway {
             listeners.udp = Some((UdpSocket::bind((address, 53)).await?, address));
@@ -59,20 +76,22 @@ impl Listeners {
         }
         Ok(listeners)
     }
-    pub(super) async fn accept(&self) -> std::io::Result<(TcpStream, Protocol)> {
-        async fn accept(listener: Option<&TcpListener>) -> std::io::Result<TcpStream> {
+    pub(super) async fn accept(&self) -> std::io::Result<(TcpStream, SocketAddr, Protocol)> {
+        async fn accept(
+            listener: Option<&TcpListener>,
+        ) -> std::io::Result<(TcpStream, SocketAddr)> {
             match listener {
-                Some(listener) => listener.accept().await.map(|(stream, _)| stream),
+                Some(listener) => listener.accept().await,
                 None => std::future::pending().await,
             }
         }
         tokio::select! {
-            stream = accept(self.explicit.as_ref()) => stream.map(|s| (s, Protocol::Http)),
-            stream = accept(self.http.as_ref()) => stream.map(|s| (s, Protocol::Http)),
-            stream = accept(self.https.as_ref()) => stream.map(|s| (s, Protocol::Http)),
+            stream = accept(self.explicit.as_ref()) => stream.map(|(s, peer)| (s, peer, Protocol::Http)),
+            stream = accept(self.http.as_ref()) => stream.map(|(s, peer)| (s, peer, Protocol::Http)),
+            stream = accept(self.https.as_ref()) => stream.map(|(s, peer)| (s, peer, Protocol::Http)),
             stream = async {
                 match &self.dns {
-                    Some((listener, address)) => listener.accept().await.map(|(s, _)| (s, Protocol::Dns(*address))),
+                    Some((listener, address)) => listener.accept().await.map(|(s, peer)| (s, peer, Protocol::Dns(*address))),
                     None => std::future::pending().await,
                 }
             } => stream,
@@ -93,19 +112,33 @@ impl Decision {
         }
     }
 }
-fn answer(engine: &Engine, packet: &[u8], gateway: Ipv4Addr) -> Result<Vec<u8>, Error> {
-    let query = Message::from_vec(packet)?;
+pub(super) fn refusal(decision: &'static str) {
+    let _span = tracing::info_span!(parent: None, "egress.dns",
+        dns.question.name = "", dns.question.type = "", egress.decision = decision);
+}
+fn answer(engine: &Engine, packet: &[u8], gateway: Ipv4Addr) -> Result<Option<Vec<u8>>, Error> {
+    let query = match Message::from_vec(packet) {
+        Ok(query) => query,
+        Err(error) => {
+            refusal("refused:protocol");
+            return Err(error.into());
+        }
+    };
     let mut reply = Message::response(query.id, query.op_code);
     reply.metadata.recursion_desired = query.recursion_desired;
     if query.message_type != MessageType::Query
         || query.op_code != OpCode::Query
         || query.queries.len() != 1
     {
+        refusal("refused:protocol");
+        if query.message_type != MessageType::Query {
+            return Ok(None);
+        }
         reply.metadata.response_code = ResponseCode::FormErr;
-        return Ok(reply.to_vec()?);
+        return Ok(Some(reply.to_vec()?));
     }
     for question in &query.queries {
-        let name = question.name().to_utf8();
+        let name = question.name().to_ascii();
         let kind = question.query_type();
         let decision = if !allowed(&name, &engine.egress.allow) {
             Decision::Host
@@ -131,35 +164,98 @@ fn answer(engine: &Engine, packet: &[u8], gateway: Ipv4Addr) -> Result<Vec<u8>, 
         }
         drop(span);
     }
-    Ok(reply.to_vec()?)
+    Ok(Some(reply.to_vec()?))
 }
-fn udp_reply(engine: &Engine, packet: &[u8], gateway: Ipv4Addr) -> Result<Vec<u8>, Error> {
-    let response = answer(engine, packet, gateway)?;
+fn udp_reply(engine: &Engine, packet: &[u8], gateway: Ipv4Addr) -> Result<Option<Vec<u8>>, Error> {
+    let Some(response) = answer(engine, packet, gateway)? else {
+        return Ok(None);
+    };
     if response.len() <= 512 {
-        return Ok(response);
+        return Ok(Some(response));
     }
-    Ok(Message::from_vec(&response)?.truncate().to_vec()?)
+    Ok(Some(Message::from_vec(&response)?.truncate().to_vec()?))
+}
+// Keep the per-datagram error boundary testable without privileged raw sockets.
+pub(super) trait Datagram {
+    async fn recv_from(&self, packet: &mut [u8]) -> std::io::Result<(usize, SocketAddr)>;
+    async fn send_to(&self, packet: &[u8], peer: SocketAddr) -> std::io::Result<usize>;
+}
+impl Datagram for UdpSocket {
+    async fn recv_from(&self, packet: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+        self.recv_from(packet).await
+    }
+    async fn send_to(&self, packet: &[u8], peer: SocketAddr) -> std::io::Result<usize> {
+        self.send_to(packet, peer).await
+    }
 }
 pub(super) async fn udp(
     engine: &Engine,
-    socket: UdpSocket,
+    socket: impl Datagram,
     gateway: Ipv4Addr,
+    peers: &HashSet<IpAddr>,
     mut stop: watch::Receiver<bool>,
 ) -> Result<(), Error> {
     let mut packet = [0; 65535];
     loop {
-        let (length, peer) = tokio::select! {
+        let received = tokio::select! {
             biased;
             _ = stop.changed() => return Ok(()),
-            received = socket.recv_from(&mut packet) => received?,
+            received = socket.recv_from(&mut packet) => received,
         };
-        match udp_reply(engine, &packet[..length], gateway) {
-            Ok(response) => {
-                socket.send_to(&response, peer).await?;
+        let (length, peer) = match received {
+            Ok(received) => received,
+            Err(error) => {
+                tracing::warn!(%error, "egress DNS receive failed");
+                refusal("refused:protocol");
+                // A broken socket must not spin; shutdown still interrupts retries.
+                tokio::select! {
+                    _ = stop.changed() => return Ok(()),
+                    _ = tokio::time::sleep(Duration::from_millis(10)) => (),
+                }
+                continue;
             }
-            Err(error) => tracing::debug!(%error, "egress DNS datagram refused"),
+        };
+        if peer.port() == 0 || !peers.contains(&peer.ip()) {
+            refusal("refused:address");
+            continue;
+        }
+        match udp_reply(engine, &packet[..length], gateway) {
+            Ok(Some(response)) => {
+                // The query already emitted its one DNS span, including on send failure.
+                if let Err(error) = socket.send_to(&response, peer).await {
+                    tracing::warn!(%error, %peer, "egress DNS send failed");
+                }
+            }
+            Ok(None) => (),
+            Err(error) => tracing::warn!(%error, "egress DNS datagram refused"),
         }
     }
+}
+struct PartialFrame(bool);
+impl Drop for PartialFrame {
+    fn drop(&mut self) {
+        if self.0 {
+            refusal("refused:protocol");
+        }
+    }
+}
+async fn read_frame(stream: &mut Stream) -> std::io::Result<Option<Vec<u8>>> {
+    let mut prefix = [0; 2];
+    match stream.read(&mut prefix[..1]).await {
+        Ok(0) => return Ok(None),
+        Ok(_) => (),
+        Err(error) => {
+            refusal("refused:protocol");
+            return Err(error);
+        }
+    }
+    // Partial frames are also refused once if the connection's idle/lifetime gate cancels us.
+    let mut partial = PartialFrame(true);
+    stream.read_exact(&mut prefix[1..]).await?;
+    let mut packet = vec![0; usize::from(u16::from_be_bytes(prefix))];
+    stream.read_exact(&mut packet).await?;
+    partial.0 = false;
+    Ok(Some(packet))
 }
 pub(super) async fn tcp(
     engine: &Engine,
@@ -167,15 +263,12 @@ pub(super) async fn tcp(
     gateway: Ipv4Addr,
 ) -> Result<(), Error> {
     loop {
-        let length = match stream.read_u16().await {
-            Ok(length) => usize::from(length),
-            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
-            Err(error) => return Err(error.into()),
+        let Some(packet) = read_frame(&mut stream).await? else {
+            return Ok(());
         };
-        let mut packet = vec![0; length];
-        stream.read_exact(&mut packet).await?;
-        let response = answer(engine, &packet, gateway)?;
-        stream.write_u16(u16::try_from(response.len())?).await?;
-        stream.write_all(&response).await?;
+        if let Some(response) = answer(engine, &packet, gateway)? {
+            stream.write_u16(u16::try_from(response.len())?).await?;
+            stream.write_all(&response).await?;
+        }
     }
 }

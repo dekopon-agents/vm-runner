@@ -30,6 +30,19 @@ enum Command {
     },
     Openapi,
 }
+fn conflicts(config: &Config, command: &Command) -> Vec<String> {
+    let mut conflicts: Vec<_> = config.conflicts().iter().map(ToString::to_string).collect();
+    if let Command::Egress {
+        gateway: Some(address),
+        ..
+    } = command
+        && let Err(error) = vm_runner::egress::validate_gateway(*address)
+    {
+        conflicts.push(error.to_string());
+    }
+    conflicts
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let command = Cli::parse().command;
@@ -43,7 +56,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     };
     let config = Config::load(path).await?;
-    let conflicts = config.conflicts();
+    let conflicts = conflicts(&config, &command);
     for conflict in &conflicts {
         eprintln!("{conflict}");
     }
@@ -107,14 +120,14 @@ mod tests {
                 Some(clap::error::ErrorKind::ValueValidation)
             );
         }
-        assert!(Cli::try_parse_from(base.into_iter().chain(["--gateway", "127.0.0.1"])).is_ok());
+        assert!(Cli::try_parse_from(base.into_iter().chain(["--gateway", "10.0.2.1"])).is_ok());
         assert!(
             Cli::try_parse_from(base.into_iter().chain(["--listen", "127.0.0.1:8080"])).is_ok()
         );
         assert!(
             Cli::try_parse_from(base.into_iter().chain([
                 "--gateway",
-                "127.0.0.1",
+                "10.0.2.1",
                 "--listen",
                 "127.0.0.1:8080"
             ]))

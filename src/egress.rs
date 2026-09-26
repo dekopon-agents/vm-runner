@@ -595,7 +595,10 @@ impl Engine {
     ) -> Result<(), Error> {
         let (activity, mut changed) = watch::channel(started);
         let stream = Box::new(ActiveStream { stream, activity });
-        let idle = Duration::from_secs(self.egress.idle_seconds.get().into());
+        let idle = match protocol {
+            gateway::Protocol::Http => Duration::from_secs(self.egress.idle_seconds.get().into()),
+            gateway::Protocol::Dns(_) => Duration::from_secs(10),
+        };
         let lifetime = Duration::from_secs(self.egress.max_connection_seconds.get().into());
         let idle_timeout = async {
             loop {
@@ -629,13 +632,14 @@ impl Engine {
         }
         let (dns_stop, stopped) = watch::channel(false);
         let mut dns_worker = listeners.udp.take().map(|(socket, address)| {
+            let peers = listeners.dns_peers.clone();
             let engine = Arc::clone(&self);
             let runtime = tokio::runtime::Handle::current();
             let dispatch = tracing::dispatcher::get_default(Clone::clone);
             // One sequential UDP worker owns its fixed packet buffer and drains before shutdown.
             tokio::task::spawn_blocking(move || {
                 tracing::dispatcher::with_default(&dispatch, || {
-                    runtime.block_on(gateway::udp(&engine, socket, address, stopped))
+                    runtime.block_on(gateway::udp(&engine, socket, address, &peers, stopped))
                 })
             })
         });
@@ -668,13 +672,19 @@ impl Engine {
                 }
                 result = workers.join_next(), if !workers.is_empty() => { if let Some(Err(error)) = result { break Err(Error::from(error)); } }
                 accepted = listeners.accept() => {
-                    let (stream, protocol) = match accepted {
+                    let (stream, peer, protocol) = match accepted {
                         Ok(accepted) => accepted,
                         Err(error) => {
                             tracing::warn!(%error, "egress accept failed");
                             continue;
                         }
                     };
+                    if matches!(protocol, gateway::Protocol::Dns(_))
+                        && !listeners.dns_peers.contains(&peer.ip())
+                    {
+                        gateway::refusal("refused:address");
+                        continue;
+                    }
                     let engine = Arc::clone(&self);
                     let runtime = tokio::runtime::Handle::current();
                     let dispatch = tracing::dispatcher::get_default(Clone::clone);
@@ -913,6 +923,24 @@ fn client_config(roots: RootCertStore) -> Result<Arc<ClientConfig>, rustls::Erro
         .with_no_client_auth(),
     ))
 }
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "invalid --gateway {0}: unspecified, broadcast, multicast and loopback addresses are forbidden"
+)]
+pub struct InvalidGateway(std::net::Ipv4Addr);
+
+pub fn validate_gateway(address: std::net::Ipv4Addr) -> Result<(), InvalidGateway> {
+    if address.is_unspecified()
+        || address.is_broadcast()
+        || address.is_multicast()
+        || address.is_loopback()
+    {
+        Err(InvalidGateway(address))
+    } else {
+        Ok(())
+    }
+}
+
 pub async fn run(
     config: Config,
     profile: &str,

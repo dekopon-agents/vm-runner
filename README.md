@@ -16,6 +16,18 @@ returns its subject and session quota. Optional `telemetry.otlp` selects `grpc` 
 with an endpoint and optional `caBundleFile` and `headersFile` (`key: value` per line).
 Without telemetry configuration, tracing goes only to stdout JSON logs.
 
+## Named sessions
+
+With a `jails` configuration, `serve` uses in-cluster Kubernetes credentials and rebuilds
+its session registry from pod labels and annotations in `jails.namespace`.
+Authenticated `POST /v1/sessions {"profile":"travel","name":"default"}` reserves a lazy
+session (201), or returns the same subject/name session (200). Names are lowercase
+alphanumeric with internal/trailing hyphens, at most 63 characters; omitted names are
+`default`. Changing the profile for an existing name returns `409 session_profile_conflict`.
+Admission applies the authenticated subject's `maxSessions` quota. Every ten seconds the
+reaper deletes pods and reservations exceeding the profile's idle or maximum lifetime.
+No DELETE route is exposed. Without `jails`, session requests return 503.
+
 ## Explicit egress proxy
 
 ```sh

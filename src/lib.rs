@@ -1,6 +1,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::disallowed_methods))]
 mod auth;
 pub mod config;
+mod controller;
 pub mod egress;
 #[cfg(unix)]
 pub mod guest;
@@ -8,9 +9,9 @@ pub mod guest;
 pub mod jail;
 pub mod telemetry;
 use auth::{Authenticator, Reason};
-use config::{Config, Quota, Quotas};
+use config::{Config, Quota};
 use opentelemetry::propagation::TextMapPropagator;
-use poem::{Endpoint, EndpointExt, Request};
+use poem::{Endpoint, EndpointExt, IntoResponse, Request};
 use poem_openapi::{
     ApiResponse, Object, OpenApi, OpenApiService,
     payload::{Json, PlainText},
@@ -23,8 +24,8 @@ struct Identity {
     subject: String,
     quota: Quota,
 }
-#[derive(Object)]
-struct Refusal {
+#[derive(Object, serde::Serialize)]
+pub(crate) struct Refusal {
     error: String,
     reason: Reason,
 }
@@ -36,12 +37,35 @@ enum Whoami {
     Unauthorized(Json<Refusal>),
 }
 struct Api;
+#[derive(Clone)]
+struct Subject(String);
 struct State {
     auth: Authenticator,
-    quotas: Quotas,
+    config: std::sync::Arc<Config>,
+    controller: Option<std::sync::Arc<controller::Controller>>,
 }
 #[OpenApi]
 impl Api {
+    #[oai(path = "/v1/sessions", method = "post")]
+    async fn create_session(
+        &self,
+        request: &Request,
+        state: poem::web::Data<&std::sync::Arc<State>>,
+        body: Json<controller::Create>,
+    ) -> poem::Result<controller::Created> {
+        let subject = match state.authenticate(request).await {
+            Ok(subject) => subject,
+            Err(refusal) => return Ok(controller::Created::Unauthorized(Json(refusal))),
+        };
+        let controller = state.controller.as_ref().ok_or_else(|| {
+            poem::Error::from_string(
+                "jails are not configured",
+                poem::http::StatusCode::SERVICE_UNAVAILABLE,
+            )
+        })?;
+        tracing::info_span!("vm_runner.session.create")
+            .in_scope(|| controller.create(&subject, body.0))
+    }
     #[oai(path = "/healthz", method = "get")]
     async fn healthz(&self) -> PlainText<&'static str> {
         PlainText("ok")
@@ -52,25 +76,37 @@ impl Api {
         request: &Request,
         state: poem::web::Data<&std::sync::Arc<State>>,
     ) -> Whoami {
-        match state.auth.verify(request.header("Authorization")).await {
+        match state.authenticate(request).await {
             Ok(subject) => {
                 let quota = state
+                    .config
                     .quotas
                     .subjects
                     .0
                     .iter()
                     .find(|(s, _)| s == &subject)
-                    .map_or(state.quotas.default, |(_, q)| *q);
+                    .map_or(state.config.quotas.default, |(_, q)| *q);
                 Whoami::Ok(Json(Identity { subject, quota }))
             }
-            Err(reason) => {
+            Err(refusal) => Whoami::Unauthorized(Json(refusal)),
+        }
+    }
+}
+impl State {
+    async fn authenticate(&self, request: &Request) -> Result<String, Refusal> {
+        if let Some(subject) = request.extensions().get::<Subject>() {
+            return Ok(subject.0.clone());
+        }
+        self.auth
+            .verify(request.header("Authorization"))
+            .await
+            .map_err(|reason| {
                 tracing::Span::current().record("vm_runner.auth.reason", reason.as_str());
-                Whoami::Unauthorized(Json(Refusal {
+                Refusal {
                     error: "unauthorized".into(),
                     reason,
-                }))
-            }
-        }
+                }
+            })
     }
 }
 fn service() -> OpenApiService<Api, ()> {
@@ -79,26 +115,80 @@ fn service() -> OpenApiService<Api, ()> {
 pub fn openapi() -> String {
     service().spec_yaml()
 }
-pub struct Requests(std::sync::Arc<tokio::sync::Semaphore>);
+pub struct Requests {
+    admission: std::sync::Arc<tokio::sync::Semaphore>,
+    controller: Option<std::sync::Arc<controller::Controller>>,
+}
 impl Requests {
+    pub async fn reap(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let Some(controller) = &self.controller else {
+            return std::future::pending().await;
+        };
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+        loop {
+            interval.tick().await;
+            // The API admission gate also excludes teardown while a request owns a session.
+            let permit = std::sync::Arc::clone(&self.admission)
+                .acquire_owned()
+                .await?;
+            let controller = std::sync::Arc::clone(controller);
+            let runtime = tokio::runtime::Handle::current();
+            let dispatch = tracing::dispatcher::get_default(Clone::clone);
+            tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                tracing::dispatcher::with_default(&dispatch, || {
+                    runtime.block_on(controller.reap(controller::now()))
+                })
+            })
+            .await??;
+        }
+    }
     // Call after the server stops, before shutting down telemetry.
     pub async fn drain(self) -> Result<(), tokio::sync::AcquireError> {
-        let _idle = self.0.acquire().await?;
+        let _idle = self.admission.acquire().await?;
         Ok(())
     }
 }
 pub async fn app(
     config: Config,
 ) -> Result<(impl Endpoint, Requests), Box<dyn std::error::Error + Send + Sync>> {
+    let config = std::sync::Arc::new(config);
+    let controller = if config.jails.is_some() {
+        let client = kube::Client::try_from(kube::Config::incluster()?)?;
+        let config = std::sync::Arc::clone(&config);
+        let runtime = tokio::runtime::Handle::current();
+        let dispatch = tracing::dispatcher::get_default(Clone::clone);
+        Some(std::sync::Arc::new(
+            tokio::task::spawn_blocking(move || {
+                tracing::dispatcher::with_default(&dispatch, || {
+                    runtime.block_on(controller::Controller::new(config, client))
+                })
+            })
+            .await??,
+        ))
+    } else {
+        None
+    };
     let state = State {
-        auth: Authenticator::new(config.auth).await?,
-        quotas: config.quotas,
+        auth: Authenticator::new(config.auth.clone()).await?,
+        config,
+        controller: controller.as_ref().map(std::sync::Arc::clone),
     };
     let admission = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
-    let requests = Requests(std::sync::Arc::clone(&admission));
-    let endpoint = service()
-        .data(std::sync::Arc::new(state))
-        .around(move |ep, req| {
+    let requests = Requests {
+        admission: std::sync::Arc::clone(&admission),
+        controller,
+    };
+    Ok((endpoint(std::sync::Arc::new(state), admission), requests))
+}
+fn endpoint(
+    state: std::sync::Arc<State>,
+    admission: std::sync::Arc<tokio::sync::Semaphore>,
+) -> impl Endpoint {
+    service()
+        .data(std::sync::Arc::clone(&state))
+        .around(move |ep, mut req| {
+            let state = std::sync::Arc::clone(&state);
             let admission = std::sync::Arc::clone(&admission);
             async move {
                 // Admit before creating the span so cancellation cannot queue an unbounded export.
@@ -122,14 +212,32 @@ pub async fn app(
                         if let Err(error) = span.set_parent(parent) {
                             tracing::warn!(%error, "could not attach trace parent");
                         }
-                        runtime.block_on(ep.call(req).instrument(span))
+                        runtime.block_on(
+                            async move {
+                                if req.uri().path() != "/healthz"
+                                    || req.method() != poem::http::Method::GET
+                                {
+                                    match state.authenticate(&req).await {
+                                        Ok(subject) => {
+                                            req.extensions_mut().insert(Subject(subject));
+                                        }
+                                        Err(refusal) => {
+                                            return Ok(poem::web::Json(refusal)
+                                                .with_status(poem::http::StatusCode::UNAUTHORIZED)
+                                                .into_response());
+                                        }
+                                    }
+                                }
+                                ep.call(req).await
+                            }
+                            .instrument(span),
+                        )
                     })
                 })
                 .await
                 .map_err(poem::error::InternalServerError)?
             }
-        });
-    Ok((endpoint, requests))
+        })
 }
 /// Stop admission on either terminal interruption or pod termination.
 /// Callers drain their requests before shutting down (and flushing) telemetry.

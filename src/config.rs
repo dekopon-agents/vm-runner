@@ -19,8 +19,9 @@ pub struct Config {
     pub(crate) profiles: Names<Profile>,
     pub(crate) quotas: Quotas,
     pub telemetry: Option<Telemetry>,
+    pub(crate) jails: Option<Jails>,
 }
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Auth {
     #[serde(default = "audience")]
@@ -31,7 +32,7 @@ pub(crate) struct Auth {
 fn audience() -> String {
     "vm-runner".into()
 }
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub(crate) struct Issuer {
     pub issuer: String,
@@ -54,8 +55,8 @@ pub(crate) struct Profile {
     pub image: String,
     #[serde(rename = "browser")]
     _browser: Browser,
-    idle_seconds: u64,
-    max_seconds: u64,
+    pub idle_seconds: u64,
+    pub max_seconds: u64,
     pub egress: Egress,
 }
 #[derive(Deserialize)]
@@ -127,6 +128,15 @@ pub(crate) enum Protocol {
     Grpc,
     Http,
 }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub(crate) struct Jails {
+    pub namespace: String,
+    pub image: String,
+    pub image_cache_host_path: PathBuf,
+    pub controller_audience: String,
+    pub token_file: PathBuf,
+}
 pub(crate) struct Names<T>(pub Vec<(String, T)>);
 impl<'de, T: Deserialize<'de>> Deserialize<'de> for Names<T> {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
@@ -163,6 +173,8 @@ pub enum Conflict {
     EgressConnections(String),
     #[error("invalid service account subject: {0}")]
     Subject(String),
+    #[error("invalid jails configuration: {0}")]
+    Jails(&'static str),
 }
 pub(crate) fn service_account(s: &str) -> bool {
     matches!(s.split(':').collect::<Vec<_>>().as_slice(), ["system", "serviceaccount", ns, name] if !ns.is_empty() && !name.is_empty() && !s.contains('*'))
@@ -181,6 +193,25 @@ impl Config {
     }
     pub fn conflicts(&self) -> Vec<Conflict> {
         let mut errors = Vec::new();
+        if let Some(jails) = &self.jails {
+            for (valid, field) in [
+                (!jails.namespace.is_empty(), "namespace"),
+                (!jails.image.trim().is_empty(), "image"),
+                (
+                    jails.image_cache_host_path.is_absolute(),
+                    "imageCacheHostPath",
+                ),
+                (jails.token_file.is_absolute(), "tokenFile"),
+                (
+                    jails.controller_audience == "vm-runner-jail",
+                    "controllerAudience",
+                ),
+            ] {
+                if !valid {
+                    errors.push(Conflict::Jails(field));
+                }
+            }
+        }
         duplicates(self.shapes.0.iter().map(|(n, _)| n.as_str()), &mut errors);
         duplicates(self.profiles.0.iter().map(|(n, _)| n.as_str()), &mut errors);
         duplicates(

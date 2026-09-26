@@ -109,9 +109,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let listen = config.listen;
     let result = async {
         let (endpoint, requests) = app(config).await?;
-        let result = poem::Server::new(poem::listener::TcpListener::bind(listen))
-            .run_with_graceful_shutdown(endpoint, vm_runner::shutdown_signal(), None)
-            .await;
+        let server = poem::Server::new(poem::listener::TcpListener::bind(listen));
+        let result = tokio::select! {
+            result = server.run_with_graceful_shutdown(endpoint, vm_runner::shutdown_signal(), None) => result.map_err(Into::into),
+            result = requests.reap() => result,
+        };
         requests.drain().await?;
         result?;
         Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())

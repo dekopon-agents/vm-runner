@@ -5,6 +5,45 @@ info:
 servers: []
 tags: []
 paths:
+  /v1/sessions:
+    post:
+      requestBody:
+        content:
+          application/json; charset=utf-8:
+            schema:
+              $ref: '#/components/schemas/Create'
+        required: true
+      responses:
+        '201':
+          description: ''
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/SessionBody'
+        '200':
+          description: ''
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/SessionBody'
+        '409':
+          description: ''
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/Conflict'
+        '400':
+          description: ''
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/NotExecuted'
+        '401':
+          description: ''
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/Refusal'
   /healthz:
     get:
       responses:
@@ -31,6 +70,33 @@ paths:
                 $ref: '#/components/schemas/Refusal'
 components:
   schemas:
+    Conflict:
+      type: object
+      title: Conflict
+      required:
+      - error
+      properties:
+        error:
+          $ref: '#/components/schemas/ConflictCode'
+    ConflictCode:
+      type: string
+      enum:
+      - session_profile_conflict
+    Create:
+      type: object
+      title: Create
+      required:
+      - profile
+      properties:
+        profile:
+          type: string
+        name:
+          type: string
+    Failure:
+      type: string
+      enum:
+      - quota
+      - bad_profile
     Identity:
       type: object
       title: Identity
@@ -42,6 +108,21 @@ components:
           type: string
         quota:
           $ref: '#/components/schemas/Quota'
+    NotExecuted:
+      type: object
+      title: NotExecuted
+      required:
+      - outcome
+      - reason
+      properties:
+        outcome:
+          $ref: '#/components/schemas/NotExecutedOutcome'
+        reason:
+          $ref: '#/components/schemas/Failure'
+    NotExecutedOutcome:
+      type: string
+      enum:
+      - not_executed
     Quota:
       type: object
       title: Quota
@@ -72,3 +153,27 @@ components:
           type: string
         reason:
           $ref: '#/components/schemas/Reason'
+    SessionBody:
+      type: object
+      title: SessionBody
+      required:
+      - sessionId
+      - name
+      - profile
+      - shape
+      - state
+      properties:
+        sessionId:
+          type: string
+        name:
+          type: string
+        profile:
+          type: string
+        shape:
+          type: string
+        state:
+          $ref: '#/components/schemas/SessionState'
+    SessionState:
+      type: string
+      enum:
+      - pending

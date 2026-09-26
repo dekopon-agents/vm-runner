@@ -20,6 +20,8 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - run: rustup show active-toolchain
+      # The guest's init; the orphan-reaping test runs the agent under it.
+      - run: sudo apt-get update && sudo apt-get install -y tini
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets --all-features --locked -- -D warnings
       - run: cargo test --all-features --locked

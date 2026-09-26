@@ -48,11 +48,11 @@ type RequestBody =
     http_body_util::combinators::MapFrame<Incoming, fn(Frame<Bytes>) -> Frame<Bytes>>;
 type Driver = hyper::client::conn::http1::Connection<TokioIo<Stream>, RequestBody>;
 
-struct Ca {
+pub(crate) struct Ca {
     issuer: Issuer<'static, KeyPair>,
 }
 impl Ca {
-    fn new() -> Result<(Self, String), Error> {
+    pub(crate) fn new() -> Result<(Self, String), Error> {
         let mut params = CertificateParams::default();
         params
             .distinguished_name
@@ -971,7 +971,7 @@ pub async fn run(
         .find(|(name, _)| name == profile)
         .ok_or(RefusalError)?;
     let provider =
-        telemetry::init_jail(config.telemetry.as_ref(), profile, &selected.1.shape).await?;
+        telemetry::init_jail(config.telemetry.as_ref(), profile, &selected.1.shape, None).await?;
     let result = async {
         let (ca, pem) = Ca::new()?;
         tokio::fs::create_dir_all(ca_out).await?;

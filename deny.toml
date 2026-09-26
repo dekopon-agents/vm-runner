@@ -39,6 +39,9 @@ allow-wildcard-paths = true
 highlight = "all"
 deny = []
 skip = [
+  { crate = "digest@0.10.7", reason = "Poem's headers/sha1 requires digest 0.10 while oci-client 0.18 uses sha2/digest 0.11; remove when upstream requirements converge" },
+  { crate = "block-buffer@0.10.4", reason = "Poem's sha1/digest 0.10 requires block-buffer 0.10 while oci-client's sha2/digest 0.11 requires 0.12; remove with the digest exception" },
+  { crate = "crypto-common@0.1.7", reason = "Poem's sha1/digest 0.10 requires crypto-common 0.1 while oci-client's sha2/digest 0.11 requires 0.2; remove with the digest exception" },
   { crate = "rand@0.9.5", reason = "OpenTelemetry SDK 0.33 requires rand 0.9 while security-patched hickory-proto 0.26 requires 0.10; remove when their version requirements converge" },
   { crate = "rand_core@0.9.5", reason = "OpenTelemetry's rand 0.9 requires rand_core 0.9 while hickory-proto's rand 0.10 requires 0.10; remove alongside the rand 0.9 exception" },
   { crate = "cpufeatures@0.2.17", reason = "Poem's headers/sha1 chain requires cpufeatures 0.2 while hickory-proto's rand/chacha20 chain requires 0.3; remove when those dependencies converge" },

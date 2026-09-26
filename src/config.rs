@@ -15,7 +15,7 @@ use std::{
 pub struct Config {
     pub listen: SocketAddr,
     pub(crate) auth: Auth,
-    shapes: Names<Shape>,
+    pub(crate) shapes: Names<Shape>,
     pub(crate) profiles: Names<Profile>,
     pub(crate) quotas: Quotas,
     pub telemetry: Option<Telemetry>,
@@ -40,20 +40,18 @@ pub(crate) struct Issuer {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-struct Shape {
-    #[serde(rename = "vcpus")]
-    _vcpus: NonZeroU32,
+pub(crate) struct Shape {
+    pub vcpus: NonZeroU32,
     #[serde(rename = "memoryMiB")]
-    _memory: NonZeroU32,
+    pub memory: NonZeroU32,
     #[serde(rename = "diskMiB")]
-    _disk: NonZeroU32,
+    pub disk: NonZeroU32,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub(crate) struct Profile {
     pub shape: String,
-    #[serde(rename = "image")]
-    _image: String,
+    pub image: String,
     #[serde(rename = "browser")]
     _browser: Browser,
     idle_seconds: u64,

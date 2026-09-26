@@ -11,5 +11,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     && install -m 0755 "/tmp/release-v1.17.0-${arch}/firecracker-v1.17.0-${arch}" /usr/local/bin/firecracker \
     && rm -rf /tmp/firecracker.tgz /tmp/release-v1.17.0-* /var/lib/apt/lists/*
 COPY --chmod=0755 vm-runnerd /usr/local/bin/vm-runnerd
+RUN find / -xdev -perm /6000 -type f -exec chmod a-s {} +
 USER 1000:1000
 ENTRYPOINT ["/usr/local/bin/vm-runnerd"]

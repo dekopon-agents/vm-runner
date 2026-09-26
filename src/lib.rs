@@ -65,10 +65,6 @@ impl Api {
         tracing::info_span!("vm_runner.session.create")
             .in_scope(|| controller.create(&subject, body.0))
     }
-    #[oai(path = "/healthz", method = "get")]
-    async fn healthz(&self) -> PlainText<&'static str> {
-        PlainText("ok")
-    }
     #[oai(path = "/v1/whoami", method = "get")]
     async fn whoami(
         &self,
@@ -108,11 +104,46 @@ impl State {
             })
     }
 }
-fn service() -> OpenApiService<Api, ()> {
-    OpenApiService::new(Api, "vm-runner", env!("CARGO_PKG_VERSION"))
+pub(crate) struct Health(pub Option<std::sync::Arc<std::sync::atomic::AtomicBool>>);
+#[derive(ApiResponse)]
+enum HealthResponse {
+    #[oai(status = 200)]
+    Ready(PlainText<&'static str>),
+    #[oai(status = 503)]
+    Starting(PlainText<&'static str>),
+}
+#[OpenApi]
+impl Health {
+    #[oai(path = "/healthz", method = "get")]
+    async fn healthz(&self) -> HealthResponse {
+        if self
+            .0
+            .as_ref()
+            .is_none_or(|ready| ready.load(std::sync::atomic::Ordering::Acquire))
+        {
+            HealthResponse::Ready(PlainText("ok"))
+        } else {
+            HealthResponse::Starting(PlainText("starting"))
+        }
+    }
+}
+fn service() -> OpenApiService<(Health, Api), ()> {
+    OpenApiService::new((Health(None), Api), "vm-runner", env!("CARGO_PKG_VERSION"))
 }
 pub fn openapi() -> String {
-    service().spec_yaml()
+    #[cfg(unix)]
+    {
+        OpenApiService::new(
+            (Health(None), Api, jail::api::Api),
+            "vm-runner",
+            env!("CARGO_PKG_VERSION"),
+        )
+        .spec_yaml()
+    }
+    #[cfg(not(unix))]
+    {
+        service().spec_yaml()
+    }
 }
 pub struct Requests {
     admission: std::sync::Arc<tokio::sync::Semaphore>,
@@ -245,6 +276,59 @@ fn endpoint(
                 .map_err(poem::error::InternalServerError)?
             }
         })
+}
+#[cfg(unix)]
+pub(crate) struct TracedRequests([std::sync::Arc<tokio::sync::Semaphore>; 2], u32);
+#[cfg(unix)]
+impl TracedRequests {
+    pub async fn drain(self) -> Result<(), tokio::sync::AcquireError> {
+        let _exec_idle = self.0[0].acquire_many(self.1).await?;
+        let _get_idle = self.0[1].acquire_many(self.1).await?;
+        Ok(())
+    }
+}
+#[cfg(unix)]
+pub(crate) fn traced(
+    endpoint: impl Endpoint + 'static,
+    capacity: u32,
+) -> (impl Endpoint<Output = poem::Response>, TracedRequests) {
+    let admission = std::array::from_fn(|_| {
+        std::sync::Arc::new(tokio::sync::Semaphore::new(capacity as usize))
+    });
+    let requests = TracedRequests(admission.each_ref().map(std::sync::Arc::clone), capacity);
+    let endpoint = endpoint.map_to_response().around(move |ep, req| {
+        let admission =
+            std::sync::Arc::clone(&admission[usize::from(req.method() == poem::http::Method::GET)]);
+        async move {
+            // Admit before creating the span so cancellation cannot queue an unbounded export.
+            let permit = admission
+                .acquire_owned()
+                .await
+                .map_err(poem::error::InternalServerError)?;
+            let runtime = tokio::runtime::Handle::current();
+            let dispatch = tracing::dispatcher::get_default(Clone::clone);
+            // The worker owns the entire request so cancellation cannot export on Tokio.
+            tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                tracing::dispatcher::with_default(&dispatch, || {
+                    let span = tracing::info_span!(
+                        "vm_runner.request",
+                        otel.kind = "server",
+                        vm_runner.auth.reason = tracing::field::Empty
+                    );
+                    let parent = opentelemetry_sdk::propagation::TraceContextPropagator::new()
+                        .extract(&telemetry::Headers(req.headers()));
+                    if let Err(error) = span.set_parent(parent) {
+                        tracing::warn!(%error, "could not attach trace parent");
+                    }
+                    runtime.block_on(ep.call(req).instrument(span))
+                })
+            })
+            .await
+            .map_err(poem::error::InternalServerError)?
+        }
+    });
+    (endpoint, requests)
 }
 /// Stop admission on either terminal interruption or pod termination.
 /// Callers drain their requests before shutting down (and flushing) telemetry.

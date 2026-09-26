@@ -5,6 +5,21 @@ info:
 servers: []
 tags: []
 paths:
+  /healthz:
+    get:
+      responses:
+        '200':
+          description: ''
+          content:
+            text/plain; charset=utf-8:
+              schema:
+                type: string
+        '503':
+          description: ''
+          content:
+            text/plain; charset=utf-8:
+              schema:
+                type: string
   /v1/sessions:
     post:
       requestBody:
@@ -50,15 +65,6 @@ paths:
             text/plain; charset=utf-8:
               schema:
                 type: string
-  /healthz:
-    get:
-      responses:
-        '200':
-          description: ''
-          content:
-            text/plain; charset=utf-8:
-              schema:
-                type: string
   /v1/whoami:
     get:
       responses:
@@ -74,6 +80,50 @@ paths:
             application/json; charset=utf-8:
               schema:
                 $ref: '#/components/schemas/Refusal'
+  /exec:
+    post:
+      requestBody:
+        content:
+          application/json; charset=utf-8:
+            schema:
+              $ref: '#/components/schemas/ExecInput'
+        required: true
+      responses:
+        '200':
+          description: ''
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/Terminal'
+        '202':
+          description: ''
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/Unknown'
+  /jobs/{id}:
+    get:
+      parameters:
+      - name: id
+        schema:
+          type: string
+        in: path
+        required: true
+        deprecated: false
+        explode: true
+      responses:
+        '200':
+          description: ''
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/View'
+        '202':
+          description: ''
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/Unknown'
 components:
   schemas:
     Conflict:
@@ -98,6 +148,41 @@ components:
           type: string
         name:
           type: string
+    ExecInput:
+      type: object
+      title: ExecInput
+      required:
+      - argv
+      - deadlineMs
+      properties:
+        argv:
+          type: array
+          items:
+            type: string
+        stdin:
+          type: string
+        deadlineMs:
+          type: integer
+          format: uint32
+          maximum: 25000.0
+    Executed:
+      type: object
+      title: Executed
+      required:
+      - exitCode
+      - stdout
+      - stderr
+      - truncated
+      properties:
+        exitCode:
+          type: integer
+          format: int32
+        stdout:
+          type: string
+        stderr:
+          type: string
+        truncated:
+          type: boolean
     Failure:
       type: string
       enum:
@@ -115,6 +200,17 @@ components:
           type: string
         quota:
           $ref: '#/components/schemas/Quota'
+    JailNotExecuted:
+      type: object
+      title: JailNotExecuted
+      required:
+      - reason
+      - truncated
+      properties:
+        reason:
+          type: string
+        truncated:
+          type: boolean
     NotExecuted:
       type: object
       title: NotExecuted
@@ -160,6 +256,14 @@ components:
           type: string
         reason:
           $ref: '#/components/schemas/Reason'
+    Running:
+      type: object
+      title: Running
+      required:
+      - state
+      properties:
+        state:
+          type: string
     SessionBody:
       type: object
       title: SessionBody
@@ -184,3 +288,53 @@ components:
       type: string
       enum:
       - pending
+    Terminal:
+      type: object
+      anyOf:
+      - $ref: '#/components/schemas/Terminal_Executed'
+      - $ref: '#/components/schemas/Terminal_JailNotExecuted'
+      discriminator:
+        propertyName: outcome
+        mapping:
+          executed: '#/components/schemas/Terminal_Executed'
+          not_executed: '#/components/schemas/Terminal_JailNotExecuted'
+    Terminal_Executed:
+      allOf:
+      - type: object
+        required:
+        - outcome
+        properties:
+          outcome:
+            type: string
+            enum:
+            - executed
+            example: executed
+      - $ref: '#/components/schemas/Executed'
+    Terminal_JailNotExecuted:
+      allOf:
+      - type: object
+        required:
+        - outcome
+        properties:
+          outcome:
+            type: string
+            enum:
+            - not_executed
+            example: not_executed
+      - $ref: '#/components/schemas/JailNotExecuted'
+    Unknown:
+      type: object
+      title: Unknown
+      required:
+      - outcome
+      - jobId
+      properties:
+        outcome:
+          type: string
+        jobId:
+          type: string
+    View:
+      type: object
+      anyOf:
+      - $ref: '#/components/schemas/Running'
+      - $ref: '#/components/schemas/Terminal'

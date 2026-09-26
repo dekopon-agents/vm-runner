@@ -957,6 +957,28 @@ pub fn validate_gateway(address: std::net::Ipv4Addr) -> Result<(), InvalidGatewa
     }
 }
 
+pub(crate) struct Gateway {
+    engine: Arc<Engine>,
+    listeners: gateway::Listeners,
+}
+impl Gateway {
+    pub(crate) async fn bind(egress: Egress, ca: Ca) -> Result<Self, Error> {
+        let roots = RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        Ok(Self {
+            engine: Arc::new(Engine {
+                ca,
+                egress,
+                tls: client_config(roots)?,
+            }),
+            listeners: gateway::Listeners::bind(None, Some(std::net::Ipv4Addr::new(10, 0, 2, 1)))
+                .await?,
+        })
+    }
+    pub(crate) async fn serve(self, stop: impl Future<Output = ()>) -> Result<(), Error> {
+        self.engine.serve(self.listeners, stop).await
+    }
+}
+
 pub async fn run(
     config: Config,
     profile: &str,

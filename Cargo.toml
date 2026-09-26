@@ -41,6 +41,9 @@ tracing-subscriber = { version = "0.3.23", features = ["json", "env-filter"] }
 cap-std = "3.4.5"
 rustix = { version = "1.1.5", features = ["fs"] }
 nix = { version = "0.30.1", default-features = false, features = ["signal"] }
+oci-client = { version = "0.18.0", default-features = false, features = ["rustls-tls"] }
+zstd = "0.13.3"
+tempfile = "3.27.0"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 tokio-vsock = "0.7.2"
@@ -51,8 +54,11 @@ vsock = "=0.5.2"
 tokio = { version = "1.49.0", features = ["test-util"] }
 opentelemetry_sdk = { version = "0.33.0", features = ["testing"] }
 poem = { version = "3.1.12", features = ["test"] }
-tempfile = "3.27.0"
 x509-parser = "0.18"
+
+[[test]]
+name = "kvm"
+test = false
 
 [profile.dev]
 debug = "line-tables-only"

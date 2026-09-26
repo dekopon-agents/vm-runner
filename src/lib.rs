@@ -4,6 +4,8 @@ pub mod config;
 pub mod egress;
 #[cfg(unix)]
 pub mod guest;
+#[cfg(unix)]
+pub mod jail;
 pub mod telemetry;
 use auth::{Authenticator, Reason};
 use config::{Config, Quota, Quotas};

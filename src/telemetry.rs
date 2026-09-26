@@ -128,6 +128,7 @@ pub(crate) async fn init_jail(
     config: Option<&Telemetry>,
     profile: &str,
     shape: &str,
+    session: Option<&str>,
 ) -> Result<SdkTracerProvider, SetupError> {
     let attributes = std::env::var("OTEL_RESOURCE_ATTRIBUTES").map_err(|_| SetupError)?;
     let get = |key| {
@@ -137,7 +138,9 @@ pub(crate) async fn init_jail(
             .find(|(k, _)| *k == key)
             .map(|(_, v)| v)
     };
-    let session = get("vm_runner.session_id").ok_or(SetupError)?;
+    let session = session
+        .or_else(|| get("vm_runner.session_id"))
+        .ok_or(SetupError)?;
     let subject = get("vm_runner.subject").ok_or(SetupError)?;
     if uuid::Uuid::parse_str(session)
         .map_err(|_| SetupError)?

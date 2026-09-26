@@ -99,4 +99,32 @@ peer set); port-zero datagrams are dropped. Unspecified, broadcast, multicast an
 idle timeout and shares the connection cap and maximum lifetime with HTTP/TLS. Both gateway HTTP ports use the same fail-closed classifier and upstream address
 policy as the explicit proxy; origin-form HTTP uses Host, and TLS uses SNI checked against Host.
 
+## Jail boot and image cache
+
+`vm-runnerd fetch-image --digest <ref@sha256:…> --cache <dir>` anonymously selects the native
+Linux guest image, locks the cache directory, streams and verifies both layer digests, and
+unpacks the rootfs before atomically publishing a digest/architecture directory. Layers are
+limited to 16 GiB each and the expanded rootfs to 64 GiB. The cache is trusted host storage;
+delete an affected digest directory while no jail uses it to reset a damaged entry.
+
+On Linux, `vm-runnerd jail --config <file> --profile <name> --session <UUIDv7>` boots Firecracker
+with the profile's shape, a read-only cached rootfs, a fresh CA drive padded to 4 KiB, and a
+sparse scratch ext4. Mount the cache read-only at `/images` and a fresh emptyDir at
+`/run/vm-runner`. Supply `vm_runner.subject` via `OTEL_RESOURCE_ATTRIBUTES`. The container
+requires uid 0, only `NET_ADMIN`, `/dev/kvm` and `/dev/net/tun`, with default seccomp.
+Configure these **pod network-namespace sysctls before startup** (the container's default
+`/proc/sys` mount is read-only): `net.ipv4.ip_forward=0`,
+`net.ipv4.conf.all.rp_filter=1`, and `net.ipv4.conf.default.rp_filter=1`.
+The jail verifies these and the new tap's inherited `rp_filter=1`, installs the guest-source
+and gateway-port firewall, then brings tap0 up. Node policy must permit those pod sysctls.
+The runtime image includes digest-verified Firecracker 1.17.0, iproute2, nftables and e2fsprogs.
+SIGTERM kills and reaps the VM before flushing telemetry; the pod owns netns/emptyDir cleanup.
+
+This boot-only command does not yet serve the jail API or in-process egress; guest network
+traffic remains blocked beyond the allowed local gateway ports, which have no listener.
+The explicit `cargo test --locked --test kvm` target requires the runtime setup above and
+`KVM_GUEST_IMAGE`; ordinary `cargo test` excludes it. The KVM workflow probes `/dev/kvm` and
+omits the hardware job when unavailable; when present it boots under the stated capability,
+device and mount constraints. Both native Linux architectures still run ordinary CI.
+
 Licensed under either of Apache-2.0 or MIT at your option.

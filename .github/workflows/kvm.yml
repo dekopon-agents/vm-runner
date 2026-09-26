@@ -1,0 +1,55 @@
+name: KVM
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    outputs:
+      available: ${{ steps.kvm.outputs.available }}
+    steps:
+      - id: kvm
+        run: |
+          if test -c /dev/kvm; then
+            echo 'available=true' >> "$GITHUB_OUTPUT"
+            echo 'KVM available; running the jail boot test' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'available=false' >> "$GITHUB_OUTPUT"
+            echo 'No /dev/kvm; kvm job omitted' >> "$GITHUB_STEP_SUMMARY"
+          fi
+  kvm:
+    needs: probe
+    if: needs.probe.outputs.available == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      KVM_GUEST_IMAGE: ghcr.io/dekopon-agents/vm-runner-guest@sha256:0fed2836fdd61e872f45465917953b91ddac198eff5e4e951ee21da9dd03331c
+    steps:
+      - run: test -c /dev/kvm
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Build runner and the explicit KVM test target
+        run: |
+          cargo build --locked --bin vm-runnerd
+          cargo test --locked --test kvm --no-run --message-format=json > "$RUNNER_TEMP/kvm-build.jsonl"
+          python3 -c 'import json,sys; print(next(x["executable"] for x in map(json.loads,open(sys.argv[1])) if x.get("target",{}).get("name")=="kvm" and x.get("executable")))' "$RUNNER_TEMP/kvm-build.jsonl" > "$RUNNER_TEMP/kvm-executable"
+      - name: Fetch pinned guest anonymously and build runtime image
+        run: |
+          target/debug/vm-runnerd fetch-image --digest "$KVM_GUEST_IMAGE" --cache "$RUNNER_TEMP/images"
+          mkdir "$RUNNER_TEMP/kvm-context"
+          cp Dockerfile target/debug/vm-runnerd "$RUNNER_TEMP/kvm-context/"
+          docker build --build-arg TARGETARCH=amd64 -t vm-runner:kvm "$RUNNER_TEMP/kvm-context"
+      - name: Boot with only NET_ADMIN and the two devices
+        run: |
+          docker run --rm --user 0:0 --cap-drop ALL --cap-add NET_ADMIN \
+            --device /dev/kvm --device /dev/net/tun \
+            --sysctl net.ipv4.ip_forward=0 \
+            --sysctl net.ipv4.conf.all.rp_filter=1 \
+            --sysctl net.ipv4.conf.default.rp_filter=1 \
+            --tmpfs /run/vm-runner \
+            -v "$RUNNER_TEMP/images:/images:ro" -v "$PWD:$PWD:ro" -w "$PWD" \
+            -e KVM_GUEST_IMAGE --entrypoint "$(cat "$RUNNER_TEMP/kvm-executable")" vm-runner:kvm --nocapture

@@ -8,6 +8,22 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Command {
+    #[cfg(unix)]
+    FetchImage {
+        #[arg(long)]
+        digest: String,
+        #[arg(long)]
+        cache: PathBuf,
+    },
+    #[cfg(unix)]
+    Jail {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        profile: String,
+        #[arg(long)]
+        session: String,
+    },
     Serve {
         #[arg(long)]
         config: PathBuf,
@@ -47,6 +63,12 @@ fn conflicts(config: &Config, command: &Command) -> Vec<String> {
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let command = Cli::parse().command;
     let path = match &command {
+        #[cfg(unix)]
+        Command::FetchImage { digest, cache } => {
+            return vm_runner::jail::image::fetch(digest, cache).await;
+        }
+        #[cfg(unix)]
+        Command::Jail { config, .. } => config,
         Command::Openapi => {
             print!("{}", openapi());
             return Ok(());
@@ -65,6 +87,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
     if matches!(command, Command::Check { .. }) {
         return Ok(());
+    }
+    #[cfg(unix)]
+    if let Command::Jail {
+        profile, session, ..
+    } = command
+    {
+        return vm_runner::jail::run(config, &profile, &session).await;
     }
     if let Command::Egress {
         profile,

@@ -25,6 +25,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          git fetch --force origin "+$GITHUB_REF:$GITHUB_REF"
           test "$(git cat-file -t "$GITHUB_REF")" = tag
           test "$(git rev-parse "$GITHUB_REF^{commit}")" = "$(git rev-parse origin/main)"
           for ((attempt=0; attempt<60; attempt++)); do

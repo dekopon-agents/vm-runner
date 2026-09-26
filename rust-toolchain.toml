@@ -1,0 +1,13 @@
+# Component toolchain pin. Do not touch this unless you are moving all of these in lockstep:
+#   rust-toolchain.toml            one Rust for the workspace, the fixtures and every CI job
+#   Cargo.toml rust-version        the same number, kept for crates.io metadata
+#   Cargo.toml wasmtime, wit-bindgen, and the six examples/providers/*/Cargo.toml wit-bindgen pins
+#   ci/toolchain.env               wasm-tools and wkg, with their sha256
+#   deny.toml [[skip]]             wasm-encoder / wasmparser / wit-parser versions
+# then rebuild every examples/providers/*.wasm on the pinned CI image.
+# wit-bindgen's generated code must agree with the wasm-tools CLI and with Wasmtime's component
+# model crates. History: #206; #191 is the lone wit-bindgen bump that could not build.
+[toolchain]
+channel = "1.98.1"
+components = ["clippy", "rustfmt"]
+profile = "minimal"

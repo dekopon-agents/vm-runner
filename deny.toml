@@ -1,0 +1,59 @@
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = [
+  { id = "RUSTSEC-2026-0194", reason = "quick-xml 0.36 via poem-openapi is unreachable: no route accepts XML, enforced by the OpenAPI request-body test; revisit at quick-xml >= 0.41 or an XML route" },
+  { id = "RUSTSEC-2026-0195", reason = "quick-xml 0.36 via poem-openapi is unreachable: no route accepts XML, enforced by the OpenAPI request-body test; revisit at quick-xml >= 0.41 or an XML route" },
+]
+
+[licenses]
+version = 2
+confidence-threshold = 0.93
+allow = [
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-3-Clause",
+  "CDLA-Permissive-2.0",
+  "ISC",
+  "MIT",
+  "Unicode-3.0",
+  "Zlib",
+]
+exceptions = [
+  # reason: poem-openapi unconditionally enables poem SSE; unmodified file-level copyleft is acceptable in this OSS binary; revisit when adding an SSE route.
+  { crate = "sse-codec", allow = ["MPL-2.0"] },
+]
+
+[bans]
+multiple-versions = "deny"
+wildcards = "deny"
+# Narrowly: a *path* dependency may carry `version = "*"`. It cannot reach crates.io that way —
+# cargo requires a real version on any published dependency — so this admits no unpinned registry
+# crate. It exists for `dekopon-broker-host`'s path-only dev-dependency on
+# `dekopon-provider-sdk-testkit`, which depends back on it; omitting the version is what makes
+# `cargo package` strip the edge so the cycle never leaves the workspace.
+allow-wildcard-paths = true
+highlight = "all"
+deny = []
+skip = [
+  { crate = "base64@0.22.1", reason = "hyper-util, jaq-std, reqwest, tonic, and ureq still decode with base64 0.22 while this workspace has moved to 0.23; removable once those crates ship releases built on base64 0.23" },
+  { crate = "getrandom@0.2.17", reason = "rustls uses ring's established getrandom 0.2 API while tempfile uses 0.4" },
+  { crate = "getrandom@0.3.4", reason = "OpenTelemetry's rand 0.9 ID generator has not converged on tempfile's getrandom 0.4 API" },
+  { crate = "r-efi@5.3.0", reason = "getrandom 0.3 and 0.4 require different target-only UEFI adapters" },
+  { crate = "syn@2.0.119", reason = "Wasmtime and WIT macro dependencies have not converged on syn 3" },
+  { crate = "untrusted@0.7.1", reason = "aws-lc-rs ring-compatibility API requires 0.7; ring and rustls-webpki require 0.9, so version alignment is unavailable" },
+  { crate = "windows-sys@0.52.0", reason = "ring's Windows support trails the current workspace Windows bindings" },
+]
+skip-tree = [
+  { crate = "windows-targets@0.52.6", reason = "transitive architecture packages required by ring's Windows bindings" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# Exact revision is pinned in Cargo.toml for tokio-rs/tracing#3614.
+allow-git = ["https://github.com/dekopon-agents/tracing"]

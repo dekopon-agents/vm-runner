@@ -36,4 +36,4 @@ ip addr add 10.0.2.2/30 dev eth0
 ip link set eth0 up
 ip route add default via 10.0.2.1 dev eth0
 printf 'nameserver 10.0.2.1\n' > /etc/resolv.conf
-exec /usr/local/bin/vm-guest-agent
+exec /usr/bin/tini -- /usr/local/bin/vm-guest-agent

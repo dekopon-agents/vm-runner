@@ -339,3 +339,60 @@ async fn ping_closes_after_one_response_and_malformed_json_is_refused() {
         json!({"outcome":"not_executed", "reason":"invalid_request"})
     );
 }
+
+// The guest's PID 1 is tini with the agent as its only child; `tini -s` stands in for PID 1 here.
+#[cfg(target_os = "linux")]
+#[test]
+fn orphaned_grandchildren_are_reaped_by_init_while_exec_exit_codes_stay_exact() {
+    let status = std::process::Command::new("tini")
+        .args(["-s", "--"])
+        .arg(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "guest::tests::agent_under_init",
+            "--ignored",
+            "--nocapture",
+        ])
+        .status()
+        .expect("tini, the guest's init, must be installed");
+    assert!(status.success(), "agent under tini failed: {status}");
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "runs as tini's child from orphaned_grandchildren_are_reaped_by_init_..."]
+async fn agent_under_init() {
+    let init = std::os::unix::process::parent_id();
+    let (_dir, guest) = guest();
+    // Like `browse`, each exec leaves a setsid orphan that outlives it and exits later.
+    let responses = futures_util::future::join_all((0..8).map(|code| {
+        call(
+            &guest,
+            exec(&format!("setsid sleep 1 & echo $!; exit {code}")),
+        )
+    }))
+    .await;
+    for (code, response) in responses.iter().enumerate() {
+        assert_eq!(response["exitCode"], code, "{response}");
+        let orphan: u32 = response["stdout"].as_str().unwrap().trim().parse().unwrap();
+        let stat = format!("/proc/{orphan}/stat");
+        timeout(Duration::from_secs(10), async {
+            while let Ok(text) = fs::read_to_string(&stat).await {
+                let fields: Vec<&str> = text
+                    .rsplit_once(')')
+                    .unwrap()
+                    .1
+                    .split_whitespace()
+                    .collect();
+                assert_eq!(
+                    fields[1].parse::<u32>().unwrap(),
+                    init,
+                    "orphan {orphan} not adopted by init"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("orphan {orphan} was never reaped"));
+    }
+}

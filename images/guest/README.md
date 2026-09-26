@@ -18,7 +18,9 @@ checks the architecture-specific SHA-256 embedded in `build.sh`.
 Boot with `init=/sbin/vm-init ro`, a read-only rootfs on vda, the session CA PEM
 on vdb, and a formatted scratch ext4 on vdc. Init pivots into an overlay backed
 by scratch, mounts `/artifacts` there for uid 1000, installs system/NSS/Node
-trust, and configures eth0 as 10.0.2.2/30 via 10.0.2.1 before starting the agent.
+trust, and configures eth0 as 10.0.2.2/30 via 10.0.2.1, then execs Debian's `tini` as
+PID 1 with the agent as its only child. Orphans such as `browse`'s detached Chromium
+reparent to tini, which reaps them; the agent waits only for its own execs.
 The `jail` user's default Node module and browser-cache paths point at the baked
 Playwright installation; no browser download is needed at exec time.
 

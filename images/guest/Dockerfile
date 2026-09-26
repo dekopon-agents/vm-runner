@@ -3,7 +3,7 @@ FROM debian:trixie@sha256:9cc080028c43b27d2074d63a5f9caf7166d731494965616c1a6d28
 ENV DEBIAN_FRONTEND=noninteractive
 ARG TARGETARCH
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl ca-certificates openssl libnss3-tools iproute2 util-linux xz-utils \
+    curl ca-certificates openssl libnss3-tools iproute2 util-linux xz-utils tini \
     && groupadd --gid 1000 jail && useradd --uid 1000 --gid 1000 --create-home jail
 RUN case "$TARGETARCH" in \
       amd64) node_arch=x64; sha=fd8e59d5a511510f6a298afb548f18c7d2b1be404d8b4a27d94fbe49f56cb2d6 ;; \

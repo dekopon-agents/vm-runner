@@ -327,6 +327,7 @@ async fn job_capacity_refuses_active_work_and_evicts_only_non_running_records() 
         guest: Arc::new(Guest::new(dir.path().join("absent.sock"))),
         ready: Arc::new(AtomicBool::new(false)),
         jobs: Mutex::new(jobs),
+        transfers: Arc::new(tokio::sync::Semaphore::new(4)),
     };
     let input = || ExecInput {
         argv: vec!["true".into()],

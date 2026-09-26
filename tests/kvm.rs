@@ -108,6 +108,25 @@ async fn jail_vmm_has_no_new_privileges_and_confined_identity_and_egress() {
         assert_eq!(api.get("http://127.0.0.1:8080/healthz").bearer_auth(&token).send().await.unwrap().status(), 200);
         let result = exec(&api, &token, "node -e \"require('node:dns').resolve4('example.com',(e,a)=>{if(e||JSON.stringify(a)!=='[\\\"10.0.2.1\\\"]')process.exit(1)})\" && curl --fail --http1.1 --max-time 15 https://example.com").await;
         assert!(result["stdout"].as_str().unwrap().contains("Example Domain"));
+        assert!(!tokio::fs::try_exists("/usr/bin/curl").await.unwrap());
+        exec(&api, &token, "mkdir -p /artifacts/nested; printf hello > /artifacts/nested/test.txt").await;
+        let files: Value = api.get("http://127.0.0.1:8080/artifacts").bearer_auth(&token).send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+        assert_eq!(files[0]["path"], "nested/test.txt");
+        assert_eq!(files[0]["bytes"], 5);
+        let response = api.get("http://127.0.0.1:8080/artifacts/nested%2Ftest.txt").bearer_auth(&token).header("Range", "bytes=1-3").send().await.unwrap();
+        assert_eq!(response.status(), 206);
+        assert_eq!(response.headers()["content-range"], "bytes 1-3/5");
+        assert_eq!(response.headers()["sha256"], "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824");
+        assert_eq!(response.text().await.unwrap(), "ell");
+        let vmm = reqwest::Client::builder().unix_socket("/run/vm-runner/firecracker.sock").build().unwrap();
+        let config: Value = vmm.get("http://localhost/vm/config").send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+        // Post-boot config enumerates the device manager's HashMap, not boot drive order.
+        let scratch = config["drives"].as_array().unwrap().iter().find(|drive| drive["drive_id"] == "scratch").expect("scratch drive missing from live config");
+        assert_eq!(scratch["rate_limiter"]["bandwidth"]["size"], 100_000_000);
+        let nic = config["network-interfaces"].as_array().unwrap().iter().find(|nic| nic["iface_id"] == "eth0").expect("eth0 missing from live config");
+        for direction in ["rx_rate_limiter", "tx_rate_limiter"] {
+            assert_eq!(nic[direction]["bandwidth"]["size"], 25_000_000);
+        }
         let probe = tokio::net::UdpSocket::bind("0.0.0.0:0").await.unwrap();
         probe.connect("1.1.1.1:80").await.unwrap();
         let pod = probe.local_addr().unwrap().ip();

@@ -48,4 +48,16 @@ spans to at most one per second, with `count` giving the number refused since th
 export never blocks the accept loop. Shutdown stops accepting and drains the bounded workers
 and final refusal count before shutting down telemetry.
 
+## Guest agent
+
+`vm-guest-agent` runs as root inside a Linux guest and serves one length-prefixed JSON request
+per vsock connection on port 1024. Requests are processed sequentially. Exec runs as uid/gid 1000
+with HOME and default cwd `/home/jail`; deadlines kill the process group, and stdout/stderr are
+capped at 64 KiB each while excess output is drained. `/artifacts` must be owned by uid 1000.
+Artifact listing hashes regular files recursively without following symlinks; reads canonicalize
+paths beneath `/artifacts` and open relative to a directory handle, so symlink replacements cannot
+escape between the check and open. Large reads may return fewer bytes than requested to keep base64 and
+its JSON envelope within the 1 MiB frame cap; continue at the returned byte count until `eof`.
+A ping returns `{"ok":true}`. Other platforms print `linux only` and exit 2.
+
 Licensed under either of Apache-2.0 or MIT at your option.

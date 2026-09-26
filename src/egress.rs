@@ -54,6 +54,9 @@ struct Ca {
 impl Ca {
     fn new() -> Result<(Self, String), Error> {
         let mut params = CertificateParams::default();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "vm-runner egress CA");
         params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
         params.key_usages = vec![
             rcgen::KeyUsagePurpose::KeyCertSign,
@@ -69,18 +72,31 @@ impl Ca {
         ))
     }
     fn server(&self, host: &str) -> Result<Arc<ServerConfig>, Error> {
-        let key = KeyPair::generate()?;
-        let cert = CertificateParams::new(vec![host.to_owned()])?.signed_by(&key, &self.issuer)?;
+        let (cert, key) = self.leaf(host)?;
         let config = ServerConfig::builder_with_provider(Arc::new(
             rustls::crypto::aws_lc_rs::default_provider(),
         ))
         .with_safe_default_protocol_versions()?
         .with_no_client_auth()
         .with_single_cert(
-            vec![cert.der().clone()],
+            vec![cert],
             PrivatePkcs8KeyDer::from(key.serialize_der()).into(),
         )?;
         Ok(Arc::new(config))
+    }
+    fn leaf(
+        &self,
+        host: &str,
+    ) -> Result<(rustls::pki_types::CertificateDer<'static>, KeyPair), Error> {
+        let key = KeyPair::generate()?;
+        let mut params = CertificateParams::new(vec![host.to_owned()])?;
+        params.distinguished_name = rcgen::DistinguishedName::new();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, host);
+        params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+        let cert = params.signed_by(&key, &self.issuer)?;
+        Ok((cert.der().clone(), key))
     }
 }
 enum Classified {

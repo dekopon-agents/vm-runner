@@ -889,3 +889,16 @@ fn suffix_allowlist_respects_label_boundaries_and_attributes_are_byte_bounded() 
     assert!(value.len() <= 4096);
     assert!(value.ends_with("…[truncated]"));
 }
+
+#[test]
+fn minted_leaf_names_its_host_and_chains_to_a_distinct_ca_subject() {
+    let (ca, pem) = Ca::new().unwrap();
+    let (leaf, _) = ca.leaf("www.example.com").unwrap();
+    let (_, ca_der) = x509_parser::pem::parse_x509_pem(pem.as_bytes()).unwrap();
+    let ca_cert = ca_der.parse_x509().unwrap();
+    let (_, leaf_cert) = x509_parser::parse_x509_certificate(&leaf).unwrap();
+    assert_eq!(leaf_cert.issuer(), ca_cert.subject());
+    assert_ne!(leaf_cert.subject(), leaf_cert.issuer());
+    let eku = leaf_cert.extended_key_usage().unwrap().unwrap().value;
+    assert!(eku.server_auth);
+}

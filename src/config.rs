@@ -87,6 +87,9 @@ fn egress_idle() -> NonZeroU32 {
 fn egress_lifetime() -> NonZeroU32 {
     const { NonZeroU32::new(1800).expect("nonzero default") }
 }
+// One worker and one DNS lookup per connection, plus refusal export and spare work,
+// must fit Tokio's default 512 blocking threads: 2 * 255 + 2 = 512.
+const MAX_EGRESS_CONNECTIONS: u32 = 255;
 fn egress_connections() -> NonZeroU32 {
     const { NonZeroU32::new(128).expect("nonzero default") }
 }
@@ -158,6 +161,8 @@ pub enum Conflict {
     Wildcard(String),
     #[error("idleSeconds exceeds maxSeconds: {0}")]
     Lifetime(String),
+    #[error("egress.maxConnections exceeds 255 (Tokio blocking-pool budget): {0}")]
+    EgressConnections(String),
     #[error("invalid service account subject: {0}")]
     Subject(String),
 }
@@ -207,6 +212,9 @@ impl Config {
             }
             if profile.idle_seconds > profile.max_seconds {
                 errors.push(Conflict::Lifetime(name.clone()));
+            }
+            if profile.egress.max_connections.get() > MAX_EGRESS_CONNECTIONS {
+                errors.push(Conflict::EgressConnections(name.clone()));
             }
             if profile.egress.allow.is_empty() {
                 errors.push(Conflict::EmptyAllow(name.clone()));

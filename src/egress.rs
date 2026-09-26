@@ -112,6 +112,7 @@ enum Refusal {
     NotAllowed,
     Protocol,
     Address,
+    Dns,
     Connections,
 }
 impl Refusal {
@@ -121,6 +122,7 @@ impl Refusal {
             Self::NotAllowed => "refused:not_allowed",
             Self::Protocol => "refused:protocol",
             Self::Address => "refused:address",
+            Self::Dns => "refused:dns",
             Self::Connections => "refused:connections",
         }
     }
@@ -174,23 +176,46 @@ fn safe_url(value: &str) -> String {
 struct RequestSpan {
     span: tracing::Span,
     status: i64,
+    decision: &'static str,
 }
 impl Drop for RequestSpan {
     fn drop(&mut self) {
         // Finalize once even when the connection deadline cancels forwarding.
         self.span.record("http.response.status_code", self.status);
+        self.span.record("egress.decision", self.decision);
     }
 }
 fn span(method: &str, url: &str, host: &str) -> RequestSpan {
     RequestSpan {
-        span: tracing::info_span!(parent: None, "egress.request", http.request.method = %cut(method), url.full = %safe_url(url), server.address = %cut(host), http.response.status_code = tracing::field::Empty, egress.decision = tracing::field::Empty),
+        span: tracing::info_span!(parent: None, "egress.request", http.request.method = %cut(method), url.full = %safe_url(url), server.address = %cut(host), http.response.status_code = tracing::field::Empty, egress.decision = tracing::field::Empty, count = tracing::field::Empty),
         status: 0,
+        decision: "allowed",
     }
 }
 fn protocol_refusal(host: Option<&str>) {
-    let span = span("", "", host.unwrap_or(""));
-    span.span
-        .record("egress.decision", Refusal::Protocol.decision());
+    let mut span = span("", "", host.unwrap_or(""));
+    span.decision = Refusal::Protocol.decision();
+}
+fn forward_response(
+    result: Result<Response<HttpBody>, Error>,
+    span: &mut RequestSpan,
+    host: &str,
+) -> Response<HttpBody> {
+    match result {
+        Ok(response) => response,
+        Err(error) if error.is::<AddressRefused>() || error.is::<DnsFailed>() => {
+            span.decision = if error.is::<DnsFailed>() {
+                Refusal::Dns.decision()
+            } else {
+                Refusal::Address.decision()
+            };
+            reply(StatusCode::FORBIDDEN, format!("egress refused: {host}"))
+        }
+        Err(error) => {
+            tracing::warn!(%error, "egress upstream failed");
+            reply(StatusCode::BAD_GATEWAY, String::new())
+        }
+    }
 }
 fn reply(status: StatusCode, body: String) -> Response<HttpBody> {
     let mut response = Response::new(
@@ -363,11 +388,11 @@ impl Engine {
         let tls = uri.scheme_str() == Some("https");
         let port = uri.port_u16().unwrap_or(if tls { 443 } else { 80 });
         async {
-            let addresses: Vec<_> = tokio::net::lookup_host((host.trim_matches(['[', ']']), port))
-                .await?
-                .collect();
-            let addresses = vetted_addresses(&addresses, &self.egress.allow_private)?;
-            let tcp = TcpStream::connect(addresses).await?;
+            let addresses = resolved_addresses(
+                tokio::net::lookup_host((host.trim_matches(['[', ']']), port)).await,
+                &self.egress.allow_private,
+            )?;
+            let tcp = TcpStream::connect(addresses.as_slice()).await?;
             if tls {
                 Ok::<Stream, Error>(Box::new(
                     TlsConnector::from(Arc::clone(&self.tls))
@@ -465,11 +490,10 @@ impl Engine {
         let decision = destination(&req, tunnel, &self.egress.allow);
         let response = match decision {
             Err(reason) => {
-                span.span.record("egress.decision", reason.decision());
+                span.decision = reason.decision();
                 reply(StatusCode::FORBIDDEN, format!("egress refused: {host}"))
             }
             Ok(uri) => {
-                span.span.record("egress.decision", "allowed");
                 if req.method() == hyper::Method::CONNECT {
                     match upgrade.lock() {
                         Ok(mut slot) => {
@@ -485,18 +509,8 @@ impl Engine {
                         }
                     }
                 } else {
-                    match self.forward(req, uri).instrument(span.span.clone()).await {
-                        Ok(response) => response,
-                        Err(error) if error.is::<AddressRefused>() => {
-                            span.span
-                                .record("egress.decision", Refusal::Address.decision());
-                            reply(StatusCode::FORBIDDEN, format!("egress refused: {host}"))
-                        }
-                        Err(error) => {
-                            tracing::warn!(%error, "egress upstream failed");
-                            reply(StatusCode::BAD_GATEWAY, String::new())
-                        }
-                    }
+                    let result = self.forward(req, uri).instrument(span.span.clone()).await;
+                    forward_response(result, &mut span, &host)
                 }
             }
         };
@@ -596,6 +610,15 @@ impl Engine {
     ) -> Result<(), Error> {
         tracing::info!(addr = %listener.local_addr()?, "listening");
         let mut workers = tokio::task::JoinSet::new();
+        let (refusals, refused) = watch::channel(0_i64);
+        let runtime = tokio::runtime::Handle::current();
+        let dispatch = tracing::dispatcher::get_default(Clone::clone);
+        // One worker coalesces counts, rather than queueing a task/span per refused socket.
+        let refusal_worker = tokio::task::spawn_blocking(move || {
+            tracing::dispatcher::with_default(&dispatch, || {
+                runtime.block_on(connection_refusals(refused));
+            });
+        });
         tokio::pin!(stop);
         let outcome = loop {
             tokio::select! {
@@ -615,12 +638,7 @@ impl Engine {
                     let dispatch = tracing::dispatcher::get_default(Clone::clone);
                     if workers.len() >= self.egress.max_connections.get() as usize {
                         drop(stream);
-                        // One awaited exporter task keeps synchronous OTLP off the accept loop's runtime.
-                        tokio::task::spawn_blocking(move || tracing::dispatcher::with_default(&dispatch, || {
-                            let _entered = runtime.enter();
-                            let span = span("", "", "");
-                            span.span.record("egress.decision", Refusal::Connections.decision());
-                        })).await?;
+                        refusals.send_modify(|count| *count += 1);
                         continue;
                     }
                     let started = Instant::now();
@@ -635,14 +653,41 @@ impl Engine {
                 }
             }
         };
+        drop(refusals);
         let mut outcome = outcome;
         while let Some(result) = workers.join_next().await {
             if let Err(error) = result {
                 outcome = Err(error.into());
             }
         }
+        if let Err(error) = refusal_worker.await {
+            outcome = Err(error.into());
+        }
         outcome
     }
+}
+async fn connection_refusals(mut refused: watch::Receiver<i64>) {
+    let mut exported = 0;
+    while refused.changed().await.is_ok() {
+        // At most one span per second; a slow exporter only grows the coalesced count.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let total = *refused.borrow_and_update();
+        let mut span = span("", "", "");
+        span.decision = Refusal::Connections.decision();
+        span.span.record("count", total - exported);
+        exported = total;
+    }
+}
+#[derive(Debug, thiserror::Error)]
+#[error("egress DNS resolution failed: {0}")]
+struct DnsFailed(#[source] std::io::Error);
+fn resolved_addresses(
+    result: std::io::Result<impl Iterator<Item = SocketAddr>>,
+    exceptions: &[ipnet::IpNet],
+) -> Result<Vec<SocketAddr>, Error> {
+    let addresses: Vec<_> = result.map_err(DnsFailed)?.collect();
+    vetted_addresses(&addresses, exceptions)?;
+    Ok(addresses)
 }
 #[derive(Debug, thiserror::Error)]
 #[error("egress address refused")]

@@ -24,7 +24,7 @@ use std::{
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader},
-    net::{TcpListener, TcpStream},
+    net::TcpStream,
     sync::watch,
     time::Instant,
 };
@@ -36,6 +36,8 @@ use tokio_rustls::{
     },
 };
 use tracing::Instrument;
+
+mod gateway;
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
 type HttpBody = UnsyncBoxBody<Bytes, Error>;
@@ -267,11 +269,17 @@ fn destination(
     if connect && tunnel.is_some() {
         return Err(Refusal::Protocol);
     }
+    let mut hosts = req.headers().get_all(header::HOST).iter();
+    let host = hosts
+        .next()
+        .and_then(|h| h.to_str().ok())
+        .and_then(|h| h.parse::<hyper::http::uri::Authority>().ok())
+        .ok_or(Refusal::HostMismatch)?;
     let authority = req
         .uri()
         .authority()
         .or_else(|| tunnel.map(|t| &t.authority))
-        .ok_or(Refusal::HostMismatch)?;
+        .unwrap_or(&host);
     let scheme = if connect {
         "https"
     } else {
@@ -286,12 +294,6 @@ fn destination(
     if !matches!(scheme, "http" | "https") {
         return Err(Refusal::Protocol);
     }
-    let mut hosts = req.headers().get_all(header::HOST).iter();
-    let host = hosts
-        .next()
-        .and_then(|h| h.to_str().ok())
-        .and_then(|h| h.parse::<hyper::http::uri::Authority>().ok())
-        .ok_or(Refusal::HostMismatch)?;
     let default = if scheme == "https" { 443 } else { 80 };
     let destination_port = port(authority, default)?;
     if hosts.next().is_some()
@@ -466,10 +468,16 @@ impl Engine {
         recorded: &Cell<bool>,
     ) -> Result<Response<HttpBody>, Infallible> {
         recorded.set(true);
+        let header_host = req
+            .headers()
+            .get(header::HOST)
+            .and_then(|h| h.to_str().ok())
+            .and_then(|h| h.parse::<hyper::http::uri::Authority>().ok());
         let host = req
             .uri()
             .host()
             .or_else(|| tunnel.map(|t| t.authority.host()))
+            .or_else(|| header_host.as_ref().map(|h| h.host()))
             .unwrap_or("");
         let host = host.to_owned();
         let url = if req.method() == hyper::Method::CONNECT {
@@ -483,6 +491,8 @@ impl Engine {
                 t.authority,
                 req.uri()
             )
+        } else if let Some(authority) = &header_host {
+            format!("http://{authority}{}", req.uri())
         } else {
             req.uri().to_string()
         };
@@ -581,10 +591,14 @@ impl Engine {
         stream: Stream,
         record: &mut ConnectionRecord,
         started: Instant,
+        protocol: gateway::Protocol,
     ) -> Result<(), Error> {
         let (activity, mut changed) = watch::channel(started);
         let stream = Box::new(ActiveStream { stream, activity });
-        let idle = Duration::from_secs(self.egress.idle_seconds.get().into());
+        let idle = match protocol {
+            gateway::Protocol::Http => Duration::from_secs(self.egress.idle_seconds.get().into()),
+            gateway::Protocol::Dns(_) => Duration::from_secs(10),
+        };
         let lifetime = Duration::from_secs(self.egress.max_connection_seconds.get().into());
         let idle_timeout = async {
             loop {
@@ -600,15 +614,35 @@ impl Engine {
             biased;
             _ = tokio::time::sleep_until(started + lifetime) => Err(ConnectionTimeout::Lifetime.into()),
             _ = idle_timeout => Err(ConnectionTimeout::Idle.into()),
-            result = self.connection(stream, record) => result,
+            result = async {
+                match protocol {
+                    gateway::Protocol::Http => self.connection(stream, record).await,
+                    gateway::Protocol::Dns(address) => gateway::tcp(self, stream, address).await,
+                }
+            } => result,
         }
     }
     async fn serve(
         self: Arc<Self>,
-        listener: TcpListener,
+        mut listeners: gateway::Listeners,
         stop: impl Future<Output = ()>,
     ) -> Result<(), Error> {
-        tracing::info!(addr = %listener.local_addr()?, "listening");
+        if let Some(listener) = listeners.explicit.as_ref().or(listeners.http.as_ref()) {
+            tracing::info!(addr = %listener.local_addr()?, "listening");
+        }
+        let (dns_stop, stopped) = watch::channel(false);
+        let mut dns_worker = listeners.udp.take().map(|(socket, address)| {
+            let peers = listeners.dns_peers.clone();
+            let engine = Arc::clone(&self);
+            let runtime = tokio::runtime::Handle::current();
+            let dispatch = tracing::dispatcher::get_default(Clone::clone);
+            // One sequential UDP worker owns its fixed packet buffer and drains before shutdown.
+            tokio::task::spawn_blocking(move || {
+                tracing::dispatcher::with_default(&dispatch, || {
+                    runtime.block_on(gateway::udp(&engine, socket, address, &peers, stopped))
+                })
+            })
+        });
         let mut workers = tokio::task::JoinSet::new();
         let (refusals, refused) = watch::channel(0_i64);
         let runtime = tokio::runtime::Handle::current();
@@ -624,15 +658,33 @@ impl Engine {
             tokio::select! {
                 biased;
                 _ = &mut stop => break Ok(()),
+                result = async {
+                    match &mut dns_worker {
+                        Some(worker) => worker.await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    dns_worker = None;
+                    break match result {
+                        Ok(result) => result,
+                        Err(error) => Err(error.into()),
+                    };
+                }
                 result = workers.join_next(), if !workers.is_empty() => { if let Some(Err(error)) = result { break Err(Error::from(error)); } }
-                accepted = listener.accept() => {
-                    let (stream, _) = match accepted {
+                accepted = listeners.accept() => {
+                    let (stream, peer, protocol) = match accepted {
                         Ok(accepted) => accepted,
                         Err(error) => {
                             tracing::warn!(%error, "egress accept failed");
                             continue;
                         }
                     };
+                    if matches!(protocol, gateway::Protocol::Dns(_))
+                        && !listeners.dns_peers.contains(&peer.ip())
+                    {
+                        gateway::refusal("refused:address");
+                        continue;
+                    }
                     let engine = Arc::clone(&self);
                     let runtime = tokio::runtime::Handle::current();
                     let dispatch = tracing::dispatcher::get_default(Clone::clone);
@@ -645,8 +697,8 @@ impl Engine {
                     // The capped JoinSet owns each stream and its synchronous span exports until drained.
                     workers.spawn_blocking(move || tracing::dispatcher::with_default(&dispatch, || {
                         let mut record = ConnectionRecord::default();
-                        if let Err(error) = runtime.block_on(engine.bounded_connection(Box::new(stream), &mut record, started)) {
-                            record.failed();
+                        if let Err(error) = runtime.block_on(engine.bounded_connection(Box::new(stream), &mut record, started, protocol)) {
+                            if matches!(protocol, gateway::Protocol::Http) { record.failed(); }
                             tracing::warn!(%error, "egress connection failed");
                         }
                     }));
@@ -654,7 +706,15 @@ impl Engine {
             }
         };
         drop(refusals);
+        dns_stop.send_replace(true);
         let mut outcome = outcome;
+        if let Some(worker) = dns_worker {
+            match worker.await {
+                Ok(Ok(())) => (),
+                Ok(Err(error)) => outcome = Err(error),
+                Err(error) => outcome = Err(error.into()),
+            }
+        }
         while let Some(result) = workers.join_next().await {
             if let Err(error) = result {
                 outcome = Err(error.into());
@@ -863,10 +923,29 @@ fn client_config(roots: RootCertStore) -> Result<Arc<ClientConfig>, rustls::Erro
         .with_no_client_auth(),
     ))
 }
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "invalid --gateway {0}: unspecified, broadcast, multicast and loopback addresses are forbidden"
+)]
+pub struct InvalidGateway(std::net::Ipv4Addr);
+
+pub fn validate_gateway(address: std::net::Ipv4Addr) -> Result<(), InvalidGateway> {
+    if address.is_unspecified()
+        || address.is_broadcast()
+        || address.is_multicast()
+        || address.is_loopback()
+    {
+        Err(InvalidGateway(address))
+    } else {
+        Ok(())
+    }
+}
+
 pub async fn run(
     config: Config,
     profile: &str,
-    listen: SocketAddr,
+    listen: Option<SocketAddr>,
+    gateway: Option<std::net::Ipv4Addr>,
     ca_out: &Path,
 ) -> Result<(), Error> {
     let selected = config
@@ -888,7 +967,10 @@ pub async fn run(
             tls: client_config(roots)?,
         });
         engine
-            .serve(TcpListener::bind(listen).await?, crate::shutdown_signal())
+            .serve(
+                gateway::Listeners::bind(listen, gateway).await?,
+                crate::shutdown_signal(),
+            )
             .await
     }
     .await;

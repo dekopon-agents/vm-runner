@@ -39,6 +39,9 @@ allow-wildcard-paths = true
 highlight = "all"
 deny = []
 skip = [
+  { crate = "rand@0.9.5", reason = "OpenTelemetry SDK 0.33 requires rand 0.9 while security-patched hickory-proto 0.26 requires 0.10; remove when their version requirements converge" },
+  { crate = "rand_core@0.9.5", reason = "OpenTelemetry's rand 0.9 requires rand_core 0.9 while hickory-proto's rand 0.10 requires 0.10; remove alongside the rand 0.9 exception" },
+  { crate = "cpufeatures@0.2.17", reason = "Poem's headers/sha1 chain requires cpufeatures 0.2 while hickory-proto's rand/chacha20 chain requires 0.3; remove when those dependencies converge" },
   { crate = "base64@0.22.1", reason = "hyper-util, jaq-std, reqwest, tonic, and ureq still decode with base64 0.22 while this workspace has moved to 0.23; removable once those crates ship releases built on base64 0.23" },
   { crate = "getrandom@0.2.17", reason = "rustls uses ring's established getrandom 0.2 API while tempfile uses 0.4" },
   { crate = "getrandom@0.3.4", reason = "OpenTelemetry's rand 0.9 ID generator has not converged on tempfile's getrandom 0.4 API" },

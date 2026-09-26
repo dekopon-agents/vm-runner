@@ -32,7 +32,7 @@ rotates the CA; its private key stays in memory. Upstream TLS uses WebPKI roots.
 
 HTTP/1.1 and TLS-in-CONNECT are inspected; unsupported protocols fail closed. Each inner Host
 must agree with CONNECT and TLS SNI, and every forwarded request loses W3C trace headers.
-There is no transparent routing, credential injection, HTTP/2 or WebSocket tunneling.
+There is no credential injection, HTTP/2 or WebSocket tunneling.
 After DNS resolution, every returned address must be global unicast before the proxy connects
 using those exact addresses. Profile `egress.allowPrivate` CIDRs are the only exceptions (empty
 by default); the host allow-list still applies. Mixed public/private DNS answers fail closed.
@@ -41,7 +41,7 @@ DNS lookup failures are `refused:dns`; empty answers and prohibited addresses ar
 
 Profile `egress.idleSeconds` defaults to 90, `maxConnectionSeconds` to 1800, and `maxConnections`
 to 128. `maxConnections` must be 1–255: one blocking worker and one DNS lookup per connection,
-plus a refusal-export worker and one spare, fit Tokio's default 512-thread blocking pool.
+plus the refusal-export and gateway UDP workers, fit Tokio's default 512-thread blocking pool.
 Successful client reads or writes reset the idle timeout, not the maximum lifetime.
 Excess connections close immediately. One background worker coalesces their `refused:connections`
 spans to at most one per second, with `count` giving the number refused since the previous span;
@@ -80,5 +80,23 @@ architectures, pushes untagged per-arch manifests, and publishes an attested mul
 `ghcr.io/dekopon-agents/vm-runner:<package-version>` plus binaries/checksums in a GitHub release.
 Only the publish job can sign attestations or create a release; image jobs can push package
 content but do not publish version tags. No workflow creates Git tags.
+
+## Gateway egress
+
+With the same session metadata, replace `--listen` with `--gateway 10.0.2.1` to bind UDP/TCP 53
+and TCP 80/443 on that IPv4 address; both flags may also be used together. Binding these ports
+requires the appropriate OS permission. The caller must configure the tap, guest route and
+firewall; this command does not configure networking.
+
+The DNS stub never queries upstream: allowed A names receive the gateway address (TTL 30),
+allowed AAAA names receive NOERROR with no answers, and disallowed names or other types receive
+NXDOMAIN. Each question emits `egress.dns` with its ASCII name, type and final decision;
+malformed queries and frames emit `refused:protocol`, and QR=1 packets are never answered.
+UDP replies are limited to 512 bytes; per-datagram I/O failures do not stop the stub.
+DNS only answers usable peer addresses in the gateway's /30 (tests supply an explicit loopback
+peer set); port-zero datagrams are dropped. Unspecified, broadcast, multicast and loopback
+`--gateway` values are rejected alongside all configuration conflicts. TCP DNS has a 10-second
+idle timeout and shares the connection cap and maximum lifetime with HTTP/TLS. Both gateway HTTP ports use the same fail-closed classifier and upstream address
+policy as the explicit proxy; origin-form HTTP uses Host, and TLS uses SNI checked against Host.
 
 Licensed under either of Apache-2.0 or MIT at your option.

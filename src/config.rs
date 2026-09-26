@@ -14,6 +14,7 @@ use std::{
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct Config {
     pub listen: SocketAddr,
+    pub(crate) tls: Option<crate::tls::Files>,
     pub(crate) auth: Auth,
     pub(crate) shapes: Names<Shape>,
     pub(crate) profiles: Names<Profile>,
@@ -198,6 +199,8 @@ pub enum Conflict {
     Image(String),
     #[error("invalid jails configuration: {0}")]
     Jails(&'static str),
+    #[error("invalid tls configuration: {0}")]
+    Tls(crate::tls::Error),
 }
 pub(crate) fn service_account(s: &str) -> bool {
     matches!(s.split(':').collect::<Vec<_>>().as_slice(), ["system", "serviceaccount", ns, name] if !ns.is_empty() && !name.is_empty() && !s.contains('*'))

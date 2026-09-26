@@ -1,4 +1,7 @@
 listen: 127.0.0.1:8080
+# tls:
+#   certFile: /var/run/secrets/vm-runner-tls/tls.crt
+#   keyFile: /var/run/secrets/vm-runner-tls/tls.key
 auth:
   audience: vm-runner
   issuers:

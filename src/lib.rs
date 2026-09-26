@@ -8,6 +8,7 @@ pub mod guest;
 #[cfg(unix)]
 pub mod jail;
 pub mod telemetry;
+mod tls;
 use auth::{Authenticator, Reason};
 use config::{Config, Quota};
 use opentelemetry::propagation::TextMapPropagator;

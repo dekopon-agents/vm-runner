@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand};
+use poem::listener::Listener;
 use std::path::PathBuf;
 use vm_runner::{app, config::Config, openapi, telemetry};
 #[derive(Parser)]
@@ -93,7 +94,14 @@ async fn run(command: Command) -> Result<(), Box<dyn std::error::Error + Send + 
         }
     };
     let config = Config::load(path).await?;
-    let conflicts = conflicts(&config, &command);
+    let mut conflicts = conflicts(&config, &command);
+    let listener = match command {
+        Command::Serve { .. } | Command::Check { .. } => config.controller_listener().await,
+        _ => Ok(poem::listener::TcpListener::bind(config.listen).boxed()),
+    };
+    if let Err(conflict) = &listener {
+        conflicts.push(conflict.to_string());
+    }
     for conflict in &conflicts {
         eprintln!("{conflict}");
     }
@@ -121,10 +129,9 @@ async fn run(command: Command) -> Result<(), Box<dyn std::error::Error + Send + 
         return vm_runner::egress::run(config, &profile, listen, gateway, &ca_out).await;
     }
     let provider = telemetry::init(config.telemetry.as_ref()).await?;
-    let listen = config.listen;
     let result = async {
         let (endpoint, requests) = app(config).await?;
-        let server = poem::Server::new(poem::listener::TcpListener::bind(listen));
+        let server = poem::Server::new(listener?);
         let result = tokio::select! {
             result = server.run_with_graceful_shutdown(endpoint, vm_runner::shutdown_signal(), Some(std::time::Duration::from_secs(30))) => result.map_err(Into::into),
             result = requests.reap() => result,

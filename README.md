@@ -16,6 +16,19 @@ returns its subject and session quota. Optional `telemetry.otlp` selects `grpc` 
 with an endpoint and optional `caBundleFile` and `headersFile` (`key: value` per line).
 Without telemetry configuration, tracing goes only to stdout JSON logs.
 
+## Controller TLS (C3 config / C4 API)
+
+Optional `tls: {certFile: /path/tls.crt, keyFile: /path/tls.key}` makes `serve` HTTPS-only
+(TLS 1.2/1.3), including `/healthz` on the same listener. Supply a PEM certificate chain
+(leaf first) and matching PEM private key. `check` and `serve` report unreadable, invalid
+or mismatched pairs alongside other configuration conflicts before startup.
+The listener checks file contents every second, including through cert-manager's rotated
+symlinks, and reloads changed pairs or every ten minutes. A failed reload retains the last
+valid pair and emits `vm_runner.tls.reload` with the failure cause, never key material.
+Existing connections continue; new handshakes use the replacement pair. Without `tls`,
+the controller remains HTTP. C1 bearer-token authentication is unchanged. The C7 jail API
+remains plaintext pod-to-pod; deployment NetworkPolicy must restrict it to the controller.
+
 ## Named sessions
 
 With a `jails` configuration, `serve` uses in-cluster Kubernetes credentials and rebuilds

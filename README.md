@@ -248,7 +248,8 @@ observation of guest files, not an immutable snapshot. Short or inconsistent chu
 transfer rather than succeeding with truncation.
 
 The explicit `cargo test --locked --test kvm` target requires the runtime setup above and
-`KVM_GUEST_IMAGE`; ordinary `cargo test` excludes it. The KVM workflow probes `/dev/kvm` and
+`KVM_GUEST_IMAGE`; ordinary `cargo test` excludes it. On Linux, ordinary `cargo test` needs `tini`
+(the guest's init) on `PATH`. The KVM workflow probes `/dev/kvm` and
 omits the hardware job when unavailable; when present it boots under the stated capability,
 device and mount constraints. Both native Linux architectures still run ordinary CI.
 

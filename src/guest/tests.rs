@@ -368,7 +368,9 @@ async fn agent_under_init() {
     let responses = futures_util::future::join_all((0..8).map(|code| {
         call(
             &guest,
-            exec(&format!("setsid sleep 1 & echo $!; exit {code}")),
+            exec(&format!(
+                "setsid sleep 1 & until [ \"$(cut -d' ' -f6 /proc/$!/stat)\" = $! ]; do :; done; echo $!; exit {code}"
+            )),
         )
     }))
     .await;

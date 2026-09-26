@@ -16,4 +16,24 @@ returns its subject and session quota. Optional `telemetry.otlp` selects `grpc` 
 with an endpoint and optional `caBundleFile` and `headersFile` (`key: value` per line).
 Without telemetry configuration, tracing goes only to stdout JSON logs.
 
+## Explicit egress proxy
+
+```sh
+export OTEL_RESOURCE_ATTRIBUTES='vm_runner.session_id=019955e0-0000-7000-8000-000000000001,vm_runner.subject=system:serviceaccount:dekopon:default'
+cargo run --locked --bin vm-runnerd -- egress --config examples/vm-runner.yaml \
+  --profile travel --listen 127.0.0.1:8080 --ca-out /tmp/vm-runner-ca
+```
+
+The launcher supplies the session UUIDv7 and service-account subject through the standard
+`OTEL_RESOURCE_ATTRIBUTES` variable; profile and shape come from validated config. These are
+local launcher metadata, not guest-provided identity. Replace the example session ID per session.
+Trust the newly written `ca.pem` in the guest and configure its explicit HTTP proxy. Restarting
+rotates the CA; its private key stays in memory. Upstream TLS uses WebPKI roots.
+
+HTTP/1.1 and TLS-in-CONNECT are inspected; unsupported protocols fail closed. Each inner Host
+must agree with CONNECT and TLS SNI, and every forwarded request loses W3C trace headers.
+There is no transparent routing, credential injection, HTTP/2 or WebSocket tunneling.
+The listener admits at most 16 connections, each with a 60-second total lifetime; shutdown stops
+accepting and drains those bounded workers before shutting down telemetry.
+
 Licensed under either of Apache-2.0 or MIT at your option.

@@ -1,6 +1,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::disallowed_methods))]
 mod auth;
 pub mod config;
+pub mod egress;
 pub mod telemetry;
 use auth::{Authenticator, Reason};
 use config::{Config, Quota, Quotas};

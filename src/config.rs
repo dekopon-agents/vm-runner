@@ -16,7 +16,7 @@ pub struct Config {
     pub listen: SocketAddr,
     pub(crate) auth: Auth,
     shapes: Names<Shape>,
-    profiles: Names<Profile>,
+    pub(crate) profiles: Names<Profile>,
     pub(crate) quotas: Quotas,
     pub telemetry: Option<Telemetry>,
 }
@@ -50,15 +50,15 @@ struct Shape {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-struct Profile {
-    shape: String,
+pub(crate) struct Profile {
+    pub shape: String,
     #[serde(rename = "image")]
     _image: String,
     #[serde(rename = "browser")]
     _browser: Browser,
     idle_seconds: u64,
     max_seconds: u64,
-    egress: Egress,
+    pub egress: Egress,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -68,8 +68,8 @@ enum Browser {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Egress {
-    allow: Vec<String>,
+pub(crate) struct Egress {
+    pub allow: Vec<String>,
     #[serde(rename = "dns")]
     _dns: Dns,
 }

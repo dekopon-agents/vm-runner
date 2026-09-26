@@ -12,6 +12,16 @@ enum Command {
         #[arg(long)]
         config: PathBuf,
     },
+    Egress {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        profile: String,
+        #[arg(long)]
+        listen: std::net::SocketAddr,
+        #[arg(long)]
+        ca_out: PathBuf,
+    },
     Check {
         #[arg(long)]
         config: PathBuf,
@@ -26,7 +36,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             print!("{}", openapi());
             return Ok(());
         }
-        Command::Serve { config } | Command::Check { config } => config,
+        Command::Serve { config } | Command::Check { config } | Command::Egress { config, .. } => {
+            config
+        }
     };
     let config = Config::load(path).await?;
     let conflicts = config.conflicts();
@@ -38,6 +50,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
     if matches!(command, Command::Check { .. }) {
         return Ok(());
+    }
+    if let Command::Egress {
+        profile,
+        listen,
+        ca_out,
+        ..
+    } = command
+    {
+        return vm_runner::egress::run(config, &profile, listen, &ca_out).await;
     }
     let provider = telemetry::init(config.telemetry.as_ref()).await?;
     let listen = config.listen;

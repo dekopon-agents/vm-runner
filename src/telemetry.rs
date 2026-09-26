@@ -9,21 +9,32 @@ use std::{collections::HashMap, time::Duration};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Debug, thiserror::Error)]
-#[error("could not initialize telemetry (check endpoint, CA and headers file)")]
+#[error(
+    "could not initialize telemetry (check endpoint, CA, headers file and jail resource attributes)"
+)]
 pub struct SetupError;
 
 #[expect(
     clippy::map_err_ignore,
     reason = "exporter setup errors can contain secret header values"
 )]
-pub(crate) async fn provider(config: Option<&Telemetry>) -> Result<SdkTracerProvider, SetupError> {
+async fn build_provider(
+    config: Option<&Telemetry>,
+    jail: Vec<KeyValue>,
+) -> Result<SdkTracerProvider, SetupError> {
+    let role = if jail.is_empty() {
+        "controller"
+    } else {
+        "jail"
+    };
     let resource = Resource::builder_empty()
         .with_attributes([
             KeyValue::new("service.name", "vm-runner"),
             KeyValue::new("service.version", env!("CARGO_PKG_VERSION")),
-            KeyValue::new("vm_runner.role", "controller"),
+            KeyValue::new("vm_runner.role", role),
             KeyValue::new("dekopon.source", "runner"),
         ])
+        .with_attributes(jail)
         .build();
     let mut builder = SdkTracerProvider::builder()
         .with_resource(resource)
@@ -103,12 +114,57 @@ pub(crate) async fn provider(config: Option<&Telemetry>) -> Result<SdkTracerProv
     }
     Ok(builder.build())
 }
+pub async fn init(config: Option<&Telemetry>) -> Result<SdkTracerProvider, SetupError> {
+    install(provider(config).await?)
+}
+pub(crate) async fn provider(config: Option<&Telemetry>) -> Result<SdkTracerProvider, SetupError> {
+    build_provider(config, Vec::new()).await
+}
+#[expect(
+    clippy::map_err_ignore,
+    reason = "environment and identity parsing errors must not echo launcher values"
+)]
+pub(crate) async fn init_jail(
+    config: Option<&Telemetry>,
+    profile: &str,
+    shape: &str,
+) -> Result<SdkTracerProvider, SetupError> {
+    let attributes = std::env::var("OTEL_RESOURCE_ATTRIBUTES").map_err(|_| SetupError)?;
+    let get = |key| {
+        attributes
+            .split(',')
+            .filter_map(|pair| pair.split_once('='))
+            .find(|(k, _)| *k == key)
+            .map(|(_, v)| v)
+    };
+    let session = get("vm_runner.session_id").ok_or(SetupError)?;
+    let subject = get("vm_runner.subject").ok_or(SetupError)?;
+    if uuid::Uuid::parse_str(session)
+        .map_err(|_| SetupError)?
+        .get_version_num()
+        != 7
+        || !crate::config::service_account(subject)
+    {
+        return Err(SetupError);
+    }
+    install(
+        build_provider(
+            config,
+            vec![
+                KeyValue::new("vm_runner.session_id", session.to_owned()),
+                KeyValue::new("vm_runner.subject", crate::egress::cut(subject)),
+                KeyValue::new("vm_runner.profile", crate::egress::cut(profile)),
+                KeyValue::new("vm_runner.shape", crate::egress::cut(shape)),
+            ],
+        )
+        .await?,
+    )
+}
 #[expect(
     clippy::map_err_ignore,
     reason = "subscriber setup errors need no credential-bearing diagnostics"
 )]
-pub async fn init(config: Option<&Telemetry>) -> Result<SdkTracerProvider, SetupError> {
-    let provider = provider(config).await?;
+fn install(provider: SdkTracerProvider) -> Result<SdkTracerProvider, SetupError> {
     tracing_subscriber::registry()
         .with(tracing_subscriber::filter::LevelFilter::INFO)
         .with(

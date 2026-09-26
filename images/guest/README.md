@@ -22,6 +22,12 @@ trust, and configures eth0 as 10.0.2.2/30 via 10.0.2.1 before starting the agent
 The `jail` user's default Node module and browser-cache paths point at the baked
 Playwright installation; no browser download is needed at exec time.
 
+`browse` (`browse --help`) keeps one headless Chromium for the life of the jail. The first
+call starts it in its own session, outside the exec's process group, with DevTools on
+127.0.0.1:9222 and a profile under `~/.browse-profile`; every call reattaches over CDP, so
+tabs, cookies and page state carry across execs. Playwright scripts can attach with
+`chromium.connectOverCDP('http://127.0.0.1:9222')`.
+
 The Guest image workflow builds both architectures on PRs without publishing.
 An owner-pushed annotated `guest-v*` tag on main additionally publishes
 `ghcr.io/dekopon-agents/vm-runner-guest:v*`. Each platform manifest has two

@@ -1,0 +1,242 @@
+#!/usr/bin/env node
+'use strict';
+// One Chromium per jail, started on first use and outliving each exec: every call reattaches over CDP.
+const { spawn } = require('node:child_process');
+const fs = require('node:fs');
+const { chromium } = require(process.env.BROWSE_PLAYWRIGHT || '/opt/playwright/node_modules/playwright');
+
+const PORT = Number(process.env.BROWSE_PORT || 9222);
+const ENDPOINT = `http://127.0.0.1:${PORT}`;
+const PROFILE = process.env.BROWSE_PROFILE || `${process.env.HOME || '/home/jail'}/.browse-profile`;
+const ARTIFACTS = process.env.BROWSE_ARTIFACTS || '/artifacts';
+const MAX_OUT = Number(process.env.BROWSE_MAX_CHARS || 6000);
+const STATE = `${PROFILE}.state.json`;
+
+const HELP = `browse: a browser that stays open for the life of the jail.
+
+browse open URL            go to URL (new tab with --tab)
+browse snapshot            URL, title and the accessibility tree (roles and names)
+browse click ROLE NAME     click by role and accessible name, e.g. click button "Search"
+browse click --text TEXT   click the first element showing TEXT
+browse fill LABEL VALUE    fill a field found by label, placeholder or name
+browse press KEY           press a key in the focused element, e.g. Enter, Tab, ArrowDown
+browse text [SELECTOR]     visible text of the page or of SELECTOR
+browse eval JS             evaluate an expression in the page and print the JSON result
+browse wait MS             wait MS milliseconds (at most 20000)
+browse shot NAME           screenshot to /artifacts/NAME
+browse tabs | tab N        list tabs, or switch to tab N
+browse reset               stop the browser and delete its profile (cookies, tabs); the next call starts clean
+
+With no arguments, commands are read from stdin, one per line (quote arguments with
+spaces), and run in order in one call. Output is capped at ${MAX_OUT} characters per command.
+Page loads are bounded so single commands finish well inside a 25 s exec; a load that times
+out still reports the page as it stands. Long batches may outlive the exec: poll the job.
+Playwright scripts can attach to the same browser:
+  const b = await chromium.connectOverCDP('${ENDPOINT}'); const page = b.contexts()[0].pages()[0];
+`;
+
+function words(line) {
+  const out = [];
+  const re = /"((?:[^"\\]|\\.)*)"|'([^']*)'|(\S+)/g;
+  let m;
+  while ((m = re.exec(line))) out.push(m[1] !== undefined ? m[1].replace(/\\(.)/g, '$1') : m[2] ?? m[3]);
+  return out;
+}
+
+function cap(text) {
+  const s = String(text ?? '');
+  return s.length > MAX_OUT ? `${s.slice(0, MAX_OUT)}\n[truncated ${s.length - MAX_OUT} chars]` : s;
+}
+
+async function alive() {
+  try {
+    return (await fetch(`${ENDPOINT}/json/version`, { signal: AbortSignal.timeout(1000) })).ok;
+  } catch {
+    return false;
+  }
+}
+
+function readState() {
+  try {
+    return JSON.parse(fs.readFileSync(STATE, 'utf8'));
+  } catch {
+    return {};
+  }
+}
+
+function writeState(patch) {
+  fs.writeFileSync(STATE, JSON.stringify({ ...readState(), ...patch }));
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function ensureBrowser() {
+  if (await alive()) return;
+  fs.mkdirSync(PROFILE, { recursive: true });
+  // Playwright's own background-traffic switches: component and variation fetches would only hit the egress deny list.
+  const child = spawn(process.env.BROWSE_CHROMIUM || chromium.executablePath(), [
+    '--headless=new', '--no-sandbox', '--no-first-run', '--no-default-browser-check',
+    '--disable-background-networking', '--disable-component-update', '--disable-sync',
+    '--disable-dev-shm-usage', '--password-store=basic', '--use-mock-keychain',
+    `--remote-debugging-port=${PORT}`, '--remote-debugging-address=127.0.0.1',
+    `--user-data-dir=${PROFILE}`, '--lang=en-US', '--window-size=1280,900', 'about:blank',
+  ], { detached: true, stdio: 'ignore' });
+  child.unref();
+  writeState({ pid: child.pid, target: null });
+  for (let i = 0; i < 100; i++) {
+    if (await alive()) return;
+    await sleep(100);
+  }
+  throw new Error('browser is still starting; run the command again');
+}
+
+async function settle(page) {
+  await page.waitForLoadState('domcontentloaded', { timeout: 3000 }).catch(() => {});
+  await page.waitForLoadState('networkidle', { timeout: 1000 }).catch(() => {});
+}
+
+async function targetId(page) {
+  const session = await page.context().newCDPSession(page);
+  try {
+    return (await session.send('Target.getTargetInfo')).targetInfo.targetId;
+  } finally {
+    await session.detach().catch(() => {});
+  }
+}
+
+async function select(state, page) {
+  state.page = page;
+  writeState({ target: await targetId(page).catch(() => null) });
+}
+
+async function where(page) {
+  return `url: ${page.url()}\ntitle: ${await page.title().catch(() => '')}`;
+}
+
+function field(page, label) {
+  return page.getByLabel(label)
+    .or(page.getByPlaceholder(label))
+    .or(page.getByRole('combobox', { name: label }))
+    .or(page.getByRole('textbox', { name: label }))
+    .or(page.getByRole('searchbox', { name: label }))
+    .first();
+}
+
+async function run(state, argv) {
+  const [cmd, ...args] = argv;
+  const page = state.page;
+  switch (cmd) {
+    case 'open': {
+      const tab = args[0] === '--tab';
+      const url = tab ? args[1] : args[0];
+      if (!url) throw new Error('usage: open [--tab] URL');
+      if (tab) await select(state, await state.context.newPage());
+      // A slow page is still a page: report where it stands instead of failing the command.
+      await state.page.goto(url, { waitUntil: 'domcontentloaded', timeout: 8000 }).catch((error) => {
+        if (error.name !== 'TimeoutError') throw error;
+      });
+      await settle(state.page);
+      return where(state.page);
+    }
+    case 'snapshot':
+      return `${await where(page)}\n${await page.locator('body').ariaSnapshot({ timeout: 10000 })}`;
+    case 'click': {
+      const target = args[0] === '--text'
+        ? page.getByText(args[1]).first()
+        : page.getByRole(args[0], args[1] === undefined ? {} : { name: args[1] }).first();
+      await target.click({ timeout: 10000 });
+      await settle(page);
+      return where(page);
+    }
+    case 'fill': {
+      if (args.length < 2) throw new Error('usage: fill LABEL VALUE');
+      await field(page, args[0]).fill(args[1], { timeout: 10000 });
+      return `filled ${JSON.stringify(args[0])}`;
+    }
+    case 'press':
+      await page.keyboard.press(args[0]);
+      await settle(page);
+      return where(page);
+    case 'text':
+      return args[0]
+        ? page.locator(args[0]).first().innerText({ timeout: 10000 })
+        : page.locator('body').innerText({ timeout: 10000 });
+    case 'eval':
+      return JSON.stringify(await page.evaluate(args.join(' ')), null, 1);
+    case 'wait':
+      await page.waitForTimeout(Math.min(Number(args[0]) || 1000, 20000));
+      return 'waited';
+    case 'shot': {
+      const name = args[0] || 'page.png';
+      if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(name)) throw new Error('shot NAME must be a flat file name');
+      await page.screenshot({ path: `${ARTIFACTS}/${name}` });
+      return `saved ${ARTIFACTS}/${name}`;
+    }
+    case 'tabs':
+      return (await Promise.all(state.context.pages().map(async (p, i) =>
+        `${i}${p === page ? '*' : ' '} ${p.url()} ${await p.title().catch(() => '')}`))).join('\n');
+    case 'tab': {
+      const next = state.context.pages()[Number(args[0])];
+      if (!next) throw new Error(`no tab ${args[0]}`);
+      await select(state, next);
+      await next.bringToFront();
+      return where(next);
+    }
+    default:
+      throw new Error(`unknown command ${JSON.stringify(cmd)}; try browse --help`);
+  }
+}
+
+async function main() {
+  const argv = process.argv.slice(2);
+  if (argv[0] === '-h' || argv[0] === '--help') return process.stdout.write(HELP);
+  if (argv[0] === 'reset') {
+    const { pid } = readState();
+    if (await alive()) {
+      await chromium.connectOverCDP(ENDPOINT, { timeout: 5000 })
+        .then((b) => b.newBrowserCDPSession())
+        .then((s) => s.send('Browser.close'))
+        .catch(() => {});
+    }
+    for (let i = 0; i < 100 && (await alive()); i++) await sleep(100);
+    if (pid) {
+      try {
+        process.kill(-pid, 'SIGKILL');
+      } catch {}
+    }
+    fs.rmSync(PROFILE, { recursive: true, force: true });
+    fs.rmSync(STATE, { force: true });
+    return console.log('browser stopped and profile deleted');
+  }
+  const batch = argv.length ? [argv] : fs.readFileSync(0, 'utf8').split('\n').map(words).filter((w) => w.length);
+  if (!batch.length) return process.stdout.write(HELP);
+  await ensureBrowser();
+  const browser = await chromium.connectOverCDP(ENDPOINT, { timeout: 10000 });
+  const context = browser.contexts()[0];
+  const pages = context.pages();
+  const { target } = readState();
+  let current = null;
+  for (const page of target ? pages : []) {
+    if ((await targetId(page).catch(() => null)) === target) current = page;
+  }
+  const state = { context, page: current || pages[pages.length - 1] || (await context.newPage()) };
+  if (!current) await select(state, state.page);
+  let failed = false;
+  for (const command of batch) {
+    if (batch.length > 1) console.log(`$ ${command.map((w) => (/\s/.test(w) ? JSON.stringify(w) : w)).join(' ')}`);
+    try {
+      console.log(cap(await run(state, command)));
+    } catch (error) {
+      console.log(`error: ${String(error.message || error).split('\n')[0]}`);
+      failed = true;
+      break;
+    }
+  }
+  // Exit without closing: the browser and its tabs stay up for the next call.
+  process.exit(failed ? 1 : 0);
+}
+
+main().catch((error) => {
+  console.error(`browse: ${String(error.message || error).split('\n')[0]}`);
+  process.exit(2);
+});

@@ -3,7 +3,7 @@
 use aws_lc_rs::signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, KeyPair};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD as B64};
 use serde_json::{Value, json};
-use std::{os::unix::fs::PermissionsExt, process::Stdio, time::Duration};
+use std::{os::unix::fs::MetadataExt, process::Stdio, time::Duration};
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
     process::Command,
@@ -11,6 +11,21 @@ use tokio::{
 
 #[tokio::test]
 async fn jail_vmm_has_no_new_privileges_and_confined_identity_and_egress() {
+    let kvm = tokio::fs::metadata("/dev/kvm").await.unwrap();
+    let tun = tokio::fs::metadata("/dev/net/tun").await.unwrap();
+    for (path, device) in [("/dev/kvm", &kvm), ("/dev/net/tun", &tun)] {
+        println!(
+            "device {path} mode={:o} uid={} gid={}",
+            device.mode() & 0o777,
+            device.uid(),
+            device.gid()
+        );
+    }
+    assert_eq!(kvm.mode() & 0o777, 0o660);
+    assert_eq!(kvm.uid(), 0);
+    assert_ne!(kvm.gid(), 0);
+    assert_ne!(kvm.gid(), 1000);
+    assert_eq!(tun.mode() & 0o777, 0o666);
     let key = EcdsaKeyPair::generate(&ECDSA_P256_SHA256_FIXED_SIGNING).unwrap();
     let point = key.public_key().as_ref();
     let jwks = json!({"keys":[{"kty":"EC","crv":"P-256","kid":"kvm","alg":"ES256","x":B64.encode(&point[1..33]),"y":B64.encode(&point[33..])}]}).to_string();
@@ -91,16 +106,17 @@ async fn jail_vmm_has_no_new_privileges_and_confined_identity_and_egress() {
         for field in ["Uid:", "Gid:"] {
             assert_eq!(status.lines().find(|line| line.starts_with(field)).unwrap().split_whitespace().skip(1).collect::<Vec<_>>(), ["1000"; 4]);
         }
-        for field in ["Groups:", "CapEff:"] {
+        println!("{status}");
+        let mut groups = status.lines().find(|line| line.starts_with("Groups:")).unwrap().split_whitespace().skip(1).map(|gid| gid.parse::<u32>().unwrap()).collect::<Vec<_>>();
+        groups.sort_unstable();
+        let mut expected = [1000, kvm.gid()];
+        expected.sort_unstable();
+        assert_eq!(groups, expected);
+        for field in ["CapEff:", "CapPrm:", "CapInh:", "CapAmb:"] {
             let value = status.lines().find(|line| line.starts_with(field)).unwrap().split_once(':').unwrap().1.trim();
-            if field == "Groups:" { assert!(value.is_empty()); } else { assert_eq!(u64::from_str_radix(value, 16).unwrap(), 0); }
+            assert_eq!(u64::from_str_radix(value, 16).unwrap(), 0, "{field}");
         }
         assert_eq!(status.lines().find(|line| line.starts_with("NoNewPrivs:")).unwrap().split_once(':').unwrap().1.trim(), "1");
-        for path in ["/dev/kvm", "/dev/net/tun"] {
-            let mode = tokio::fs::metadata(path).await.unwrap().permissions().mode() & 0o777;
-            println!("device {path} mode={mode:o}");
-            assert_eq!(mode, 0o666);
-        }
         for path in ["ip_forward", "conf/all/rp_filter", "conf/default/rp_filter", "conf/tap0/rp_filter"] {
             assert_eq!(tokio::fs::read_to_string(format!("/proc/sys/net/ipv4/{path}")).await.unwrap().trim(), if path == "ip_forward" { "0" } else { "1" });
         }

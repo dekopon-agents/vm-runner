@@ -189,13 +189,18 @@ sparse scratch ext4. Mount the cache read-only at `/images` and a fresh emptyDir
 requires uid 0 with exactly `NET_ADMIN`, `SETUID`, and `SETGID`, plus `/dev/kvm` and
 `/dev/net/tun`, with default seccomp and container `allowPrivilegeEscalation: false`
 (`--security-opt no-new-privileges` in Docker). The runtime image has no setuid/setgid files.
-Set pod `fsGroup: 1000`; the runtime volume must be
-owned by group 1000 and both devices accessible to that group (device-manager defaults to
-0666). Firecracker runs as uid/gid 1000, without supplementary groups or effective capabilities.
+Set pod `fsGroup: 1000`; the runtime volume must be owned by group 1000.
+Firecracker runs through util-linux `setpriv` as uid/gid 1000 with supplementary groups
+1000 and the runtime `/dev/kvm` group, plus `/dev/net/tun`'s group when that device is not
+world-readable/writable (duplicate groups are removed). Devices must allow group read/write
+or world read/write; `/dev/kvm` may be root-owned mode 0660 with a host-specific group.
+The VMM has zero effective, permitted, inheritable and ambient capabilities and `NoNewPrivs: 1`.
+The bounding set is not cleared: no-new-privileges prevents gaining capabilities through exec.
 Runtime files are group-writable; the private CA key stays in memory.
 Shape keys `diskMBps` (default 100) and `netMbps` (default 200) set nonzero SI bandwidth
 limits on the scratch drive and each NIC direction, using one-second token buckets. Guest serial output
-and VMM diagnostics go to `/run/vm-runner/serial.log`, separate from stdout JSON telemetry.
+and VMM diagnostics go to `/run/vm-runner/console/serial.log`, separate from stdout JSON telemetry.
+A pre-boot VMM exit includes the first console line in its failure span.
 Configure these **pod network-namespace sysctls before startup** (the container's default
 `/proc/sys` mount is read-only): `net.ipv4.ip_forward=0`,
 `net.ipv4.conf.all.rp_filter=1`, and `net.ipv4.conf.default.rp_filter=1`.

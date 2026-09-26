@@ -12,6 +12,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     && apt-get purge -y --auto-remove curl \
     && rm -rf /tmp/firecracker.tgz /tmp/release-v1.17.0-* /var/lib/apt/lists/*
 COPY --chmod=0755 vm-runnerd /usr/local/bin/vm-runnerd
-RUN find / -xdev -perm /6000 -type f -exec chmod a-s {} +
+RUN setpriv --version && find / -xdev -perm /6000 -type f -exec chmod a-s {} +
 USER 1000:1000
 ENTRYPOINT ["/usr/local/bin/vm-runnerd"]

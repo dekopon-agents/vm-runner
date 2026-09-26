@@ -51,8 +51,12 @@ jobs:
           '
       - name: Exercise C7, VMM identity, and positive and negative egress
         run: |
-          # Match smarter-device-manager's device permissions on this disposable runner.
-          sudo chmod 0666 /dev/kvm /dev/net/tun
+          set -euo pipefail
+          gid=60000
+          while getent group "$gid" >/dev/null; do gid=$((gid + 1)); done
+          sudo chgrp "$gid" /dev/kvm
+          sudo chmod 0660 /dev/kvm
+          sudo chmod 0666 /dev/net/tun
           stat -c '%n mode=%a uid=%u gid=%g' /dev/kvm /dev/net/tun
           docker run --rm --user 0:0 --group-add 1000 --cap-drop ALL \
             --cap-add NET_ADMIN --cap-add SETUID --cap-add SETGID \

@@ -81,7 +81,7 @@ def emit(binary, directory, endpoint, protocol, authorization, upstream):
         "profiles": {"ci": {
             "shape": "ci", "image": "ci@sha256:" + "0" * 64,
             "browser": "headless", "idleSeconds": 30, "maxSeconds": 60,
-            "egress": {"allow": ["127.0.0.1"], "dns": "runner"},
+            "egress": {"allow": ["127.0.0.1"], "allowPrivate": ["127.0.0.0/8"], "dns": "runner"},
         }},
         "quotas": {"default": {"maxSessions": 1}, "subjects": {}},
         "telemetry": {"otlp": {

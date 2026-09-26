@@ -108,11 +108,24 @@ impl Fixture {
         .unwrap()
     }
 }
+pub(crate) fn span_attribute<'a>(
+    span: &'a opentelemetry_sdk::trace::SpanData,
+    key: &str,
+) -> Option<&'a opentelemetry::Value> {
+    let mut attributes = span.attributes.iter().filter(|kv| kv.key.as_str() == key);
+    let value = attributes.next().map(|kv| &kv.value);
+    assert!(
+        attributes.next().is_none(),
+        "duplicate span attribute {key}: {span:?}"
+    );
+    value
+}
 #[test]
 fn config_reports_all_conflicts_together() {
     let yaml = include_str!("../examples/vm-runner.yaml")
         .replace("shape: pw-1c1g", "shape: missing")
-        .replace("maxSeconds: 1800", "maxSeconds: 1");
+        .replace("maxSeconds: 1800", "maxSeconds: 1")
+        .replace("maxConnections: 128", "maxConnections: 256");
     let mut config: Config = serde_yaml_ng::from_str(&yaml).unwrap();
     let invalid = ["www.google.com:443", "https://x", "*.bücher.example"];
     config.profiles.0[0]
@@ -130,10 +143,32 @@ fn config_reports_all_conflicts_together() {
     for expected in [
         config::Conflict::Shape("travel".into()),
         config::Conflict::Lifetime("travel".into()),
+        config::Conflict::EgressConnections("travel".into()),
     ] {
         assert!(conflicts.contains(&expected), "{conflicts:?}");
     }
     assert!(serde_yaml_ng::from_str::<Config>(&format!("{yaml}\nunrecognized: true")).is_err());
+}
+#[test]
+fn egress_connection_ceiling_fits_the_default_blocking_pool() {
+    for (limit, valid) in [
+        (1, true),
+        (128, true),
+        (255, true),
+        (256, false),
+        (u32::MAX, false),
+    ] {
+        let yaml = include_str!("../examples/vm-runner.yaml")
+            .replace("maxConnections: 128", &format!("maxConnections: {limit}"));
+        let config: Config = serde_yaml_ng::from_str(&yaml).unwrap();
+        assert_eq!(
+            config
+                .conflicts()
+                .contains(&config::Conflict::EgressConnections("travel".into())),
+            !valid,
+            "maxConnections: {limit}"
+        );
+    }
 }
 #[test]
 fn openapi_file_matches_generated() {
@@ -297,10 +332,10 @@ async fn cancelled_request_finishes_off_runtime_before_shutdown() {
     let spans = exporter.get_finished_spans().unwrap();
     assert_eq!(spans.len(), 1);
     assert_eq!(spans[0].name, "vm_runner.request");
-    assert!(spans[0].attributes.contains(&opentelemetry::KeyValue::new(
-        "vm_runner.auth.reason",
-        "signature"
-    )));
+    assert_eq!(
+        span_attribute(&spans[0], "vm_runner.auth.reason"),
+        Some(&"signature".into())
+    );
     provider.shutdown().unwrap();
 }
 #[tokio::test]
@@ -384,9 +419,9 @@ async fn refusal_span_has_reason_and_incoming_parent() {
         span.span_context.trace_id().to_string(),
         "11111111111111111111111111111111"
     );
-    assert!(span.attributes.contains(&opentelemetry::KeyValue::new(
-        "vm_runner.auth.reason",
-        "malformed"
-    )));
+    assert_eq!(
+        span_attribute(span, "vm_runner.auth.reason"),
+        Some(&"malformed".into())
+    );
     provider.shutdown().unwrap();
 }

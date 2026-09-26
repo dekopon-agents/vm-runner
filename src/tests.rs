@@ -1,4 +1,5 @@
 use super::*;
+mod controller_resilience;
 use aws_lc_rs::{
     encoding::AsDer,
     signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, KeyPair},
@@ -119,6 +120,96 @@ pub(crate) fn span_attribute<'a>(
         "duplicate span attribute {key}: {span:?}"
     );
     value
+}
+#[tokio::test]
+async fn session_route_authenticates_and_returns_named_create_or_get_statuses() {
+    let mut fixture = Fixture::new().await;
+    let token = fixture.token(&fixture.claims(), "ec");
+    fixture.config.jails = Some(
+        serde_json::from_value(json!({
+            "namespace":"jails", "image":"runner", "imageCacheHostPath":"/images",
+            "controllerAudience":"vm-runner-jail", "tokenFile":"/token"
+        }))
+        .unwrap(),
+    );
+    let config = Arc::new(fixture.config);
+    let (mock_service, mut mock) = tower_test::mock::pair();
+    let (controller, ()) = tokio::join!(
+        controller::Controller::new(
+            Arc::clone(&config),
+            kube::Client::new(mock_service, "jails")
+        ),
+        async {
+            let (_, send) = mock.next_request().await.unwrap();
+            send.send_response(hyper::Response::new(kube::client::Body::from(
+                json!({"apiVersion":"v1","kind":"PodList","metadata":{},"items":[]})
+                    .to_string()
+                    .into_bytes(),
+            )));
+        }
+    );
+    let state = State {
+        auth: Authenticator::new(config.auth.clone()).await.unwrap(),
+        config,
+        controller: Some(Arc::new(controller.unwrap())),
+    };
+    let client = TestClient::new(endpoint(
+        Arc::new(state),
+        Arc::new(tokio::sync::Semaphore::new(1)),
+    ));
+    let malformed = client
+        .post("/v1/sessions")
+        .header("Content-Type", "application/json")
+        .body("{")
+        .send()
+        .await;
+    malformed.assert_status(StatusCode::UNAUTHORIZED);
+    malformed
+        .assert_json(json!({"error":"unauthorized", "reason":"malformed"}))
+        .await;
+    client
+        .post("/v1/sessions")
+        .body_json(&json!({"profile":"travel"}))
+        .send()
+        .await
+        .assert_status(StatusCode::UNAUTHORIZED);
+    for status in [StatusCode::CREATED, StatusCode::OK] {
+        let response = client
+            .post("/v1/sessions")
+            .header("Authorization", format!("Bearer {token}"))
+            .body_json(&json!({"profile":"travel"}))
+            .send()
+            .await;
+        response.assert_status(status);
+        response
+            .json()
+            .await
+            .value()
+            .object()
+            .get("name")
+            .assert_string("default");
+    }
+    let response = client
+        .post("/v1/sessions")
+        .header("Authorization", format!("Bearer {token}"))
+        .body_json(&json!({"profile":"other"}))
+        .send()
+        .await;
+    response.assert_status(StatusCode::CONFLICT);
+    response
+        .assert_json(json!({"error":"session_profile_conflict"}))
+        .await;
+    let response = client
+        .post("/v1/sessions")
+        .header("Authorization", format!("Bearer {token}"))
+        .body_json(&json!({"profile":"travel", "name":"Bad Name"}))
+        .send()
+        .await;
+    response.assert_status(StatusCode::BAD_REQUEST);
+    response
+        .assert_json(json!({"outcome":"not_executed", "reason":"bad_name"}))
+        .await;
+    fixture.tasks.shutdown().await;
 }
 #[test]
 fn config_reports_all_conflicts_together() {

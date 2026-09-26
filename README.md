@@ -16,6 +16,28 @@ returns its subject and session quota. Optional `telemetry.otlp` selects `grpc` 
 with an endpoint and optional `caBundleFile` and `headersFile` (`key: value` per line).
 Without telemetry configuration, tracing goes only to stdout JSON logs.
 
+## Named sessions
+
+With a `jails` configuration, `serve` uses in-cluster Kubernetes credentials and rebuilds
+its session registry from pod labels and annotations in `jails.namespace`.
+**Deployment requirement:** this namespace is controller-owned. RBAC must grant pod
+create/delete there only to the controller service account (apart from trusted cluster
+administrators). Rebuild checks the subject annotation against its SHA-256 subject-hash
+label (first 16 hex characters), the subject allowlist, configured profile and jail image.
+Inconsistent or foreign pods are ignored; duplicate subject/name pods keep the oldest
+`creationTimestamp`, and the rest are deleted.
+Authenticated `POST /v1/sessions {"profile":"travel","name":"default"}` reserves a lazy
+session (201), or returns the same subject/name session (200). Names are lowercase
+alphanumeric with internal/trailing hyphens, at most 63 characters; omitted names are
+`default`. Changing the profile for an existing name returns `409 session_profile_conflict`.
+Admission applies the authenticated subject's `maxSessions` quota. Every ten seconds the
+reaper deletes pods and reservations exceeding the profile's idle or maximum lifetime.
+Both lifetimes must be at least 60 seconds. Terminating pods still consume quota until
+Kubernetes confirms they are gone, but never satisfy create-or-get. Kubernetes cleanup
+errors are logged and retried without blocking API admission; connect/read timeouts are
+5/15 seconds.
+No DELETE route is exposed. Without `jails`, session requests return 503.
+
 ## Explicit egress proxy
 
 ```sh

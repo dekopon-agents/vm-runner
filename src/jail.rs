@@ -11,7 +11,12 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use tokio::{io::AsyncWriteExt, process::Command, sync::watch, task::JoinSet};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    process::Command,
+    sync::watch,
+    task::JoinSet,
+};
 use tracing::Instrument;
 
 pub(crate) mod api;
@@ -55,8 +60,11 @@ enum Error {
         program: &'static str,
         status: std::process::ExitStatus,
     },
-    #[error("Firecracker exited: {0}")]
-    Firecracker(std::process::ExitStatus),
+    #[error("Firecracker exited: {status}; console: {first_line}")]
+    Firecracker {
+        status: std::process::ExitStatus,
+        first_line: String,
+    },
 }
 
 async fn phase<T>(
@@ -179,6 +187,50 @@ async fn shared_file(path: &Path, bytes: &[u8]) -> Result<tokio::fs::File> {
     file.flush().await?;
     Ok(file)
 }
+fn firecracker_command(kvm_gid: u32, tun_gid: u32, tun_mode: u32) -> Command {
+    let mut groups = vec![1000];
+    for gid in [
+        Some(kvm_gid),
+        (tun_mode & 0o006 != 0o006).then_some(tun_gid),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !groups.contains(&gid) {
+            groups.push(gid);
+        }
+    }
+    let mut command = Command::new("setpriv");
+    command
+        .args(["--reuid", "1000", "--regid", "1000", "--groups"])
+        .arg(
+            groups
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+        )
+        .args(["--inh-caps=-all", "--no-new-privs", "--", "firecracker"]);
+    command
+}
+async fn firecracker_exit(status: std::process::ExitStatus, work: &Path) -> Error {
+    let line = async {
+        let file = tokio::fs::File::open(work.join("console/serial.log")).await?;
+        let mut bytes = Vec::new();
+        // C2 caps trace attributes at 4096 bytes; one extra byte preserves the truncation marker.
+        BufReader::new(file.take(4097))
+            .read_until(b'\n', &mut bytes)
+            .await?;
+        Ok::<_, std::io::Error>(crate::egress::cut(
+            String::from_utf8_lossy(&bytes).trim_end(),
+        ))
+    }
+    .await;
+    Error::Firecracker {
+        status,
+        first_line: line.unwrap_or_else(|error| format!("unavailable: {error}")),
+    }
+}
 async fn launch(
     image: &Path,
     work: &Path,
@@ -221,7 +273,9 @@ async fn launch(
     })
     .await?;
     phase("vmm.spawn", async {
-        Ok(Command::new("firecracker")
+        let kvm = tokio::fs::metadata("/dev/kvm").await?;
+        let tun = tokio::fs::metadata("/dev/net/tun").await?;
+        Ok(firecracker_command(kvm.gid(), tun.gid(), tun.mode())
             .arg("--api-sock")
             .arg(work.join("firecracker.sock"))
             .arg("--config-file")
@@ -230,8 +284,6 @@ async fn launch(
             .stdin(Stdio::null())
             .stdout(Stdio::from(console.try_clone()?))
             .stderr(Stdio::from(console))
-            .uid(1000)
-            .gid(1000)
             .kill_on_drop(true)
             .spawn()?)
     })
@@ -337,7 +389,7 @@ pub async fn run(config: Config, profile: &str, session: &str) -> Result<()> {
                 tokio::select! {
                     result = guest.ready() => { result?; Ok(true) },
                     _ = &mut shutdown => Ok(false),
-                    status = child.wait() => Err(Error::Firecracker(status?).into()),
+                    status = child.wait() => Err(firecracker_exit(status?, &work).await.into()),
                     worker = workers.join_next() => Err(worker_error(worker)),
                 }
             })
@@ -349,7 +401,7 @@ pub async fn run(config: Config, profile: &str, session: &str) -> Result<()> {
             tracing::info!(pid, "jail ready");
             tokio::select! {
                 _ = &mut shutdown => Ok(()),
-                status = child.wait() => Err(Error::Firecracker(status?).into()),
+                status = child.wait() => Err(firecracker_exit(status?, &work).await.into()),
                 worker = workers.join_next() => Err(worker_error(worker)),
             }
         }
@@ -419,6 +471,87 @@ async fn stop_vm(child: &mut tokio::process::Child) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn setpriv_uses_device_groups_without_duplicates_and_cannot_gain_privileges() {
+        for (kvm, tun, mode, groups) in [
+            (993, 994, 0o666, "1000,993"),
+            (993, 994, 0o660, "1000,993,994"),
+            (993, 994, 0o664, "1000,993,994"),
+            (993, 993, 0o660, "1000,993"),
+            (1000, 1000, 0o660, "1000"),
+        ] {
+            let command = firecracker_command(kvm, tun, mode);
+            assert_eq!(command.as_std().get_program(), "setpriv");
+            assert_eq!(
+                command.as_std().get_args().collect::<Vec<_>>(),
+                [
+                    "--reuid",
+                    "1000",
+                    "--regid",
+                    "1000",
+                    "--groups",
+                    groups,
+                    "--inh-caps=-all",
+                    "--no-new-privs",
+                    "--",
+                    "firecracker",
+                ]
+            );
+        }
+    }
+    #[tokio::test]
+    async fn preboot_vmm_exit_spans_the_first_console_line_once_with_its_status() {
+        use opentelemetry::trace::TracerProvider;
+        use tracing::instrument::WithSubscriber;
+        use tracing_subscriber::layer::SubscriberExt;
+        let exporter = opentelemetry_sdk::trace::InMemorySpanExporter::default();
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("vmm-exit")));
+        let work = tempfile::tempdir().unwrap();
+        tokio::fs::create_dir(work.path().join("console"))
+            .await
+            .unwrap();
+        let console = work.path().join("console/serial.log");
+        let status = Command::new("/bin/sh")
+            .args(["-c", "printf 'KVM EACCES\\nsecond line\\n' >&2; exit 1"])
+            .stderr(Stdio::from(std::fs::File::create(&console).unwrap()))
+            .status()
+            .await
+            .unwrap();
+        let error = phase::<()>("ready", async {
+            Err(firecracker_exit(status, work.path()).await.into())
+        })
+        .with_subscriber(subscriber)
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(error.downcast_ref::<Error>(), Some(Error::Firecracker { status, first_line }) if status.code() == Some(1) && first_line == "KVM EACCES")
+        );
+        let spans = exporter.get_finished_spans().unwrap();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(
+            crate::tests::span_attribute(&spans[0], "boot.phase"),
+            Some(&"ready".into())
+        );
+        assert_eq!(
+            crate::tests::span_attribute(&spans[0], "error.message"),
+            Some(&error.to_string().into())
+        );
+        assert!(spans[0].events.is_empty());
+        tokio::fs::write(&console, "x".repeat(8192)).await.unwrap();
+        let Error::Firecracker { first_line, .. } = firecracker_exit(status, work.path()).await
+        else {
+            panic!("wrong cause")
+        };
+        assert_eq!(first_line, crate::egress::cut(&"x".repeat(8192)));
+        tokio::fs::remove_file(console).await.unwrap();
+        assert!(
+            matches!(firecracker_exit(status, work.path()).await, Error::Firecracker { status, .. } if status.code() == Some(1))
+        );
+    }
     #[tokio::test]
     async fn ca_drive_preserves_the_pem_and_zero_pads_to_four_kib() {
         let dir = tempfile::tempdir().unwrap();

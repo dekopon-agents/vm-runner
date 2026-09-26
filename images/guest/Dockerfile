@@ -28,5 +28,6 @@ RUN npm install --save-exact playwright@1.63.0 \
     && npm cache clean --force && rm -rf /var/lib/apt/lists/* /root/.cache
 COPY --chmod=0755 vm-guest-agent /usr/local/bin/vm-guest-agent
 COPY --chmod=0755 vm-init /sbin/vm-init
+COPY --chmod=0755 browse /usr/local/bin/browse
 WORKDIR /home/jail
 ENTRYPOINT ["/sbin/vm-init"]

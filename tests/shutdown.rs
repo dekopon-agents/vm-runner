@@ -54,8 +54,8 @@ profiles:
     shape: small
     image: test@sha256:abc
     browser: headless
-    idleSeconds: 1
-    maxSeconds: 2
+    idleSeconds: 60
+    maxSeconds: 120
     egress: {{allow: [localhost], dns: runner}}
 quotas: {{default: {{maxSessions: 1}}, subjects: {{}}}}
 telemetry:

@@ -4,7 +4,10 @@ use kube::{
     Api, Client,
     api::{DeleteParams, ListParams},
 };
-use poem_openapi::{ApiResponse, Object, payload::Json};
+use poem_openapi::{
+    ApiResponse, Object,
+    payload::{Json, PlainText},
+};
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
@@ -15,6 +18,7 @@ use tracing::Instrument;
 const SESSION: &str = "vm-runner/session";
 const PROFILE: &str = "vm-runner/profile";
 const SUBJECT: &str = "vm-runner/subject";
+const SUBJECT_HASH: &str = "vm-runner/subject-hash";
 const NAME: &str = "vm-runner/name";
 const CREATED: &str = "vm-runner/created";
 const ACTIVE: &str = "vm-runner/active";
@@ -53,6 +57,7 @@ enum NotExecutedOutcome {
 enum Failure {
     Quota,
     BadProfile,
+    BadName,
 }
 #[derive(Object)]
 pub(crate) struct Conflict {
@@ -75,6 +80,8 @@ pub(crate) enum Created {
     Refused(Json<NotExecuted>),
     #[oai(status = 401)]
     Unauthorized(Json<crate::Refusal>),
+    #[oai(status = 503)]
+    Unavailable(PlainText<&'static str>),
 }
 impl Created {
     fn refused(reason: Failure) -> Self {
@@ -90,10 +97,12 @@ struct Session {
     created: u64,
     active: u64,
     pod: Option<String>,
+    retiring: bool,
 }
 pub(crate) struct Controller {
     config: Arc<Config>,
     pods: Api<Pod>,
+    // Rebuilt entries use pod names as keys, so even duplicate session IDs count toward quota.
     sessions: Mutex<HashMap<String, Session>>,
 }
 pub(super) fn now() -> u64 {
@@ -110,6 +119,13 @@ fn valid_name(name: &str) -> bool {
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
+fn subject_hash(subject: &str) -> String {
+    aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, subject.as_bytes()).as_ref()[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 impl Controller {
     pub(crate) async fn new(config: Arc<Config>, client: Client) -> Result<Self, kube::Error> {
         let namespace = &config
@@ -122,23 +138,16 @@ impl Controller {
             .list(&ListParams::default().labels(SESSION))
             .await?
             .items;
-        fn key(pod: &Pod) -> (Option<&str>, Option<&str>) {
-            (
-                pod.metadata
-                    .labels
-                    .as_ref()
-                    .and_then(|l| l.get(SESSION))
-                    .map(String::as_str),
-                pod.metadata.name.as_deref(),
-            )
-        }
-        listed.sort_by(|a, b| key(a).cmp(&key(b)));
+        listed.sort_by(|a, b| {
+            a.metadata
+                .creation_timestamp
+                .cmp(&b.metadata.creation_timestamp)
+                .then_with(|| a.metadata.name.cmp(&b.metadata.name))
+        });
         let mut sessions = HashMap::new();
         let mut names = HashSet::new();
+        let mut ids = HashSet::new();
         for pod in listed {
-            if pod.metadata.deletion_timestamp.is_some() {
-                continue;
-            }
             let labels = pod.metadata.labels.as_ref();
             let annotations = pod.metadata.annotations.as_ref();
             let fields = labels.zip(annotations).and_then(|(l, a)| {
@@ -154,12 +163,12 @@ impl Controller {
             let recovered = fields.and_then(|(id, profile, subject, name, created, active)| {
                 let (_, selected) = config.profiles.0.iter().find(|(n, _)| n == profile)?;
                 if !valid_name(name)
-                    || !crate::config::service_account(subject)
+                    || !config.auth.subjects.contains(subject)
+                    || labels?.get(SUBJECT_HASH)? != &subject_hash(subject)
+                    || !matches!(pod.spec.as_ref()?.containers.as_slice(), [container]
+                        if container.image.as_deref() == config.jails.as_ref().map(|j| j.image.as_str()))
+                    || pod.metadata.creation_timestamp.is_none()
                     || !uuid::Uuid::parse_str(id).is_ok_and(|id| id.get_version_num() == 7)
-                    || matches!(
-                        pod.status.as_ref().and_then(|s| s.phase.as_deref()),
-                        Some("Failed" | "Succeeded")
-                    )
                 {
                     return None;
                 }
@@ -172,25 +181,46 @@ impl Controller {
                         state: SessionState::Pending,
                     },
                     subject: subject.clone(),
-                    created,
-                    active,
-                    pod: pod.metadata.name.clone(),
+                    created: created.min(now()),
+                    active: active.min(now()),
+                    pod: Some(pod.metadata.name.clone()?),
+                    retiring: pod.metadata.deletion_timestamp.is_some()
+                        || matches!(
+                            pod.status.as_ref().and_then(|s| s.phase.as_deref()),
+                            Some("Failed" | "Succeeded")
+                        ),
                 })
             });
-            if let Some(session) = recovered
-                && !sessions.contains_key(&session.body.session_id)
-                && names.insert((session.subject.clone(), session.body.name.clone()))
-            {
-                sessions.insert(session.body.session_id.clone(), session);
-            } else if let Some(name) = &pod.metadata.name {
-                delete_pod(&pods, name)
-                    .instrument(tracing::info_span!(
-                        "vm_runner.reap",
-                        k8s.pod.name = name,
-                        cause = "unrecoverable_or_duplicate"
-                    ))
-                    .await?;
+            // Foreign/inconsistent pods are not ours to adopt or delete.
+            let Some(mut session) = recovered else {
+                continue;
+            };
+            if !session.retiring {
+                session.retiring = !ids.insert(session.body.session_id.clone())
+                    || !names.insert((session.subject.clone(), session.body.name.clone()));
             }
+            let name = session.pod.as_ref().expect("recovered pod has a name");
+            if session.retiring && pod.metadata.deletion_timestamp.is_none() {
+                let gone = async {
+                    match delete_pod(&pods, name).await {
+                        Ok(gone) => gone,
+                        Err(error) => {
+                            tracing::warn!(%error, "pod cleanup failed; retrying next tick");
+                            false
+                        }
+                    }
+                }
+                .instrument(tracing::info_span!(
+                    "vm_runner.reap",
+                    k8s.pod.name = name,
+                    cause = "terminal_or_duplicate"
+                ))
+                .await;
+                if gone {
+                    continue;
+                }
+            }
+            sessions.insert(name.clone(), session);
         }
         Ok(Self {
             config,
@@ -201,15 +231,12 @@ impl Controller {
     pub(crate) fn create(&self, subject: &str, request: Create) -> poem::Result<Created> {
         let name = request.name.as_deref().unwrap_or("default");
         if !valid_name(name) {
-            return Err(poem::Error::from_string(
-                "invalid session name",
-                poem::http::StatusCode::BAD_REQUEST,
-            ));
+            return Ok(Created::refused(Failure::BadName));
         }
         let mut sessions = self.sessions.lock().expect("session registry poisoned");
         if let Some(existing) = sessions
             .values()
-            .find(|s| s.subject == subject && s.body.name == name)
+            .find(|s| !s.retiring && s.subject == subject && s.body.name == name)
         {
             return Ok(if existing.body.profile == request.profile {
                 Created::Existing(Json(existing.body.clone()))
@@ -255,18 +282,22 @@ impl Controller {
                 created: now(),
                 active: now(),
                 pod: None,
+                retiring: false,
             },
         );
         Ok(Created::New(Json(body)))
     }
-    pub(crate) async fn reap(&self, now: u64) -> Result<(), kube::Error> {
+    pub(crate) async fn reap(&self, now: u64) {
+        // Mark under the same mutex used by create. Network I/O never owns admission
+        // or the registry lock; retiring entries reserve quota, but cannot be returned.
         let expired: Vec<_> = self
             .sessions
             .lock()
             .expect("session registry poisoned")
-            .iter()
-            .filter(|(_, s)| {
-                self.config
+            .iter_mut()
+            .filter_map(|(key, s)| {
+                let expired = self
+                    .config
                     .profiles
                     .0
                     .iter()
@@ -274,36 +305,61 @@ impl Controller {
                     .is_some_and(|(_, p)| {
                         now.saturating_sub(s.created) >= p.max_seconds
                             || now.saturating_sub(s.active) >= p.idle_seconds
-                    })
-            })
-            .map(|(id, s)| (id.clone(), s.pod.clone()))
-            .collect();
-        for (id, pod) in expired {
-            async {
-                if let Some(pod) = pod {
-                    delete_pod(&self.pods, &pod).await?;
+                    });
+                if !s.retiring && !expired {
+                    return None;
                 }
-                self.sessions
-                    .lock()
-                    .expect("session registry poisoned")
-                    .remove(&id);
-                Ok::<_, kube::Error>(())
+                let was_retiring = s.retiring;
+                s.retiring = true;
+                Some((
+                    key.clone(),
+                    s.body.session_id.clone(),
+                    s.pod.clone(),
+                    was_retiring,
+                ))
+            })
+            .collect();
+        for (key, id, pod, was_retiring) in expired {
+            async {
+                let result = async {
+                    let Some(pod) = pod else { return Ok(true) };
+                    if was_retiring {
+                        let Some(current) = self.pods.get_opt(&pod).await? else {
+                            return Ok(true);
+                        };
+                        if current.metadata.deletion_timestamp.is_some() {
+                            return Ok(false);
+                        }
+                    }
+                    delete_pod(&self.pods, &pod).await
+                }
+                .await;
+                match result {
+                    Ok(true) => {
+                        self.sessions
+                            .lock()
+                            .expect("session registry poisoned")
+                            .remove(&key);
+                    }
+                    Ok(false) => {}
+                    Err(error) => tracing::warn!(%error, "pod cleanup failed; retrying next tick"),
+                }
             }
             .instrument(tracing::info_span!(
                 "vm_runner.reap",
                 vm_runner.session_id = id
             ))
-            .await?;
+            .await;
         }
-        Ok(())
     }
 }
-async fn delete_pod(pods: &Api<Pod>, name: &str) -> Result<(), kube::Error> {
+async fn delete_pod(pods: &Api<Pod>, name: &str) -> Result<bool, kube::Error> {
     match pods.delete(name, &DeleteParams::default()).await {
-        Ok(_) => Ok(()),
-        Err(kube::Error::Api(error)) if error.code == 404 => Ok(()),
+        // A successful DELETE only starts termination; quota is held until GET returns 404.
+        Ok(_) => Ok(false),
+        Err(kube::Error::Api(error)) if error.code == 404 => Ok(true),
         Err(error) => Err(error),
     }
 }
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

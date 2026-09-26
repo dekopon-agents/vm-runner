@@ -57,12 +57,11 @@ impl Api {
             Ok(subject) => subject,
             Err(refusal) => return Ok(controller::Created::Unauthorized(Json(refusal))),
         };
-        let controller = state.controller.as_ref().ok_or_else(|| {
-            poem::Error::from_string(
+        let Some(controller) = state.controller.as_ref() else {
+            return Ok(controller::Created::Unavailable(PlainText(
                 "jails are not configured",
-                poem::http::StatusCode::SERVICE_UNAVAILABLE,
-            )
-        })?;
+            )));
+        };
         tracing::info_span!("vm_runner.session.create")
             .in_scope(|| controller.create(&subject, body.0))
     }
@@ -117,6 +116,8 @@ pub fn openapi() -> String {
 }
 pub struct Requests {
     admission: std::sync::Arc<tokio::sync::Semaphore>,
+    // Only shutdown waits on this: a cancelled reap future leaves its blocking worker alive.
+    reaper_drain: std::sync::Arc<tokio::sync::Semaphore>,
     controller: Option<std::sync::Arc<controller::Controller>>,
 }
 impl Requests {
@@ -127,8 +128,7 @@ impl Requests {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
         loop {
             interval.tick().await;
-            // The API admission gate also excludes teardown while a request owns a session.
-            let permit = std::sync::Arc::clone(&self.admission)
+            let permit = std::sync::Arc::clone(&self.reaper_drain)
                 .acquire_owned()
                 .await?;
             let controller = std::sync::Arc::clone(controller);
@@ -140,21 +140,27 @@ impl Requests {
                     runtime.block_on(controller.reap(controller::now()))
                 })
             })
-            .await??;
+            .await?;
         }
     }
     // Call after the server stops, before shutting down telemetry.
     pub async fn drain(self) -> Result<(), tokio::sync::AcquireError> {
         let _idle = self.admission.acquire().await?;
+        let _reaped = self.reaper_drain.acquire().await?;
         Ok(())
     }
+}
+fn kube_timeouts(mut config: kube::Config) -> kube::Config {
+    config.connect_timeout = Some(std::time::Duration::from_secs(5));
+    config.read_timeout = Some(std::time::Duration::from_secs(15));
+    config
 }
 pub async fn app(
     config: Config,
 ) -> Result<(impl Endpoint, Requests), Box<dyn std::error::Error + Send + Sync>> {
     let config = std::sync::Arc::new(config);
     let controller = if config.jails.is_some() {
-        let client = kube::Client::try_from(kube::Config::incluster()?)?;
+        let client = kube::Client::try_from(kube_timeouts(kube::Config::incluster()?))?;
         let config = std::sync::Arc::clone(&config);
         let runtime = tokio::runtime::Handle::current();
         let dispatch = tracing::dispatcher::get_default(Clone::clone);
@@ -177,6 +183,7 @@ pub async fn app(
     let admission = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
     let requests = Requests {
         admission: std::sync::Arc::clone(&admission),
+        reaper_drain: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
         controller,
     };
     Ok((endpoint(std::sync::Arc::new(state), admission), requests))

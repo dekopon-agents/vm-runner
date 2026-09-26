@@ -1,4 +1,5 @@
 use super::*;
+mod controller_resilience;
 use aws_lc_rs::{
     encoding::AsDer,
     signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, KeyPair},
@@ -197,6 +198,16 @@ async fn session_route_authenticates_and_returns_named_create_or_get_statuses() 
     response.assert_status(StatusCode::CONFLICT);
     response
         .assert_json(json!({"error":"session_profile_conflict"}))
+        .await;
+    let response = client
+        .post("/v1/sessions")
+        .header("Authorization", format!("Bearer {token}"))
+        .body_json(&json!({"profile":"travel", "name":"Bad Name"}))
+        .send()
+        .await;
+    response.assert_status(StatusCode::BAD_REQUEST);
+    response
+        .assert_json(json!({"outcome":"not_executed", "reason":"bad_name"}))
         .await;
     fixture.tasks.shutdown().await;
 }

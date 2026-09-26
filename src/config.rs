@@ -167,7 +167,7 @@ pub enum Conflict {
     EmptyAllow(String),
     #[error("malformed egress host pattern: {0}")]
     Wildcard(String),
-    #[error("idleSeconds exceeds maxSeconds: {0}")]
+    #[error("idleSeconds and maxSeconds must be at least 60, with idleSeconds <= maxSeconds: {0}")]
     Lifetime(String),
     #[error("egress.maxConnections exceeds 255 (Tokio blocking-pool budget): {0}")]
     EgressConnections(String),
@@ -239,7 +239,10 @@ impl Config {
             if !self.shapes.0.iter().any(|(n, _)| n == &profile.shape) {
                 errors.push(Conflict::Shape(name.clone()));
             }
-            if profile.idle_seconds > profile.max_seconds {
+            if profile.idle_seconds < 60
+                || profile.max_seconds < 60
+                || profile.idle_seconds > profile.max_seconds
+            {
                 errors.push(Conflict::Lifetime(name.clone()));
             }
             if profile.egress.max_connections.get() > MAX_EGRESS_CONNECTIONS {

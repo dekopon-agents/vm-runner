@@ -44,6 +44,12 @@ paths:
             application/json; charset=utf-8:
               schema:
                 $ref: '#/components/schemas/Refusal'
+        '503':
+          description: ''
+          content:
+            text/plain; charset=utf-8:
+              schema:
+                type: string
   /healthz:
     get:
       responses:
@@ -97,6 +103,7 @@ components:
       enum:
       - quota
       - bad_profile
+      - bad_name
     Identity:
       type: object
       title: Identity

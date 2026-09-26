@@ -45,7 +45,7 @@ quotas: {default: {maxSessions: 1}, subjects: {}}
         let stderr = String::from_utf8(output.stderr).unwrap();
         for conflict in [
             "unknown shape in profile: test",
-            "idleSeconds exceeds maxSeconds: test",
+            "idleSeconds and maxSeconds must be at least 60, with idleSeconds <= maxSeconds: test",
             "empty allow list: test",
             &format!("invalid --gateway {address}:"),
         ] {

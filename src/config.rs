@@ -66,14 +66,31 @@ enum Browser {
     Headless,
     Headful,
 }
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub(crate) struct Egress {
     pub allow: Vec<String>,
+    #[serde(default)]
+    pub allow_private: Vec<ipnet::IpNet>,
+    #[serde(default = "egress_idle")]
+    pub idle_seconds: NonZeroU32,
+    #[serde(default = "egress_lifetime")]
+    pub max_connection_seconds: NonZeroU32,
+    #[serde(default = "egress_connections")]
+    pub max_connections: NonZeroU32,
     #[serde(rename = "dns")]
     _dns: Dns,
 }
-#[derive(Deserialize)]
+fn egress_idle() -> NonZeroU32 {
+    const { NonZeroU32::new(90).expect("nonzero default") }
+}
+fn egress_lifetime() -> NonZeroU32 {
+    const { NonZeroU32::new(1800).expect("nonzero default") }
+}
+fn egress_connections() -> NonZeroU32 {
+    const { NonZeroU32::new(128).expect("nonzero default") }
+}
+#[derive(Clone, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum Dns {
     Runner,

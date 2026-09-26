@@ -18,8 +18,17 @@ struct Proxy {
     stop: tokio::sync::oneshot::Sender<()>,
     task: tokio::task::JoinHandle<Result<(), Error>>,
 }
+fn local_egress() -> Egress {
+    serde_yaml_ng::from_str(
+        "allow: [localhost]\ndns: runner\nallowPrivate: [127.0.0.0/8, '::1/128']",
+    )
+    .unwrap()
+}
 impl Proxy {
     async fn new(roots: RootCertStore) -> Self {
+        Self::configured(roots, local_egress()).await
+    }
+    async fn configured(roots: RootCertStore, egress: Egress) -> Self {
         let (ca, pem) = Ca::new().unwrap();
         let mut trust = RootCertStore::empty();
         trust
@@ -43,7 +52,7 @@ impl Proxy {
         let (stop, stopped) = tokio::sync::oneshot::channel();
         let engine = Arc::new(Engine {
             ca,
-            allow: vec!["localhost".into()],
+            egress,
             tls: client_config(roots).unwrap(),
         });
         let task = tokio::spawn(
@@ -440,7 +449,7 @@ async fn cancelled_upstream_request_exports_exactly_one_zero_status_without_prot
     async {
         let engine = Engine {
             ca: Ca::new().unwrap().0,
-            allow: vec!["localhost".into()],
+            egress: local_egress(),
             tls: client_config(RootCertStore::empty()).unwrap(),
         };
         let (mut client, stream) = tokio::io::duplex(4096);
@@ -523,6 +532,196 @@ fn request_trailers_cannot_reintroduce_trace_headers() {
     assert!(!trailers.contains_key("traceparent"));
     assert!(!trailers.contains_key("tracestate"));
     assert_eq!(trailers["x-checksum"], "kept");
+}
+#[tokio::test]
+async fn allowed_name_resolving_to_loopback_is_refused_and_spanned_before_connect() {
+    let mut egress = local_egress();
+    egress.allow_private.clear();
+    let proxy = Proxy::configured(RootCertStore::empty(), egress).await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let stream = TcpStream::connect(proxy.addr).await.unwrap();
+    assert_eq!(exchange(stream, &format!("GET http://localhost:{port}/ HTTP/1.1\r\nHost: localhost:{port}\r\nConnection: close\r\n\r\n")).await,
+        (403, "egress refused: localhost".into()));
+    std::future::poll_fn(|cx| {
+        assert!(listener.poll_accept(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    let spans = proxy.finish().await;
+    let request = spans.iter().find(|s| s.name == "egress.request").unwrap();
+    assert!(attribute(request, "egress.decision", "refused:address"));
+    assert!(attribute(request, "server.address", "localhost"));
+    assert!(
+        request
+            .attributes
+            .contains(&KeyValue::new("http.response.status_code", 403_i64))
+    );
+}
+#[test]
+fn address_policy_rejects_non_global_answers_including_mapped_and_mixed_addresses() {
+    for text in [
+        "0.0.0.0",
+        "10.0.0.1",
+        "172.16.0.1",
+        "192.168.1.1",
+        "127.0.0.1",
+        "169.254.169.254",
+        "100.64.0.1",
+        "224.0.0.1",
+        "255.255.255.255",
+        "192.0.2.1",
+        "198.18.0.1",
+        "240.0.0.1",
+        "::",
+        "::1",
+        "fd00::1",
+        "fe80::1",
+        "ff0e::1",
+        "::ffff:127.0.0.1",
+        "::ffff:169.254.169.254",
+        "2001:db8::1",
+        "2002:7f00:1::1",
+        "64:ff9b::7f00:1",
+        "100::1",
+        "3fff::1",
+        "fec0::1",
+    ] {
+        let address = SocketAddr::new(text.parse().unwrap(), 80);
+        assert!(
+            matches!(vetted_addresses(&[address], &[]), Err(AddressRefused)),
+            "{text}"
+        );
+    }
+    let public: Vec<SocketAddr> = ["1.1.1.1:80", "[2606:4700:4700::1111]:80"]
+        .map(|a| a.parse().unwrap())
+        .into();
+    assert_eq!(vetted_addresses(&public, &[]).unwrap(), public);
+    assert!(matches!(
+        vetted_addresses(&[public[0], "127.0.0.1:80".parse().unwrap()], &[]),
+        Err(AddressRefused)
+    ));
+    assert!(matches!(vetted_addresses(&[], &[]), Err(AddressRefused)));
+}
+#[test]
+fn private_cidr_exception_is_narrow_and_applies_to_vetted_socket_addresses() {
+    let exceptions = [
+        "127.0.0.1/32".parse().unwrap(),
+        "169.254.169.254/32".parse().unwrap(),
+        "::1/128".parse().unwrap(),
+    ];
+    for text in [
+        "127.0.0.1:80",
+        "169.254.169.254:80",
+        "[::1]:80",
+        "[::ffff:127.0.0.1]:80",
+    ] {
+        let address = [text.parse().unwrap()];
+        assert_eq!(vetted_addresses(&address, &exceptions).unwrap(), address);
+    }
+    assert!(matches!(
+        vetted_addresses(&["127.0.0.2:80".parse().unwrap()], &exceptions),
+        Err(AddressRefused)
+    ));
+}
+#[test]
+fn egress_defaults_match_browser_limits_and_invalid_settings_fail_at_parse_boundary() {
+    let egress: Egress = serde_yaml_ng::from_str("allow: [localhost]\ndns: runner").unwrap();
+    assert!(egress.allow_private.is_empty());
+    assert_eq!(egress.idle_seconds.get(), 90);
+    assert_eq!(egress.max_connection_seconds.get(), 1800);
+    assert_eq!(egress.max_connections.get(), 128);
+    for invalid in [
+        "allowPrivate: [bad-cidr]",
+        "idleSeconds: 0",
+        "maxConnectionSeconds: 0",
+        "maxConnections: 0",
+        "unknown: 1",
+    ] {
+        assert!(
+            serde_yaml_ng::from_str::<Egress>(&format!(
+                "allow: [localhost]\ndns: runner\n{invalid}"
+            ))
+            .is_err(),
+            "{invalid}"
+        );
+    }
+}
+async fn poll_pending(mut future: Pin<&mut impl Future<Output = Result<(), Error>>>) {
+    std::future::poll_fn(|cx| {
+        assert!(future.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+}
+#[tokio::test(start_paused = true)]
+async fn idle_connection_closes_only_after_inactivity_and_reads_reset_the_deadline() {
+    let engine = Engine {
+        ca: Ca::new().unwrap().0,
+        egress: local_egress(),
+        tls: client_config(RootCertStore::empty()).unwrap(),
+    };
+    let (mut client, stream) = tokio::io::duplex(4096);
+    let mut record = ConnectionRecord::default();
+    let mut connection =
+        Box::pin(engine.bounded_connection(Box::new(stream), &mut record, Instant::now()));
+    poll_pending(connection.as_mut()).await;
+    tokio::time::advance(Duration::from_secs(80)).await;
+    client.write_all(b"G").await.unwrap();
+    poll_pending(connection.as_mut()).await;
+    tokio::time::advance(Duration::from_secs(80)).await;
+    poll_pending(connection.as_mut()).await;
+    tokio::time::advance(Duration::from_secs(10)).await;
+    let error = connection.await.unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<ConnectionTimeout>(),
+        Some(ConnectionTimeout::Idle)
+    ));
+    assert_eq!(client.read(&mut [0; 1]).await.unwrap(), 0);
+}
+#[tokio::test(start_paused = true)]
+async fn maximum_lifetime_closes_even_an_active_connection() {
+    let mut egress = local_egress();
+    egress.max_connection_seconds = 180.try_into().unwrap();
+    let engine = Engine {
+        ca: Ca::new().unwrap().0,
+        egress,
+        tls: client_config(RootCertStore::empty()).unwrap(),
+    };
+    let (mut client, stream) = tokio::io::duplex(4096);
+    let mut record = ConnectionRecord::default();
+    let mut connection =
+        Box::pin(engine.bounded_connection(Box::new(stream), &mut record, Instant::now()));
+    poll_pending(connection.as_mut()).await;
+    for byte in [b"G", b"E"] {
+        tokio::time::advance(Duration::from_secs(80)).await;
+        client.write_all(byte).await.unwrap();
+        poll_pending(connection.as_mut()).await;
+    }
+    tokio::time::advance(Duration::from_secs(20)).await;
+    let error = connection.await.unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<ConnectionTimeout>(),
+        Some(ConnectionTimeout::Lifetime)
+    ));
+    assert_eq!(client.read(&mut [0; 1]).await.unwrap(), 0);
+}
+#[tokio::test]
+async fn connection_cap_closes_the_next_socket_and_exports_a_refusal() {
+    let mut egress = local_egress();
+    egress.max_connections = 1.try_into().unwrap();
+    let proxy = Proxy::configured(RootCertStore::empty(), egress).await;
+    let first = proxy.tunnel(443).await;
+    let mut excess = TcpStream::connect(proxy.addr).await.unwrap();
+    assert_eq!(excess.read(&mut [0; 1]).await.unwrap(), 0);
+    drop(first);
+    let spans = proxy.finish().await;
+    let refusals: Vec<_> = spans
+        .iter()
+        .filter(|s| attribute(s, "egress.decision", "refused:connections"))
+        .collect();
+    assert_eq!(refusals.len(), 1);
+    assert_eq!(refusals[0].name, "egress.request");
 }
 #[test]
 fn suffix_allowlist_respects_label_boundaries_and_attributes_are_byte_bounded() {

@@ -1,4 +1,7 @@
-use crate::{config::Config, telemetry};
+use crate::{
+    config::{Config, Egress},
+    telemetry,
+};
 use http_body_util::{BodyExt, Full, combinators::UnsyncBoxBody};
 use hyper::{
     Request, Response, StatusCode, Uri,
@@ -12,7 +15,7 @@ use std::{
     cell::Cell,
     convert::Infallible,
     future::Future,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     path::Path,
     pin::Pin,
     sync::{Arc, Mutex},
@@ -22,6 +25,8 @@ use std::{
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream},
+    sync::watch,
+    time::Instant,
 };
 use tokio_rustls::{
     LazyConfigAcceptor, TlsConnector,
@@ -93,7 +98,7 @@ async fn classify(stream: Stream) -> Result<Classified, Error> {
 }
 struct Engine {
     ca: Ca,
-    allow: Vec<String>,
+    egress: Egress,
     tls: Arc<ClientConfig>,
 }
 #[derive(Clone)]
@@ -106,6 +111,8 @@ enum Refusal {
     HostMismatch,
     NotAllowed,
     Protocol,
+    Address,
+    Connections,
 }
 impl Refusal {
     fn decision(self) -> &'static str {
@@ -113,6 +120,8 @@ impl Refusal {
             Self::HostMismatch => "refused:host_mismatch",
             Self::NotAllowed => "refused:not_allowed",
             Self::Protocol => "refused:protocol",
+            Self::Address => "refused:address",
+            Self::Connections => "refused:connections",
         }
     }
 }
@@ -354,7 +363,11 @@ impl Engine {
         let tls = uri.scheme_str() == Some("https");
         let port = uri.port_u16().unwrap_or(if tls { 443 } else { 80 });
         async {
-            let tcp = TcpStream::connect((host.trim_matches(['[', ']']), port)).await?;
+            let addresses: Vec<_> = tokio::net::lookup_host((host.trim_matches(['[', ']']), port))
+                .await?
+                .collect();
+            let addresses = vetted_addresses(&addresses, &self.egress.allow_private)?;
+            let tcp = TcpStream::connect(addresses).await?;
             if tls {
                 Ok::<Stream, Error>(Box::new(
                     TlsConnector::from(Arc::clone(&self.tls))
@@ -433,6 +446,7 @@ impl Engine {
             .host()
             .or_else(|| tunnel.map(|t| t.authority.host()))
             .unwrap_or("");
+        let host = host.to_owned();
         let url = if req.method() == hyper::Method::CONNECT {
             format!("https://{}/", req.uri())
         } else if req.uri().scheme().is_some() {
@@ -447,8 +461,8 @@ impl Engine {
         } else {
             req.uri().to_string()
         };
-        let mut span = span(req.method().as_str(), &url, host);
-        let decision = destination(&req, tunnel, &self.allow);
+        let mut span = span(req.method().as_str(), &url, &host);
+        let decision = destination(&req, tunnel, &self.egress.allow);
         let response = match decision {
             Err(reason) => {
                 span.span.record("egress.decision", reason.decision());
@@ -473,6 +487,11 @@ impl Engine {
                 } else {
                     match self.forward(req, uri).instrument(span.span.clone()).await {
                         Ok(response) => response,
+                        Err(error) if error.is::<AddressRefused>() => {
+                            span.span
+                                .record("egress.decision", Refusal::Address.decision());
+                            reply(StatusCode::FORBIDDEN, format!("egress refused: {host}"))
+                        }
                         Err(error) => {
                             tracing::warn!(%error, "egress upstream failed");
                             reply(StatusCode::BAD_GATEWAY, String::new())
@@ -543,6 +562,33 @@ impl Engine {
             tunnel = Some(next);
         }
     }
+    async fn bounded_connection(
+        &self,
+        stream: Stream,
+        record: &mut ConnectionRecord,
+        started: Instant,
+    ) -> Result<(), Error> {
+        let (activity, mut changed) = watch::channel(started);
+        let stream = Box::new(ActiveStream { stream, activity });
+        let idle = Duration::from_secs(self.egress.idle_seconds.get().into());
+        let lifetime = Duration::from_secs(self.egress.max_connection_seconds.get().into());
+        let idle_timeout = async {
+            loop {
+                let deadline = *changed.borrow_and_update() + idle;
+                tokio::select! {
+                    biased;
+                    result = changed.changed() => { if result.is_err() { return; } }
+                    _ = tokio::time::sleep_until(deadline) => return,
+                }
+            }
+        };
+        tokio::select! {
+            biased;
+            _ = tokio::time::sleep_until(started + lifetime) => Err(ConnectionTimeout::Lifetime.into()),
+            _ = idle_timeout => Err(ConnectionTimeout::Idle.into()),
+            result = self.connection(stream, record) => result,
+        }
+    }
     async fn serve(
         self: Arc<Self>,
         listener: TcpListener,
@@ -553,9 +599,10 @@ impl Engine {
         tokio::pin!(stop);
         let outcome = loop {
             tokio::select! {
+                biased;
                 _ = &mut stop => break Ok(()),
                 result = workers.join_next(), if !workers.is_empty() => { if let Some(Err(error)) = result { break Err(Error::from(error)); } }
-                accepted = listener.accept(), if workers.len() < 16 => {
+                accepted = listener.accept() => {
                     let (stream, _) = match accepted {
                         Ok(accepted) => accepted,
                         Err(error) => {
@@ -566,14 +613,23 @@ impl Engine {
                     let engine = Arc::clone(&self);
                     let runtime = tokio::runtime::Handle::current();
                     let dispatch = tracing::dispatcher::get_default(Clone::clone);
-                    // Each of 16 owned workers drives its stream and synchronous span exports off Tokio.
+                    if workers.len() >= self.egress.max_connections.get() as usize {
+                        drop(stream);
+                        // One awaited exporter task keeps synchronous OTLP off the accept loop's runtime.
+                        tokio::task::spawn_blocking(move || tracing::dispatcher::with_default(&dispatch, || {
+                            let _entered = runtime.enter();
+                            let span = span("", "", "");
+                            span.span.record("egress.decision", Refusal::Connections.decision());
+                        })).await?;
+                        continue;
+                    }
+                    let started = Instant::now();
+                    // The capped JoinSet owns each stream and its synchronous span exports until drained.
                     workers.spawn_blocking(move || tracing::dispatcher::with_default(&dispatch, || {
                         let mut record = ConnectionRecord::default();
-                        let result = runtime.block_on(tokio::time::timeout(Duration::from_secs(60), engine.connection(Box::new(stream), &mut record)));
-                        match result {
-                            Ok(Ok(())) => (),
-                            Ok(Err(error)) => { record.failed(); tracing::warn!(%error, "egress connection failed"); }
-                            Err(error) => { record.failed(); tracing::warn!(%error, "egress connection deadline"); }
+                        if let Err(error) = runtime.block_on(engine.bounded_connection(Box::new(stream), &mut record, started)) {
+                            record.failed();
+                            tracing::warn!(%error, "egress connection failed");
                         }
                     }));
                 }
@@ -586,6 +642,120 @@ impl Engine {
             }
         }
         outcome
+    }
+}
+#[derive(Debug, thiserror::Error)]
+#[error("egress address refused")]
+struct AddressRefused;
+fn vetted_addresses<'a>(
+    addresses: &'a [SocketAddr],
+    exceptions: &[ipnet::IpNet],
+) -> Result<&'a [SocketAddr], AddressRefused> {
+    if addresses.is_empty()
+        || addresses.iter().any(|address| {
+            let ip = address.ip().to_canonical();
+            !(global_unicast(ip)
+                || exceptions
+                    .iter()
+                    .any(|cidr| cidr.contains(&ip) || cidr.contains(&address.ip())))
+        })
+    {
+        return Err(AddressRefused);
+    }
+    Ok(addresses)
+}
+fn global_unicast(ip: IpAddr) -> bool {
+    // Stable Rust lacks is_global (rust-lang/rust#27709); exclude IANA special-purpose ranges explicitly.
+    match ip {
+        IpAddr::V4(ip) => {
+            let [a, b, c, d] = ip.octets();
+            !(ip.is_private()
+                || ip.is_loopback()
+                || ip.is_link_local()
+                || ip.is_documentation()
+                || a == 0
+                || a >= 224
+                || (a == 100 && (64..=127).contains(&b))
+                || (a == 198 && (18..=19).contains(&b))
+                || (a == 192 && b == 0 && c == 0 && !matches!(d, 9 | 10))
+                || (a == 192 && b == 88 && c == 99))
+        }
+        IpAddr::V6(ip) => {
+            let s = ip.segments();
+            let protocol_exception = matches!(
+                s,
+                [0x2001, 1, 0, 0, 0, 0, 0, 1..=3]
+                    | [0x2001, 3, ..]
+                    | [0x2001, 4, 0x112, ..]
+                    | [0x2001, 0x20..=0x3f, ..]
+            );
+            !(ip.is_unspecified()
+                || ip.is_loopback()
+                || ip.is_multicast()
+                || ip.is_unique_local()
+                || ip.is_unicast_link_local()
+                || matches!(
+                    s,
+                    [0, 0, 0, 0, 0, 0, ..]
+                        | [0x64, 0xff9b, 1, ..]
+                        | [0x100, 0, 0, 0, ..]
+                        | [0x100, 0, 0, 1, ..]
+                        | [0x2002, ..]
+                        | [0x2001, 0xdb8, ..]
+                        | [0x3fff, 0..=0x0fff, ..]
+                        | [0x5f00, ..]
+                        | [0xfec0..=0xfeff, ..]
+                )
+                || (s[0] == 0x2001 && s[1] < 0x200 && !protocol_exception)
+                || (matches!(s, [0x64, 0xff9b, 0, 0, 0, 0, ..])
+                    && !global_unicast(IpAddr::V4(std::net::Ipv4Addr::from(
+                        (u32::from(s[6]) << 16) | u32::from(s[7]),
+                    )))))
+        }
+    }
+}
+#[derive(Debug, thiserror::Error)]
+enum ConnectionTimeout {
+    #[error("egress idle timeout")]
+    Idle,
+    #[error("egress maximum lifetime")]
+    Lifetime,
+}
+struct ActiveStream {
+    stream: Stream,
+    activity: watch::Sender<Instant>,
+}
+impl AsyncRead for ActiveStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let result = Pin::new(&mut self.stream).poll_read(cx, buf);
+        if matches!(result, Poll::Ready(Ok(()))) && buf.filled().len() > before {
+            self.activity.send_replace(Instant::now());
+        }
+        result
+    }
+}
+impl AsyncWrite for ActiveStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let result = Pin::new(&mut self.stream).poll_write(cx, buf);
+        if matches!(result, Poll::Ready(Ok(n)) if n > 0) {
+            self.activity.send_replace(Instant::now());
+        }
+        result
+    }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.stream).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.stream).poll_shutdown(cx)
     }
 }
 #[derive(Default)]
@@ -669,7 +839,7 @@ pub async fn run(
         let roots = RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         let engine = Arc::new(Engine {
             ca,
-            allow: selected.1.egress.allow.clone(),
+            egress: selected.1.egress.clone(),
             tls: client_config(roots)?,
         });
         engine

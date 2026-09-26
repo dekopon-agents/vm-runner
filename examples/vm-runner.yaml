@@ -23,6 +23,10 @@ profiles:
         - "*.gstatic.com"
         - "*.googleapis.com"
       dns: runner
+      allowPrivate: []
+      idleSeconds: 90
+      maxConnectionSeconds: 1800
+      maxConnections: 128
 quotas:
   default: { maxSessions: 1 }
   subjects:

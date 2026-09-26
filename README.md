@@ -33,7 +33,13 @@ rotates the CA; its private key stays in memory. Upstream TLS uses WebPKI roots.
 HTTP/1.1 and TLS-in-CONNECT are inspected; unsupported protocols fail closed. Each inner Host
 must agree with CONNECT and TLS SNI, and every forwarded request loses W3C trace headers.
 There is no transparent routing, credential injection, HTTP/2 or WebSocket tunneling.
-The listener admits at most 16 connections, each with a 60-second total lifetime; shutdown stops
-accepting and drains those bounded workers before shutting down telemetry.
+After DNS resolution, every returned address must be global unicast before the proxy connects
+using those exact addresses. Profile `egress.allowPrivate` CIDRs are the only exceptions (empty
+by default); the host allow-list still applies. Mixed public/private DNS answers fail closed.
+
+Profile `egress.idleSeconds` defaults to 90, `maxConnectionSeconds` to 1800, and `maxConnections`
+to 128. Successful client reads or writes reset the idle timeout, not the maximum lifetime.
+Excess connections close immediately with a `refused:connections` span. Shutdown stops accepting
+and drains the bounded workers before shutting down telemetry.
 
 Licensed under either of Apache-2.0 or MIT at your option.

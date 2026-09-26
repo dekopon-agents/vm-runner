@@ -135,6 +135,7 @@ pub(crate) struct Jails {
     pub image: String,
     pub image_cache_host_path: PathBuf,
     pub controller_audience: String,
+    pub controller_subject: String,
     pub token_file: PathBuf,
 }
 pub(crate) struct Names<T>(pub Vec<(String, T)>);
@@ -205,6 +206,10 @@ impl Config {
                 (
                     jails.controller_audience == "vm-runner-jail",
                     "controllerAudience",
+                ),
+                (
+                    service_account(&jails.controller_subject),
+                    "controllerSubject",
                 ),
             ] {
                 if !valid {

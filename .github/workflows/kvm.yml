@@ -43,6 +43,12 @@ jobs:
           mkdir "$RUNNER_TEMP/kvm-context"
           cp Dockerfile target/debug/vm-runnerd "$RUNNER_TEMP/kvm-context/"
           docker build --build-arg TARGETARCH=amd64 -t vm-runner:kvm "$RUNNER_TEMP/kvm-context"
+      - name: Runtime image contains no setuid or setgid files
+        run: |
+          docker run --rm --user 0:0 --entrypoint /bin/sh vm-runner:kvm -ec '
+            find / -xdev -perm /6000 -type f > /tmp/privileged-files
+            test ! -s /tmp/privileged-files
+          '
       - name: Exercise C7, VMM identity, and positive and negative egress
         run: |
           # Match smarter-device-manager's device permissions on this disposable runner.
@@ -50,6 +56,7 @@ jobs:
           stat -c '%n mode=%a uid=%u gid=%g' /dev/kvm /dev/net/tun
           docker run --rm --user 0:0 --group-add 1000 --cap-drop ALL \
             --cap-add NET_ADMIN --cap-add SETUID --cap-add SETGID \
+            --security-opt no-new-privileges \
             --device /dev/kvm --device /dev/net/tun \
             --sysctl net.ipv4.ip_forward=0 \
             --sysctl net.ipv4.ip_unprivileged_port_start=0 \

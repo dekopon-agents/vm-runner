@@ -32,6 +32,8 @@ enum Error {
     ImageLayers,
     #[error("unknown profile or shape")]
     Profile,
+    #[error("jail requires jails.controllerSubject")]
+    ControllerSubject,
     #[error("jail netns requires {path}={expected}; set the pod sysctl before startup")]
     Sysctl {
         path: &'static str,
@@ -191,6 +193,10 @@ pub async fn run(config: Config, profile: &str, session: &str) -> Result<()> {
     if uuid::Uuid::parse_str(session)?.get_version_num() != 7 {
         return Err(Error::Session.into());
     }
+    let controller_subject = config
+        .jails
+        .ok_or(Error::ControllerSubject)?
+        .controller_subject;
     let selected = config
         .profiles
         .0
@@ -221,20 +227,26 @@ pub async fn run(config: Config, profile: &str, session: &str) -> Result<()> {
         if tokio::fs::metadata(&work).await?.gid() != 1000 { return Err(Error::RuntimeGroup.into()); }
         tokio::fs::set_permissions(&work, std::fs::Permissions::from_mode(0o2770)).await?;
         let guest = Arc::new(client::Guest::new(work.join("guest.sock")));
-        let (endpoint, requests, state) = api::endpoint(config.auth, Arc::clone(&guest)).await?;
+        let (endpoint, requests, state) = api::endpoint(config.auth, controller_subject, Arc::clone(&guest)).await?;
         let acceptor = poem::listener::TcpListener::bind("0.0.0.0:8080").into_acceptor().await?;
-        let (ca, pem) = crate::egress::Ca::new()?;
-        network(&work).await?;
-        let gateway = crate::egress::Gateway::bind(selected.egress, ca).await?;
         let (stop, stopping) = watch::channel(false);
         let mut workers = JoinSet::new();
         let handle = tokio::runtime::Handle::current();
         let dispatch = tracing::dispatcher::get_default(Clone::clone);
-        let egress_stop = stopping.clone();
+        let api_stop = stopping.clone();
         // The lifecycle joins exactly the gateway and API workers after stopping the VM.
-        workers.spawn_blocking(move || tracing::dispatcher::with_default(&dispatch, || handle.block_on(gateway.serve(stopped(egress_stop)))));
+        workers.spawn_blocking(move || tracing::dispatcher::with_default(&dispatch, || handle.block_on(async {
+            poem::Server::new_with_acceptor(acceptor).run_with_graceful_shutdown(endpoint, stopped(api_stop), Some(Duration::from_secs(45))).await?;
+            Ok(())
+        })));
         let mut vm = None;
         let result = async {
+            let (ca, pem) = crate::egress::Ca::new()?;
+            network(&work).await?;
+            let gateway = crate::egress::Gateway::bind(selected.egress, ca).await?;
+            let handle = tokio::runtime::Handle::current();
+            let dispatch = tracing::dispatcher::get_default(Clone::clone);
+            workers.spawn_blocking(move || tracing::dispatcher::with_default(&dispatch, || handle.block_on(gateway.serve(stopped(stopping)))));
             let shutdown = crate::shutdown_signal();
             tokio::pin!(shutdown);
             let boot = tracing::info_span!("vm_runner.boot");
@@ -251,12 +263,7 @@ pub async fn run(config: Config, profile: &str, session: &str) -> Result<()> {
                 status = child.wait() => return Err(Error::Firecracker(status?).into()),
                 worker = workers.join_next() => return Err(worker_error(worker)),
             }
-            let handle = tokio::runtime::Handle::current();
-            let dispatch = tracing::dispatcher::get_default(Clone::clone);
-            workers.spawn_blocking(move || tracing::dispatcher::with_default(&dispatch, || handle.block_on(async {
-                poem::Server::new_with_acceptor(acceptor).run_with_graceful_shutdown(endpoint, stopped(stopping), Some(Duration::from_secs(45))).await?;
-                Ok(())
-            })));
+            state.mark_ready();
             tracing::info!(pid, "jail ready");
             tokio::select! {
                 _ = &mut shutdown => Ok(()),

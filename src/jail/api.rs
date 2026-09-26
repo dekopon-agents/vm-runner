@@ -7,7 +7,7 @@ use poem_openapi::{
 use serde::Deserialize;
 use std::{
     collections::VecDeque,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, atomic::AtomicBool},
     time::Duration,
 };
 use tokio::{sync::watch, task::JoinSet};
@@ -35,6 +35,8 @@ struct Executed {
 #[oai(rename = "JailNotExecuted")]
 struct NotExecuted {
     reason: String,
+    #[serde(default)]
+    truncated: bool,
 }
 #[derive(Clone, Deserialize, Union)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
@@ -42,6 +44,26 @@ struct NotExecuted {
 enum Terminal {
     Executed(Executed),
     NotExecuted(NotExecuted),
+}
+impl Terminal {
+    fn capped(mut self) -> Self {
+        match &mut self {
+            Self::Executed(result) => {
+                result.truncated |= cap(&mut result.stdout) | cap(&mut result.stderr);
+            }
+            Self::NotExecuted(result) => result.truncated |= cap(&mut result.reason),
+        }
+        self
+    }
+}
+fn cap(text: &mut String) -> bool {
+    const OUTPUT_CAP: usize = 64 * 1024;
+    if text.len() <= OUTPUT_CAP {
+        return false;
+    }
+    text.truncate(text.floor_char_boundary(OUTPUT_CAP));
+    text.shrink_to_fit();
+    true
 }
 #[derive(Object)]
 #[oai(rename_all = "camelCase")]
@@ -95,9 +117,13 @@ struct Jobs {
 }
 pub(super) struct State {
     guest: Arc<Guest>,
+    ready: Arc<AtomicBool>,
     jobs: Mutex<Jobs>,
 }
 impl State {
+    pub(super) fn mark_ready(&self) {
+        self.ready.store(true, std::sync::atomic::Ordering::Release);
+    }
     fn submit(&self, input: ExecInput) -> poem::Result<Option<Job>> {
         let mut jobs = self.jobs.lock().map_err(|error| {
             poem::error::InternalServerError(std::io::Error::other(error.to_string()))
@@ -144,7 +170,7 @@ impl State {
                             .call::<Terminal>(&request, Duration::from_secs(610))
                             .await
                         {
-                            Ok(result) => Progress::Done(Arc::new(result)),
+                            Ok(result) => Progress::Done(Arc::new(result.capped())),
                             Err(error) => {
                                 tracing::error!(%error, "guest exec outcome unknown");
                                 Progress::Unknown
@@ -190,6 +216,7 @@ impl Api {
             return Ok(ExecResponse::Done(Json(Terminal::NotExecuted(
                 NotExecuted {
                     reason: "quota".into(),
+                    truncated: false,
                 },
             ))));
         };
@@ -242,6 +269,7 @@ impl Api {
 }
 pub(super) async fn endpoint(
     mut auth: Auth,
+    controller_subject: String,
     guest: Arc<Guest>,
 ) -> super::Result<(
     impl Endpoint<Output = poem::Response>,
@@ -249,13 +277,15 @@ pub(super) async fn endpoint(
     Arc<State>,
 )> {
     auth.audience = "vm-runner-jail".into();
+    auth.subjects = vec![controller_subject];
     let auth = Authenticator::new(auth).await?;
     let state = Arc::new(State {
         guest,
+        ready: Arc::new(AtomicBool::new(false)),
         jobs: Mutex::new(Jobs::default()),
     });
     let endpoint: poem::endpoint::BoxEndpoint<'static, poem::Response> = OpenApiService::new(
-        (crate::Health, Api),
+        (crate::Health(Some(Arc::clone(&state.ready))), Api),
         "vm-runner jail",
         env!("CARGO_PKG_VERSION"),
     )

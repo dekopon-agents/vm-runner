@@ -12,7 +12,7 @@ fn config() -> Arc<Config> {
     config.jails = Some(
         serde_json::from_value(json!({
             "namespace":"jails", "image":"runner@sha256:abc", "imageCacheHostPath":"/images",
-            "controllerAudience":"vm-runner-jail", "tokenFile":"/token"
+            "controllerAudience":"vm-runner-jail", "controllerSubject":"system:serviceaccount:test:controller", "tokenFile":"/token"
         }))
         .unwrap(),
     );
@@ -328,6 +328,7 @@ fn jails_configuration_reports_all_invalid_fields() {
     jails.namespace.clear();
     jails.image.clear();
     jails.controller_audience = "vm-runner".into();
+    jails.controller_subject = "not-a-service-account".into();
     jails.token_file = "relative".into();
     jails.image_cache_host_path = "relative".into();
     assert_eq!(
@@ -337,7 +338,8 @@ fn jails_configuration_reports_all_invalid_fields() {
             "image",
             "imageCacheHostPath",
             "tokenFile",
-            "controllerAudience"
+            "controllerAudience",
+            "controllerSubject"
         ]
         .map(crate::config::Conflict::Jails)
     );

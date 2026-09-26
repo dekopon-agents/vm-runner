@@ -38,6 +38,19 @@ errors are logged and retried without blocking API admission; connect/read timeo
 5/15 seconds.
 No DELETE route is exposed. Without `jails`, session requests return 503.
 
+Configure `jails` for both controller and jail roles; `controllerSubject` is required and
+names the controller's service account, not a C4 caller from `auth.subjects`:
+
+```yaml
+jails:
+  namespace: vm-runner
+  image: ghcr.io/dekopon-agents/vm-runner:<version>
+  imageCacheHostPath: /var/lib/vm-runner/images
+  controllerAudience: vm-runner-jail
+  controllerSubject: system:serviceaccount:dekopon:vm-runner-controller
+  tokenFile: /var/run/secrets/vm-runner-jail/token
+```
+
 ## Explicit egress proxy
 
 ```sh
@@ -134,7 +147,9 @@ with the profile's shape, a read-only cached rootfs, a fresh CA drive padded to 
 sparse scratch ext4. Mount the cache read-only at `/images` and a fresh emptyDir at
 `/run/vm-runner`. Supply `vm_runner.subject` via `OTEL_RESOURCE_ATTRIBUTES`. The container
 requires uid 0 with exactly `NET_ADMIN`, `SETUID`, and `SETGID`, plus `/dev/kvm` and
-`/dev/net/tun`, with default seccomp. Set pod `fsGroup: 1000`; the runtime volume must be
+`/dev/net/tun`, with default seccomp and container `allowPrivilegeEscalation: false`
+(`--security-opt no-new-privileges` in Docker). The runtime image has no setuid/setgid files.
+Set pod `fsGroup: 1000`; the runtime volume must be
 owned by group 1000 and both devices accessible to that group (device-manager defaults to
 0666). Firecracker runs as uid/gid 1000, without supplementary groups or effective capabilities.
 Runtime files are group-writable; the private CA key stays in memory. Guest serial output
@@ -149,9 +164,12 @@ The runtime image includes digest-verified Firecracker 1.17.0, iproute2, nftable
 SIGTERM kills and reaps the VM before flushing telemetry; the pod owns netns/emptyDir cleanup.
 
 The same process serves gateway DNS, HTTP and HTTPS using the CA supplied to the guest.
-After the guest answers `ping`, the jail serves `:8080`: authenticated `GET /healthz`,
-`POST /exec {argv, stdin?, deadlineMs}` and `GET /jobs/{id}`. Tokens must have audience
-`vm-runner-jail` and a configured controller subject. A response deadline (0–25000 ms) returns
+The jail serves `:8080` before boot: authenticated `GET /healthz` returns 503 until the
+guest answers `ping`, then 200. It also serves `POST /exec {argv, stdin?, deadlineMs}` and
+`GET /jobs/{id}`. Tokens must have audience `vm-runner-jail` and exactly the subject from
+`jails.controllerSubject`; C4's `auth.subjects` grants no jail access. GET admission is
+independent of long-poll exec admission. Guest stdout, stderr and refusal reasons are capped
+at 64 KiB each on a UTF-8 boundary, setting `truncated: true` when cut. A response deadline (0–25000 ms) returns
 202 with a job ID; execution continues up to the guest's 600 s limit. Transport loss leaves
 an unknown outcome, never a false success or automatic retry. The table retains at most 64
 jobs, evicting non-running records first; when all slots are active, exec returns

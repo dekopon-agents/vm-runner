@@ -25,7 +25,7 @@ async fn reaper_kube_error_or_timeout_leaves_api_serving_and_retries_next_tick()
     fixture.config.jails = Some(
         serde_json::from_value(json!({
             "namespace":"jails", "image":"runner@sha256:abc", "imageCacheHostPath":"/images",
-            "controllerAudience":"vm-runner-jail", "tokenFile":"/token"
+            "controllerAudience":"vm-runner-jail", "controllerSubject":"system:serviceaccount:test:controller", "tokenFile":"/token"
         }))
         .unwrap(),
     );

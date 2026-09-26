@@ -10,7 +10,7 @@ use tokio::{
 };
 
 #[tokio::test]
-async fn isolated_jail_executes_with_confined_identity_and_egress_then_stops() {
+async fn jail_vmm_has_no_new_privileges_and_confined_identity_and_egress() {
     let key = EcdsaKeyPair::generate(&ECDSA_P256_SHA256_FIXED_SIGNING).unwrap();
     let point = key.public_key().as_ref();
     let jwks = json!({"keys":[{"kty":"EC","crv":"P-256","kid":"kvm","alg":"ES256","x":B64.encode(&point[1..33]),"y":B64.encode(&point[33..])}]}).to_string();
@@ -37,13 +37,18 @@ async fn isolated_jail_executes_with_confined_identity_and_egress_then_stops() {
     let now = jsonwebtoken::get_current_timestamp();
     let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES256);
     header.kid = Some("kvm".into());
-    let token = jsonwebtoken::encode(&header, &json!({"iss":issuer,"sub":"system:serviceaccount:dekopon:default","aud":["vm-runner-jail"],"exp":now+300,"iat":now,"nbf":now}), &jsonwebtoken::EncodingKey::from_ec_der(key.to_pkcs8v1().unwrap().as_ref())).unwrap();
+    let token = jsonwebtoken::encode(&header, &json!({"iss":issuer,"sub":"system:serviceaccount:test:controller","aud":["vm-runner-jail"],"exp":now+300,"iat":now,"nbf":now}), &jsonwebtoken::EncodingKey::from_ec_der(key.to_pkcs8v1().unwrap().as_ref())).unwrap();
     let config = tempfile::NamedTempFile::new().unwrap();
     let mut value: Value =
         serde_yaml_ng::from_str(include_str!("../examples/vm-runner.yaml")).unwrap();
     value["profiles"]["travel"]["image"] = std::env::var("KVM_GUEST_IMAGE").unwrap().into();
     value["profiles"]["travel"]["egress"]["allow"] = json!(["example.com"]);
     value["auth"]["issuers"] = json!([{"issuer":issuer}]);
+    value["jails"] = json!({
+        "namespace":"test", "image":"vm-runner:kvm", "imageCacheHostPath":"/images",
+        "controllerAudience":"vm-runner-jail", "controllerSubject":"system:serviceaccount:test:controller",
+        "tokenFile":"/unused"
+    });
     tokio::fs::write(config.path(), serde_yaml_ng::to_string(&value).unwrap())
         .await
         .unwrap();
@@ -90,6 +95,7 @@ async fn isolated_jail_executes_with_confined_identity_and_egress_then_stops() {
             let value = status.lines().find(|line| line.starts_with(field)).unwrap().split_once(':').unwrap().1.trim();
             if field == "Groups:" { assert!(value.is_empty()); } else { assert_eq!(u64::from_str_radix(value, 16).unwrap(), 0); }
         }
+        assert_eq!(status.lines().find(|line| line.starts_with("NoNewPrivs:")).unwrap().split_once(':').unwrap().1.trim(), "1");
         for path in ["/dev/kvm", "/dev/net/tun"] {
             let mode = tokio::fs::metadata(path).await.unwrap().permissions().mode() & 0o777;
             println!("device {path} mode={mode:o}");

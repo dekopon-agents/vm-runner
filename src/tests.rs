@@ -128,7 +128,7 @@ async fn session_route_authenticates_and_returns_named_create_or_get_statuses() 
     fixture.config.jails = Some(
         serde_json::from_value(json!({
             "namespace":"jails", "image":"runner", "imageCacheHostPath":"/images",
-            "controllerAudience":"vm-runner-jail", "tokenFile":"/token"
+            "controllerAudience":"vm-runner-jail", "controllerSubject":"system:serviceaccount:test:controller", "tokenFile":"/token"
         }))
         .unwrap(),
     );

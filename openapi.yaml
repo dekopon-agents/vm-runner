@@ -14,6 +14,12 @@ paths:
             text/plain; charset=utf-8:
               schema:
                 type: string
+        '503':
+          description: ''
+          content:
+            text/plain; charset=utf-8:
+              schema:
+                type: string
   /v1/sessions:
     post:
       requestBody:
@@ -199,9 +205,12 @@ components:
       title: JailNotExecuted
       required:
       - reason
+      - truncated
       properties:
         reason:
           type: string
+        truncated:
+          type: boolean
     NotExecuted:
       type: object
       title: NotExecuted

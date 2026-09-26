@@ -104,22 +104,37 @@ impl State {
             })
     }
 }
-pub(crate) struct Health;
+pub(crate) struct Health(pub Option<std::sync::Arc<std::sync::atomic::AtomicBool>>);
+#[derive(ApiResponse)]
+enum HealthResponse {
+    #[oai(status = 200)]
+    Ready(PlainText<&'static str>),
+    #[oai(status = 503)]
+    Starting(PlainText<&'static str>),
+}
 #[OpenApi]
 impl Health {
     #[oai(path = "/healthz", method = "get")]
-    async fn healthz(&self) -> PlainText<&'static str> {
-        PlainText("ok")
+    async fn healthz(&self) -> HealthResponse {
+        if self
+            .0
+            .as_ref()
+            .is_none_or(|ready| ready.load(std::sync::atomic::Ordering::Acquire))
+        {
+            HealthResponse::Ready(PlainText("ok"))
+        } else {
+            HealthResponse::Starting(PlainText("starting"))
+        }
     }
 }
 fn service() -> OpenApiService<(Health, Api), ()> {
-    OpenApiService::new((Health, Api), "vm-runner", env!("CARGO_PKG_VERSION"))
+    OpenApiService::new((Health(None), Api), "vm-runner", env!("CARGO_PKG_VERSION"))
 }
 pub fn openapi() -> String {
     #[cfg(unix)]
     {
         OpenApiService::new(
-            (Health, Api, jail::api::Api),
+            (Health(None), Api, jail::api::Api),
             "vm-runner",
             env!("CARGO_PKG_VERSION"),
         )
@@ -263,11 +278,12 @@ fn endpoint(
         })
 }
 #[cfg(unix)]
-pub(crate) struct TracedRequests(std::sync::Arc<tokio::sync::Semaphore>, u32);
+pub(crate) struct TracedRequests([std::sync::Arc<tokio::sync::Semaphore>; 2], u32);
 #[cfg(unix)]
 impl TracedRequests {
     pub async fn drain(self) -> Result<(), tokio::sync::AcquireError> {
-        let _idle = self.0.acquire_many(self.1).await?;
+        let _exec_idle = self.0[0].acquire_many(self.1).await?;
+        let _get_idle = self.0[1].acquire_many(self.1).await?;
         Ok(())
     }
 }
@@ -276,10 +292,13 @@ pub(crate) fn traced(
     endpoint: impl Endpoint + 'static,
     capacity: u32,
 ) -> (impl Endpoint<Output = poem::Response>, TracedRequests) {
-    let admission = std::sync::Arc::new(tokio::sync::Semaphore::new(capacity as usize));
-    let requests = TracedRequests(std::sync::Arc::clone(&admission), capacity);
+    let admission = std::array::from_fn(|_| {
+        std::sync::Arc::new(tokio::sync::Semaphore::new(capacity as usize))
+    });
+    let requests = TracedRequests(admission.each_ref().map(std::sync::Arc::clone), capacity);
     let endpoint = endpoint.map_to_response().around(move |ep, req| {
-        let admission = std::sync::Arc::clone(&admission);
+        let admission =
+            std::sync::Arc::clone(&admission[usize::from(req.method() == poem::http::Method::GET)]);
         async move {
             // Admit before creating the span so cancellation cannot queue an unbounded export.
             let permit = admission

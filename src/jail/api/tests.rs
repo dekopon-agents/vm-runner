@@ -2,12 +2,222 @@ use super::*;
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+const CONTROLLER: &str = "system:serviceaccount:test:controller";
+
+#[tokio::test]
+async fn jail_refuses_a_c4_valid_non_controller_token_as_unknown_subject() {
+    let fixture = crate::tests::Fixture::new().await;
+    let mut claims = fixture.claims();
+    claims["aud"] = json!(["vm-runner", "vm-runner-jail"]);
+    let token = format!("Bearer {}", fixture.token(&claims, "ec"));
+    let c4 = Authenticator::new(fixture.config.auth.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        c4.verify(Some(&token)).await.unwrap(),
+        claims["sub"].as_str().unwrap()
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let (endpoint, requests, state) = endpoint(
+        fixture.config.auth,
+        CONTROLLER.into(),
+        Arc::new(Guest::new(dir.path().join("absent.sock"))),
+    )
+    .await
+    .unwrap();
+    let response = poem::test::TestClient::new(endpoint)
+        .post("/exec")
+        .header("Authorization", token)
+        .body_json(&json!({"argv":["true"],"deadlineMs":25000}))
+        .send()
+        .await;
+    response.assert_status(StatusCode::UNAUTHORIZED);
+    response
+        .assert_json(json!({"error":"unauthorized","reason":"unknown_subject"}))
+        .await;
+    assert!(state.jobs.lock().unwrap().entries.is_empty());
+    requests.drain().await.unwrap();
+}
+
+async fn request(
+    stream: tokio::net::UnixStream,
+) -> (BufReader<tokio::net::UnixStream>, serde_json::Value) {
+    let mut stream = BufReader::new(stream);
+    let mut hello = String::new();
+    stream.read_line(&mut hello).await.unwrap();
+    assert_eq!(hello, "CONNECT 1024\n");
+    stream.write_all(b"OK 1234\n").await.unwrap();
+    let value = serde_json::from_slice(&guest::read_frame(&mut stream).await.unwrap()).unwrap();
+    (stream, value)
+}
+
+#[tokio::test]
+async fn healthz_returns_503_until_the_guest_answers_ping() {
+    let fixture = crate::tests::Fixture::new().await;
+    let mut claims = fixture.claims();
+    claims["sub"] = json!(CONTROLLER);
+    claims["aud"] = json!(["vm-runner-jail"]);
+    let token = format!("Bearer {}", fixture.token(&claims, "ec"));
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("guest.sock");
+    let listener = tokio::net::UnixListener::bind(&path).unwrap();
+    let guest = Arc::new(Guest::new(path));
+    let (endpoint, requests, state) =
+        endpoint(fixture.config.auth, CONTROLLER.into(), Arc::clone(&guest))
+            .await
+            .unwrap();
+    let client = poem::test::TestClient::new(endpoint);
+    let starting = client
+        .get("/healthz")
+        .header("Authorization", &token)
+        .send()
+        .await;
+    starting.assert_status(StatusCode::SERVICE_UNAVAILABLE);
+    starting.assert_text("starting").await;
+    let peer = tokio::spawn(async move {
+        let (mut stream, value) = request(listener.accept().await.unwrap().0).await;
+        assert_eq!(value, json!({"op":"ping"}));
+        guest::write_frame(&mut stream, &json!({"ok":true}))
+            .await
+            .unwrap();
+    });
+    guest.ready().await.unwrap();
+    state.mark_ready();
+    peer.await.unwrap();
+    let ready = client
+        .get("/healthz")
+        .header("Authorization", &token)
+        .send()
+        .await;
+    ready.assert_status_is_ok();
+    ready.assert_text("ok").await;
+    requests.drain().await.unwrap();
+}
+
+#[tokio::test]
+async fn guest_streams_and_reason_are_capped_at_64_kib_with_truncated_in_exec_and_jobs() {
+    let fixture = crate::tests::Fixture::new().await;
+    let mut claims = fixture.claims();
+    claims["sub"] = json!(CONTROLLER);
+    claims["aud"] = json!(["vm-runner-jail"]);
+    let token = format!("Bearer {}", fixture.token(&claims, "ec"));
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("guest.sock");
+    let listener = tokio::net::UnixListener::bind(&path).unwrap();
+    let (endpoint, requests, state) = endpoint(
+        fixture.config.auth,
+        CONTROLLER.into(),
+        Arc::new(Guest::new(path)),
+    )
+    .await
+    .unwrap();
+    let client = poem::test::TestClient::new(endpoint);
+    let multibyte = format!("{}🦀", "x".repeat(65535));
+    let cases = [
+        (
+            json!({"outcome":"executed","exitCode":0,"stdout":multibyte,"stderr":"s".repeat(65537),"truncated":false}),
+            json!({"outcome":"executed","exitCode":0,"stdout":"x".repeat(65535),"stderr":"s".repeat(65536),"truncated":true}),
+        ),
+        (
+            json!({"outcome":"not_executed","reason":multibyte}),
+            json!({"outcome":"not_executed","reason":"x".repeat(65535),"truncated":true}),
+        ),
+    ];
+    for (input, expected) in cases {
+        let call = client
+            .post("/exec")
+            .header("Authorization", &token)
+            .body_json(&json!({"argv":["true"],"deadlineMs":25000}))
+            .send();
+        let peer = async {
+            let (mut stream, value) = request(listener.accept().await.unwrap().0).await;
+            assert_eq!(value["op"], "exec");
+            guest::write_frame(&mut stream, &input).await.unwrap();
+        };
+        let (response, ()) = tokio::join!(call, peer);
+        response.assert_status_is_ok();
+        response.assert_json(expected.clone()).await;
+        state.drain().await.unwrap();
+        let id = state.jobs.lock().unwrap().entries.back().unwrap().id;
+        client
+            .get(format!("/jobs/{id}"))
+            .header("Authorization", &token)
+            .send()
+            .await
+            .assert_json(expected)
+            .await;
+    }
+    requests.drain().await.unwrap();
+}
+
+#[tokio::test]
+async fn get_answers_while_all_exec_admission_capacity_is_saturated() {
+    let fixture = crate::tests::Fixture::new().await;
+    let mut claims = fixture.claims();
+    claims["sub"] = json!(CONTROLLER);
+    claims["aud"] = json!(["vm-runner-jail"]);
+    let token = format!("Bearer {}", fixture.token(&claims, "ec"));
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("guest.sock");
+    let listener = tokio::net::UnixListener::bind(&path).unwrap();
+    let (endpoint, requests, state) = endpoint(
+        fixture.config.auth,
+        CONTROLLER.into(),
+        Arc::new(Guest::new(path)),
+    )
+    .await
+    .unwrap();
+    state.mark_ready();
+    let client = Arc::new(poem::test::TestClient::new(endpoint));
+    let mut posts = JoinSet::new();
+    for _ in 0..16 {
+        let client = Arc::clone(&client);
+        let token = token.clone();
+        posts.spawn(async move {
+            client
+                .post("/exec")
+                .header("Authorization", token)
+                .body_json(&json!({"argv":["true"],"deadlineMs":25000}))
+                .send()
+                .await
+        });
+    }
+    let mut streams = Vec::new();
+    for _ in 0..16 {
+        let (stream, value) = request(listener.accept().await.unwrap().0).await;
+        assert_eq!(value["op"], "exec");
+        streams.push(stream);
+    }
+    let id = state.jobs.lock().unwrap().entries[0].id;
+    tokio::select! {
+        () = async {
+            client.get("/healthz").header("Authorization", &token).send().await.assert_status_is_ok();
+            client.get(format!("/jobs/{id}")).header("Authorization", &token).send().await.assert_json(json!({"state":"running"})).await;
+        } => (),
+        result = posts.join_next() => panic!("GET queued behind exec: {:?}", result.unwrap().unwrap().0.status()),
+    }
+    for mut stream in streams {
+        guest::write_frame(
+            &mut stream,
+            &json!({"outcome":"executed","exitCode":0,"stdout":"","stderr":"","truncated":false}),
+        )
+        .await
+        .unwrap();
+    }
+    while let Some(result) = posts.join_next().await {
+        result.unwrap().assert_status_is_ok();
+    }
+    state.drain().await.unwrap();
+    requests.drain().await.unwrap();
+}
+
 #[tokio::test]
 async fn jail_auth_deadline_job_and_later_result_use_one_guest_execution() {
     let fixture = crate::tests::Fixture::new().await;
     let wrong_audience = fixture.token(&fixture.claims(), "ec");
     let mut claims = fixture.claims();
     claims["aud"] = json!(["vm-runner-jail"]);
+    claims["sub"] = json!(CONTROLLER);
     let token = fixture.token(&claims, "ec");
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("guest.sock");
@@ -29,9 +239,14 @@ async fn jail_auth_deadline_job_and_later_result_use_one_guest_execution() {
         released.await.unwrap();
         guest::write_frame(&mut stream, &json!({"outcome":"executed","exitCode":0,"stdout":"ok","stderr":"","truncated":false,"durationMs":1})).await.unwrap();
     });
-    let (endpoint, requests, state) = endpoint(fixture.config.auth, Arc::new(Guest::new(path)))
-        .await
-        .unwrap();
+    let (endpoint, requests, state) = endpoint(
+        fixture.config.auth,
+        CONTROLLER.into(),
+        Arc::new(Guest::new(path)),
+    )
+    .await
+    .unwrap();
+    state.mark_ready();
     let client = Arc::new(poem::test::TestClient::new(endpoint));
     tokio::time::pause();
     client
@@ -110,6 +325,7 @@ async fn job_capacity_refuses_active_work_and_evicts_only_non_running_records() 
     let retained = jobs.entries[1].id;
     let state = State {
         guest: Arc::new(Guest::new(dir.path().join("absent.sock"))),
+        ready: Arc::new(AtomicBool::new(false)),
         jobs: Mutex::new(jobs),
     };
     let input = || ExecInput {

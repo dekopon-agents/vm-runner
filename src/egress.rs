@@ -9,6 +9,7 @@ use hyper::{
 use hyper_util::rt::TokioIo;
 use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair};
 use std::{
+    cell::Cell,
     convert::Infallible,
     future::Future,
     net::SocketAddr,
@@ -161,13 +162,26 @@ fn safe_url(value: &str) -> String {
     }
     cut(url.as_str())
 }
-fn span(method: &str, url: &str, host: &str) -> tracing::Span {
-    tracing::info_span!(parent: None, "egress.request", http.request.method = %cut(method), url.full = %safe_url(url), server.address = %cut(host), http.response.status_code = 0_i64, egress.decision = tracing::field::Empty)
+struct RequestSpan {
+    span: tracing::Span,
+    status: i64,
 }
-fn protocol_refusal() {
-    let span = span("", "", "");
-    span.record("egress.decision", Refusal::Protocol.decision());
-    span.record("http.response.status_code", 0);
+impl Drop for RequestSpan {
+    fn drop(&mut self) {
+        // Finalize once even when the connection deadline cancels forwarding.
+        self.span.record("http.response.status_code", self.status);
+    }
+}
+fn span(method: &str, url: &str, host: &str) -> RequestSpan {
+    RequestSpan {
+        span: tracing::info_span!(parent: None, "egress.request", http.request.method = %cut(method), url.full = %safe_url(url), server.address = %cut(host), http.response.status_code = tracing::field::Empty, egress.decision = tracing::field::Empty),
+        status: 0,
+    }
+}
+fn protocol_refusal(host: Option<&str>) {
+    let span = span("", "", host.unwrap_or(""));
+    span.span
+        .record("egress.decision", Refusal::Protocol.decision());
 }
 fn reply(status: StatusCode, body: String) -> Response<HttpBody> {
     let mut response = Response::new(
@@ -364,11 +378,10 @@ impl Engine {
         let stream = self.connect(&uri).await?;
         let (mut sender, mut driver) =
             hyper::client::conn::http1::handshake(TokioIo::new(stream)).await?;
+        // Preserve the validated wire value even if Connection nominates Host.
+        let host = req.headers().get(header::HOST).ok_or(RefusalError)?.clone();
         strip(req.headers_mut());
-        req.headers_mut().insert(
-            header::HOST,
-            uri.authority().ok_or(RefusalError)?.as_str().parse()?,
-        );
+        req.headers_mut().insert(header::HOST, host);
         req.headers_mut().insert(
             header::CONNECTION,
             hyper::http::HeaderValue::from_static("close"),
@@ -412,7 +425,9 @@ impl Engine {
         req: Request<Incoming>,
         tunnel: Option<&Tunnel>,
         upgrade: &Mutex<Option<Tunnel>>,
+        recorded: &Cell<bool>,
     ) -> Result<Response<HttpBody>, Infallible> {
+        recorded.set(true);
         let host = req
             .uri()
             .host()
@@ -432,15 +447,15 @@ impl Engine {
         } else {
             req.uri().to_string()
         };
-        let span = span(req.method().as_str(), &url, host);
+        let mut span = span(req.method().as_str(), &url, host);
         let decision = destination(&req, tunnel, &self.allow);
         let response = match decision {
             Err(reason) => {
-                span.record("egress.decision", reason.decision());
+                span.span.record("egress.decision", reason.decision());
                 reply(StatusCode::FORBIDDEN, format!("egress refused: {host}"))
             }
             Ok(uri) => {
-                span.record("egress.decision", "allowed");
+                span.span.record("egress.decision", "allowed");
                 if req.method() == hyper::Method::CONNECT {
                     match upgrade.lock() {
                         Ok(mut slot) => {
@@ -456,7 +471,7 @@ impl Engine {
                         }
                     }
                 } else {
-                    match self.forward(req, uri).instrument(span.clone()).await {
+                    match self.forward(req, uri).instrument(span.span.clone()).await {
                         Ok(response) => response,
                         Err(error) => {
                             tracing::warn!(%error, "egress upstream failed");
@@ -466,13 +481,14 @@ impl Engine {
                 }
             }
         };
-        span.record(
-            "http.response.status_code",
-            i64::from(response.status().as_u16()),
-        );
+        span.status = i64::from(response.status().as_u16());
         Ok(response)
     }
-    async fn connection(&self, mut stream: Stream) -> Result<(), Error> {
+    async fn connection(
+        &self,
+        mut stream: Stream,
+        record: &mut ConnectionRecord,
+    ) -> Result<(), Error> {
         let mut tunnel: Option<Tunnel> = None;
         loop {
             stream = match classify(stream).await {
@@ -482,6 +498,7 @@ impl Engine {
                         .server_name()
                         .ok_or(RefusalError)?
                         .to_owned();
+                    record.host = Some(sni.clone());
                     let server = self.ca.server(&sni)?;
                     if let Some(t) = &mut tunnel {
                         t.sni = Some(sni);
@@ -495,13 +512,14 @@ impl Engine {
                 }
                 Ok(Classified::Http(buffered)) => Box::new(buffered),
                 Ok(Classified::Refuse) => {
-                    protocol_refusal();
+                    protocol_refusal(record.host.as_deref());
                     return Ok(());
                 }
                 Err(error) => return Err(error),
             };
             let upgrade = Mutex::new(None);
-            let service = service_fn(|req| self.request(req, tunnel.as_ref(), &upgrade));
+            let service =
+                service_fn(|req| self.request(req, tunnel.as_ref(), &upgrade, &record.request));
             let parts = hyper::server::conn::http1::Builder::new()
                 .serve_connection(TokioIo::new(stream), service)
                 .without_shutdown()
@@ -519,6 +537,9 @@ impl Engine {
                 stream.shutdown().await?;
                 return Ok(());
             };
+            record.host = Some(next.authority.host().to_owned());
+            // CONNECT's envelope is complete; the inner byte stream has its own gate.
+            record.request.set(false);
             tunnel = Some(next);
         }
     }
@@ -527,6 +548,7 @@ impl Engine {
         listener: TcpListener,
         stop: impl Future<Output = ()>,
     ) -> Result<(), Error> {
+        tracing::info!(addr = %listener.local_addr()?, "listening");
         let mut workers = tokio::task::JoinSet::new();
         tokio::pin!(stop);
         let outcome = loop {
@@ -534,17 +556,24 @@ impl Engine {
                 _ = &mut stop => break Ok(()),
                 result = workers.join_next(), if !workers.is_empty() => { if let Some(Err(error)) = result { break Err(Error::from(error)); } }
                 accepted = listener.accept(), if workers.len() < 16 => {
-                    let (stream, _) = match accepted { Ok(accepted) => accepted, Err(error) => break Err(error.into()) };
+                    let (stream, _) = match accepted {
+                        Ok(accepted) => accepted,
+                        Err(error) => {
+                            tracing::warn!(%error, "egress accept failed");
+                            continue;
+                        }
+                    };
                     let engine = Arc::clone(&self);
                     let runtime = tokio::runtime::Handle::current();
                     let dispatch = tracing::dispatcher::get_default(Clone::clone);
                     // Each of 16 owned workers drives its stream and synchronous span exports off Tokio.
                     workers.spawn_blocking(move || tracing::dispatcher::with_default(&dispatch, || {
-                        let result = runtime.block_on(tokio::time::timeout(Duration::from_secs(60), engine.connection(Box::new(stream))));
+                        let mut record = ConnectionRecord::default();
+                        let result = runtime.block_on(tokio::time::timeout(Duration::from_secs(60), engine.connection(Box::new(stream), &mut record)));
                         match result {
                             Ok(Ok(())) => (),
-                            Ok(Err(error)) => { protocol_refusal(); tracing::warn!(%error, "egress connection failed"); }
-                            Err(error) => { protocol_refusal(); tracing::warn!(%error, "egress connection deadline"); }
+                            Ok(Err(error)) => { record.failed(); tracing::warn!(%error, "egress connection failed"); }
+                            Err(error) => { record.failed(); tracing::warn!(%error, "egress connection deadline"); }
                         }
                     }));
                 }
@@ -557,6 +586,19 @@ impl Engine {
             }
         }
         outcome
+    }
+}
+#[derive(Default)]
+struct ConnectionRecord {
+    host: Option<String>,
+    // HTTP/1 requests and this connection's classifier are driven by one worker.
+    request: Cell<bool>,
+}
+impl ConnectionRecord {
+    fn failed(&self) {
+        if !self.request.get() {
+            protocol_refusal(self.host.as_deref());
+        }
     }
 }
 struct Buffered {
@@ -631,11 +673,7 @@ pub async fn run(
             tls: client_config(roots)?,
         });
         engine
-            .serve(TcpListener::bind(listen).await?, async {
-                if let Err(error) = tokio::signal::ctrl_c().await {
-                    tracing::error!(%error, "signal handler failed");
-                }
-            })
+            .serve(TcpListener::bind(listen).await?, crate::shutdown_signal())
             .await
     }
     .await;

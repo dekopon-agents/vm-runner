@@ -65,15 +65,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let result = async {
         let (endpoint, requests) = app(config).await?;
         let result = poem::Server::new(poem::listener::TcpListener::bind(listen))
-            .run_with_graceful_shutdown(
-                endpoint,
-                async {
-                    if let Err(error) = tokio::signal::ctrl_c().await {
-                        tracing::error!(%error, "signal handler failed");
-                    }
-                },
-                None,
-            )
+            .run_with_graceful_shutdown(endpoint, vm_runner::shutdown_signal(), None)
             .await;
         requests.drain().await?;
         result?;

@@ -83,6 +83,16 @@ impl Proxy {
         self.stop.send(()).unwrap();
         self.task.await.unwrap().unwrap();
         let spans = self.exporter.get_finished_spans().unwrap();
+        for span in spans.iter().filter(|span| span.name == "egress.request") {
+            assert_eq!(
+                span.attributes
+                    .iter()
+                    .filter(|kv| kv.key.as_str() == "http.response.status_code")
+                    .count(),
+                1,
+                "each request must export exactly one final status: {span:?}"
+            );
+        }
         self.provider.shutdown().unwrap();
         spans
     }
@@ -126,7 +136,7 @@ async fn upstream(listener: TcpListener, tls: Option<Arc<ServerConfig>>) -> hype
     headers.lock().unwrap().take().unwrap()
 }
 #[tokio::test]
-async fn allowed_https_uses_injected_root_strips_trace_headers_and_exports_request() {
+async fn allowed_https_strips_trace_headers_and_exports_exactly_one_final_status() {
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     let server = ServerConfig::builder_with_provider(Arc::new(
         rustls::crypto::aws_lc_rs::default_provider(),
@@ -296,7 +306,7 @@ async fn connect_post_is_parsed_and_stripped_or_refused_by_inner_host() {
     );
 }
 #[tokio::test]
-async fn plain_http_streams_request_and_response_bodies() {
+async fn plain_http_preserves_validated_host_and_streams_bodies() {
     let proxy = Proxy::new(RootCertStore::empty()).await;
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -306,7 +316,8 @@ async fn plain_http_streams_request_and_response_bodies() {
             .keep_alive(false)
             .serve_connection(
                 TokioIo::new(stream),
-                service_fn(|req: Request<Incoming>| async {
+                service_fn(|req: Request<Incoming>| async move {
+                    assert_eq!(req.headers()[header::HOST], format!("LOCALHOST:0{port}"));
                     assert!(!req.headers().contains_key("traceparent"));
                     let length = req.headers()[header::CONTENT_LENGTH].clone();
                     let mut response = Response::new(req.into_body());
@@ -321,7 +332,7 @@ async fn plain_http_streams_request_and_response_bodies() {
     });
     let payload = "x".repeat(70000);
     let stream = TcpStream::connect(proxy.addr).await.unwrap();
-    let response = exchange(stream, &format!("POST http://localhost:{port}/echo HTTP/1.1\r\nHost: localhost:{port}\r\ntraceparent: sentinel\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}", payload.len())).await;
+    let response = exchange(stream, &format!("POST http://localhost:{port}/echo HTTP/1.1\r\nHost: LOCALHOST:0{port}\r\ntraceparent: sentinel\r\nContent-Length: {}\r\nConnection: close, Host\r\n\r\n{payload}", payload.len())).await;
     assert_eq!(response, (200, payload));
     peer.await.unwrap();
     proxy.finish().await;
@@ -334,12 +345,139 @@ async fn non_http_tunnel_bytes_close_with_protocol_refusal() {
     assert_eq!(stream.read(&mut [0; 1]).await.unwrap(), 0);
     drop(stream);
     let spans = proxy.finish().await;
-    assert!(
-        spans
-            .iter()
-            .any(|s| attribute(s, "egress.decision", "refused:protocol"))
-    );
+    let refusal = spans
+        .iter()
+        .find(|s| attribute(s, "egress.decision", "refused:protocol"))
+        .unwrap();
+    assert!(attribute(refusal, "server.address", "localhost"));
     assert!(!spans.iter().any(|s| s.name == "egress.connect"));
+}
+#[tokio::test]
+async fn failed_tls_handshake_records_known_sni() {
+    let proxy = Proxy::new(RootCertStore::empty()).await;
+    let stream = TcpStream::connect(proxy.addr).await.unwrap();
+    let error = TlsConnector::from(client_config(RootCertStore::empty()).unwrap())
+        .connect(ServerName::try_from("evil.invalid").unwrap(), stream)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            error
+                .get_ref()
+                .and_then(|inner| inner.downcast_ref::<rustls::Error>()),
+            Some(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::UnknownIssuer
+            ))
+        ),
+        "{error:?}"
+    );
+    let spans = proxy.finish().await;
+    let refusals: Vec<_> = spans
+        .iter()
+        .filter(|s| attribute(s, "egress.decision", "refused:protocol"))
+        .collect();
+    assert_eq!(refusals.len(), 1);
+    assert!(attribute(refusals[0], "server.address", "evil.invalid"));
+}
+#[tokio::test]
+async fn truncated_upstream_body_does_not_relabel_allowed_request_as_protocol_refusal() {
+    let proxy = Proxy::new(RootCertStore::empty()).await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (headers_seen, release) = tokio::sync::oneshot::channel();
+    let peer = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        while !request.ends_with(b"\r\n\r\n") {
+            request.push(stream.read_u8().await.unwrap());
+        }
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\n\r\npartial")
+            .await
+            .unwrap();
+        release.await.unwrap();
+        stream.shutdown().await.unwrap();
+    });
+    let mut stream = TcpStream::connect(proxy.addr).await.unwrap();
+    stream.write_all(format!("GET http://localhost:{port}/ HTTP/1.1\r\nHost: localhost:{port}\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+    let mut response = Vec::new();
+    while !response.ends_with(b"partial") {
+        response.push(stream.read_u8().await.unwrap());
+    }
+    headers_seen.send(()).unwrap();
+    stream.read_to_end(&mut response).await.unwrap();
+    assert!(response.starts_with(b"HTTP/1.1 200 "));
+    peer.await.unwrap();
+    let spans = proxy.finish().await;
+    let requests: Vec<_> = spans
+        .iter()
+        .filter(|s| s.name == "egress.request")
+        .collect();
+    assert_eq!(requests.len(), 1, "{requests:?}");
+    assert!(attribute(requests[0], "egress.decision", "allowed"));
+}
+#[tokio::test]
+async fn cancelled_upstream_request_exports_exactly_one_zero_status_without_protocol_refusal() {
+    let exporter = InMemorySpanExporter::default();
+    let provider = SdkTracerProvider::builder()
+        .with_simple_exporter(exporter.clone())
+        .build();
+    let subscriber = tracing_subscriber::registry()
+        .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("cancel-test")));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (seen, received) = tokio::sync::oneshot::channel();
+    let peer = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        while !request.ends_with(b"\r\n\r\n") {
+            request.push(stream.read_u8().await.unwrap());
+        }
+        seen.send(()).unwrap();
+        // Hold the response until cancellation drops the proxy's upstream socket.
+        assert_eq!(stream.read(&mut [0; 1]).await.unwrap(), 0);
+    });
+    async {
+        let engine = Engine {
+            ca: Ca::new().unwrap().0,
+            allow: vec!["localhost".into()],
+            tls: client_config(RootCertStore::empty()).unwrap(),
+        };
+        let (mut client, stream) = tokio::io::duplex(4096);
+        client.write_all(format!("GET http://localhost:{port}/ HTTP/1.1\r\nHost: localhost:{port}\r\n\r\n").as_bytes()).await.unwrap();
+        let mut record = ConnectionRecord::default();
+        let mut connection = Box::pin(engine.connection(Box::new(stream), &mut record));
+        tokio::select! {
+            result = &mut connection => panic!("connection finished before cancellation: {result:?}"),
+            result = received => result.unwrap(),
+        }
+        // A deadline cancels by dropping this same future; no clock is needed.
+        drop(connection);
+        assert!(record.request.get());
+        record.failed();
+        assert_eq!(client.read(&mut [0; 1]).await.unwrap(), 0);
+    }
+    .with_subscriber(subscriber)
+    .await;
+    peer.await.unwrap();
+    let spans = exporter.get_finished_spans().unwrap();
+    let requests: Vec<_> = spans
+        .iter()
+        .filter(|s| s.name == "egress.request")
+        .collect();
+    assert_eq!(requests.len(), 1, "{requests:?}");
+    assert!(attribute(requests[0], "egress.decision", "allowed"));
+    let statuses: Vec<_> = requests[0]
+        .attributes
+        .iter()
+        .filter(|kv| kv.key.as_str() == "http.response.status_code")
+        .cloned()
+        .collect();
+    assert_eq!(
+        statuses,
+        vec![KeyValue::new("http.response.status_code", 0_i64)]
+    );
+    provider.shutdown().unwrap();
 }
 #[tokio::test]
 async fn fragmented_client_hello_waits_for_remainder_and_is_classified_as_tls() {

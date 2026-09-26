@@ -137,7 +137,7 @@ pub enum Conflict {
     Shape(String),
     #[error("empty allow list: {0}")]
     EmptyAllow(String),
-    #[error("malformed wildcard: {0}")]
+    #[error("malformed egress host pattern: {0}")]
     Wildcard(String),
     #[error("idleSeconds exceeds maxSeconds: {0}")]
     Lifetime(String),
@@ -196,7 +196,7 @@ impl Config {
             }
             for host in &profile.egress.allow {
                 let suffix = host.strip_prefix("*.").unwrap_or(host);
-                if suffix.is_empty() || suffix.contains('*') {
+                if suffix.is_empty() || suffix.contains(['*', ':', '/']) || !suffix.is_ascii() {
                     errors.push(Conflict::Wildcard(host.clone()));
                 }
             }

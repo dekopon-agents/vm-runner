@@ -113,8 +113,20 @@ fn config_reports_all_conflicts_together() {
     let yaml = include_str!("../examples/vm-runner.yaml")
         .replace("shape: pw-1c1g", "shape: missing")
         .replace("maxSeconds: 1800", "maxSeconds: 1");
-    let config: Config = serde_yaml_ng::from_str(&yaml).unwrap();
+    let mut config: Config = serde_yaml_ng::from_str(&yaml).unwrap();
+    let invalid = ["www.google.com:443", "https://x", "*.bücher.example"];
+    config.profiles.0[0]
+        .1
+        .egress
+        .allow
+        .extend(invalid.map(String::from));
     let conflicts = config.conflicts();
+    for host in invalid {
+        assert!(
+            conflicts.contains(&config::Conflict::Wildcard(host.into())),
+            "{conflicts:?}"
+        );
+    }
     for expected in [
         config::Conflict::Shape("travel".into()),
         config::Conflict::Lifetime("travel".into()),

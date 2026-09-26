@@ -45,7 +45,7 @@ async fn jail_vmm_has_no_new_privileges_and_confined_identity_and_egress() {
     value["profiles"]["travel"]["egress"]["allow"] = json!(["example.com"]);
     value["auth"]["issuers"] = json!([{"issuer":issuer}]);
     value["jails"] = json!({
-        "namespace":"test", "image":"vm-runner:kvm", "imageCacheHostPath":"/images",
+        "namespace":"test", "image":format!("vm-runner@sha256:{}", "a".repeat(64)), "imageCacheHostPath":"/images",
         "controllerAudience":"vm-runner-jail", "controllerSubject":"system:serviceaccount:test:controller",
         "tokenFile":"/unused"
     });
@@ -119,7 +119,7 @@ async fn jail_vmm_has_no_new_privileges_and_confined_identity_and_egress() {
         let script = format!("set -eu; for url in 'http://{pod}' 'http://{pod}:8080/healthz' 'http://10.0.2.1:22' 'http://1.1.1.1' 'http://[{fe80}%25eth0]'; do code=0; curl --silent --show-error --noproxy '*' --output /dev/null --max-time 3 \"$url\" || code=$?; case $code in 7|28) :;; *) exit 1;; esac; done; echo NEGATIVE_OK");
         assert_eq!(exec(&api, &token, &script).await["stdout"], "NEGATIVE_OK\n");
         assert!(dropped().await > before, "negative packets must reach tap0's actual nft drop rule");
-        assert!(tokio::fs::read_to_string("/run/vm-runner/serial.log").await.unwrap().contains("Run /sbin/vm-init as init process"));
+        assert!(tokio::fs::read_to_string("/run/vm-runner/console/serial.log").await.unwrap().contains("Run /sbin/vm-init as init process"));
         pid
     }).await;
     nix::sys::signal::kill(

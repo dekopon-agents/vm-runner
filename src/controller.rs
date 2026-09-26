@@ -1,5 +1,7 @@
 use crate::config::Config;
-use k8s_openapi::api::core::v1::Pod;
+use k8s_openapi::api::core::v1::{Pod, Secret};
+mod pods;
+pub(crate) mod proxy;
 use kube::{
     Api, Client,
     api::{DeleteParams, ListParams},
@@ -41,6 +43,7 @@ pub(crate) struct SessionBody {
 #[oai(rename_all = "snake_case")]
 enum SessionState {
     Pending,
+    Ready,
 }
 #[derive(Object)]
 pub(crate) struct NotExecuted {
@@ -91,6 +94,7 @@ impl Created {
         }))
     }
 }
+#[derive(Clone)]
 struct Session {
     body: SessionBody,
     subject: String,
@@ -98,12 +102,18 @@ struct Session {
     active: u64,
     pod: Option<String>,
     retiring: bool,
+    starting: bool,
 }
 pub(crate) struct Controller {
     config: Arc<Config>,
     pods: Api<Pod>,
     // Rebuilt entries use pod names as keys, so even duplicate session IDs count toward quota.
     sessions: Mutex<HashMap<String, Session>>,
+    secrets: Api<Secret>,
+    jail_port: u16,
+    jobs: Mutex<HashMap<String, proxy::Job>>,
+    pub(super) execution: Arc<tokio::sync::Semaphore>,
+    pub(super) reads: Arc<tokio::sync::Semaphore>,
 }
 pub(super) fn now() -> u64 {
     SystemTime::now()
@@ -133,6 +143,7 @@ impl Controller {
             .as_ref()
             .expect("controller requires jails config")
             .namespace;
+        let secrets = Api::namespaced(client.clone(), namespace);
         let pods: Api<Pod> = Api::namespaced(client, namespace);
         let mut listed = pods
             .list(&ListParams::default().labels(SESSION))
@@ -184,6 +195,7 @@ impl Controller {
                     created: created.min(now()),
                     active: active.min(now()),
                     pod: Some(pod.metadata.name.clone()?),
+                    starting: false,
                     retiring: pod.metadata.deletion_timestamp.is_some()
                         || matches!(
                             pod.status.as_ref().and_then(|s| s.phase.as_deref()),
@@ -226,6 +238,11 @@ impl Controller {
             config,
             pods,
             sessions: Mutex::new(sessions),
+            secrets,
+            jail_port: 8080,
+            jobs: Mutex::new(HashMap::new()),
+            execution: Arc::new(tokio::sync::Semaphore::new(1)),
+            reads: Arc::new(tokio::sync::Semaphore::new(1)),
         })
     }
     pub(crate) fn create(&self, subject: &str, request: Create) -> poem::Result<Created> {
@@ -235,10 +252,11 @@ impl Controller {
         }
         let mut sessions = self.sessions.lock().expect("session registry poisoned");
         if let Some(existing) = sessions
-            .values()
+            .values_mut()
             .find(|s| !s.retiring && s.subject == subject && s.body.name == name)
         {
             return Ok(if existing.body.profile == request.profile {
+                existing.active = now();
                 Created::Existing(Json(existing.body.clone()))
             } else {
                 Created::Conflict(Json(Conflict {
@@ -283,6 +301,7 @@ impl Controller {
                 active: now(),
                 pod: None,
                 retiring: false,
+                starting: false,
             },
         );
         Ok(Created::New(Json(body)))
@@ -311,6 +330,9 @@ impl Controller {
                 }
                 let was_retiring = s.retiring;
                 s.retiring = true;
+                if s.starting {
+                    return None;
+                }
                 Some((
                     key.clone(),
                     s.body.session_id.clone(),
@@ -336,10 +358,20 @@ impl Controller {
                 .await;
                 match result {
                     Ok(true) => {
-                        self.sessions
-                            .lock()
-                            .expect("session registry poisoned")
-                            .remove(&key);
+                        let live = {
+                            let mut sessions =
+                                self.sessions.lock().expect("session registry poisoned");
+                            sessions.remove(&key);
+                            sessions
+                                .values()
+                                .any(|s| !s.retiring && s.body.session_id == id)
+                        };
+                        if !live {
+                            self.jobs
+                                .lock()
+                                .expect("job registry poisoned")
+                                .retain(|_, job| job.session != id);
+                        }
                     }
                     Ok(false) => {}
                     Err(error) => tracing::warn!(%error, "pod cleanup failed; retrying next tick"),

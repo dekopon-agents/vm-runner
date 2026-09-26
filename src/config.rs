@@ -39,7 +39,7 @@ pub(crate) struct Issuer {
     pub ca_file: Option<PathBuf>,
     pub token_file: Option<PathBuf>,
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub(crate) struct Shape {
     pub vcpus: NonZeroU32,
@@ -48,7 +48,7 @@ pub(crate) struct Shape {
     #[serde(rename = "diskMiB")]
     pub disk: NonZeroU32,
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub(crate) struct Profile {
     pub shape: String,
@@ -59,13 +59,13 @@ pub(crate) struct Profile {
     pub max_seconds: u64,
     pub egress: Egress,
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 enum Browser {
     Headless,
     Headful,
 }
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub(crate) struct Egress {
     pub allow: Vec<String>,
@@ -92,7 +92,7 @@ const MAX_EGRESS_CONNECTIONS: u32 = 255;
 fn egress_connections() -> NonZeroU32 {
     const { NonZeroU32::new(128).expect("nonzero default") }
 }
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 enum Dns {
     Runner,
@@ -109,12 +109,12 @@ pub(crate) struct Quota {
     #[oai(rename = "maxSessions")]
     pub max_sessions: u32,
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Telemetry {
     pub(crate) otlp: Otlp,
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub(crate) struct Otlp {
     pub protocol: Protocol,
@@ -122,13 +122,13 @@ pub(crate) struct Otlp {
     pub ca_bundle_file: Option<PathBuf>,
     pub headers_file: Option<PathBuf>,
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum Protocol {
     Grpc,
     Http,
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub(crate) struct Jails {
     pub namespace: String,
@@ -137,6 +137,16 @@ pub(crate) struct Jails {
     pub controller_audience: String,
     pub controller_subject: String,
     pub token_file: PathBuf,
+    #[serde(default = "fetch_timeout")]
+    pub fetch_timeout_seconds: u64,
+}
+fn fetch_timeout() -> u64 {
+    15 * 60
+}
+pub(crate) fn digest_pinned(image: &str) -> bool {
+    image.split_once("@sha256:").is_some_and(|(name, hash)| {
+        !name.is_empty() && hash.len() == 64 && hash.bytes().all(|c| c.is_ascii_hexdigit())
+    })
 }
 pub(crate) struct Names<T>(pub Vec<(String, T)>);
 impl<'de, T: Deserialize<'de>> Deserialize<'de> for Names<T> {
@@ -174,6 +184,8 @@ pub enum Conflict {
     EgressConnections(String),
     #[error("invalid service account subject: {0}")]
     Subject(String),
+    #[error("profile image must be pinned to a sha256 digest: {0}")]
+    Image(String),
     #[error("invalid jails configuration: {0}")]
     Jails(&'static str),
 }
@@ -197,7 +209,8 @@ impl Config {
         if let Some(jails) = &self.jails {
             for (valid, field) in [
                 (!jails.namespace.is_empty(), "namespace"),
-                (!jails.image.trim().is_empty(), "image"),
+                (digest_pinned(&jails.image), "image"),
+                (jails.fetch_timeout_seconds > 0, "fetchTimeoutSeconds"),
                 (
                     jails.image_cache_host_path.is_absolute(),
                     "imageCacheHostPath",
@@ -241,6 +254,9 @@ impl Config {
             }
         }
         for (name, profile) in &self.profiles.0 {
+            if !digest_pinned(&profile.image) {
+                errors.push(Conflict::Image(name.clone()));
+            }
             if !self.shapes.0.iter().any(|(n, _)| n == &profile.shape) {
                 errors.push(Conflict::Shape(name.clone()));
             }

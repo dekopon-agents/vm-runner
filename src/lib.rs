@@ -127,14 +127,18 @@ impl Health {
         }
     }
 }
-fn service() -> OpenApiService<(Health, Api), ()> {
-    OpenApiService::new((Health(None), Api), "vm-runner", env!("CARGO_PKG_VERSION"))
+fn service() -> OpenApiService<(Health, Api, controller::proxy::Api), ()> {
+    OpenApiService::new(
+        (Health(None), Api, controller::proxy::Api),
+        "vm-runner",
+        env!("CARGO_PKG_VERSION"),
+    )
 }
 pub fn openapi() -> String {
     #[cfg(unix)]
     {
         OpenApiService::new(
-            (Health(None), Api, jail::api::Api),
+            (Health(None), Api, controller::proxy::Api, jail::api::Api),
             "vm-runner",
             env!("CARGO_PKG_VERSION"),
         )
@@ -177,6 +181,10 @@ impl Requests {
     // Call after the server stops, before shutting down telemetry.
     pub async fn drain(self) -> Result<(), tokio::sync::AcquireError> {
         let _idle = self.admission.acquire().await?;
+        if let Some(controller) = &self.controller {
+            let _executed = controller.execution.acquire().await?;
+            let _read = controller.reads.acquire().await?;
+        }
         let _reaped = self.reaper_drain.acquire().await?;
         Ok(())
     }
@@ -227,7 +235,22 @@ fn endpoint(
         .data(std::sync::Arc::clone(&state))
         .around(move |ep, mut req| {
             let state = std::sync::Arc::clone(&state);
-            let admission = std::sync::Arc::clone(&admission);
+            // Slow C4 operations never own API admission. GETs have their own worker
+            // so a cold boot or long exec cannot block job/artifact reads.
+            // Poem matches literal path segments before percent-decoding captured parameters.
+            let admission = match &state.controller {
+                Some(controller)
+                    if req.uri().path().starts_with("/v1/sessions/")
+                        || req.uri().path().starts_with("/v1/jobs/") =>
+                {
+                    std::sync::Arc::clone(if req.method() == poem::http::Method::GET {
+                        &controller.reads
+                    } else {
+                        &controller.execution
+                    })
+                }
+                _ => std::sync::Arc::clone(&admission),
+            };
             async move {
                 // Admit before creating the span so cancellation cannot queue an unbounded export.
                 let permit = admission
@@ -264,6 +287,22 @@ fn endpoint(
                                                 .with_status(poem::http::StatusCode::UNAUTHORIZED)
                                                 .into_response());
                                         }
+                                    }
+                                }
+                                if req.method() == poem::http::Method::POST {
+                                    let body = tokio::time::timeout(
+                                        std::time::Duration::from_secs(30),
+                                        req.take_body()
+                                            .into_bytes_limit(controller::proxy::BODY_LIMIT),
+                                    )
+                                    .await
+                                    .map_err(poem::error::RequestTimeout)?;
+                                    match body {
+                                        Ok(body) => req.set_body(body),
+                                        Err(poem::error::ReadBodyError::PayloadTooLarge) => {
+                                            return Ok(controller::proxy::oversized());
+                                        }
+                                        Err(error) => return Err(error.into()),
                                     }
                                 }
                                 ep.call(req).await

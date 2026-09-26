@@ -80,6 +80,112 @@ paths:
             application/json; charset=utf-8:
               schema:
                 $ref: '#/components/schemas/Refusal'
+  /v1/sessions/{id}/exec:
+    post:
+      parameters:
+      - name: id
+        schema:
+          type: string
+        in: path
+        required: true
+        deprecated: false
+        explode: true
+      requestBody:
+        content:
+          application/json; charset=utf-8:
+            schema:
+              $ref: '#/components/schemas/Exec'
+        required: true
+      responses:
+        '200':
+          description: ''
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/ExecResult'
+        '202':
+          description: ''
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/Pending'
+        '401':
+          description: ''
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/Refusal'
+        '400':
+          description: ''
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/ExecResult'
+        '413':
+          description: ''
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/ExecResult'
+        '404':
+          description: ''
+          content:
+            text/plain; charset=utf-8:
+              schema:
+                type: string
+        '503':
+          description: ''
+          content:
+            text/plain; charset=utf-8:
+              schema:
+                type: string
+        '502':
+          description: ''
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/ExecResult'
+  /v1/jobs/{jobId}:
+    get:
+      parameters:
+      - name: jobId
+        schema:
+          type: string
+        in: path
+        required: true
+        deprecated: false
+        explode: true
+      responses:
+        '200':
+          description: ''
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/JobStatus'
+        '401':
+          description: ''
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/Refusal'
+        '404':
+          description: ''
+          content:
+            text/plain; charset=utf-8:
+              schema:
+                type: string
+        '503':
+          description: ''
+          content:
+            text/plain; charset=utf-8:
+              schema:
+                type: string
+        '502':
+          description: ''
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/ExecResult'
   /exec:
     post:
       requestBody:
@@ -138,6 +244,36 @@ components:
       type: string
       enum:
       - session_profile_conflict
+    ControllerExecuted:
+      type: object
+      title: ControllerExecuted
+      required:
+      - exitCode
+      - stdout
+      - stderr
+      - truncated
+      properties:
+        exitCode:
+          type: integer
+          format: int32
+        stdout:
+          type: string
+        stderr:
+          type: string
+        truncated:
+          type: boolean
+    ControllerRunning:
+      type: object
+      title: ControllerRunning
+      required:
+      - state
+      properties:
+        state:
+          $ref: '#/components/schemas/RunningState'
+    ControllerUnknown:
+      type: string
+      enum:
+      - unknown
     Create:
       type: object
       title: Create
@@ -148,6 +284,24 @@ components:
           type: string
         name:
           type: string
+    Exec:
+      type: object
+      title: Exec
+      required:
+      - argv
+      - deadlineMs
+      properties:
+        argv:
+          type: array
+          items:
+            type: string
+        stdin:
+          type: string
+        deadlineMs:
+          type: integer
+          format: uint32
+          maximum: 25000.0
+          minimum: 1000.0
     ExecInput:
       type: object
       title: ExecInput
@@ -165,6 +319,51 @@ components:
           type: integer
           format: uint32
           maximum: 25000.0
+    ExecRefused:
+      type: object
+      title: ExecRefused
+      required:
+      - reason
+      - truncated
+      properties:
+        reason:
+          type: string
+        truncated:
+          type: boolean
+    ExecResult:
+      type: object
+      anyOf:
+      - $ref: '#/components/schemas/ExecResult_ControllerExecuted'
+      - $ref: '#/components/schemas/ExecResult_ExecRefused'
+      discriminator:
+        propertyName: outcome
+        mapping:
+          executed: '#/components/schemas/ExecResult_ControllerExecuted'
+          not_executed: '#/components/schemas/ExecResult_ExecRefused'
+    ExecResult_ControllerExecuted:
+      allOf:
+      - type: object
+        required:
+        - outcome
+        properties:
+          outcome:
+            type: string
+            enum:
+            - executed
+            example: executed
+      - $ref: '#/components/schemas/ControllerExecuted'
+    ExecResult_ExecRefused:
+      allOf:
+      - type: object
+        required:
+        - outcome
+        properties:
+          outcome:
+            type: string
+            enum:
+            - not_executed
+            example: not_executed
+      - $ref: '#/components/schemas/ExecRefused'
     Executed:
       type: object
       title: Executed
@@ -211,6 +410,11 @@ components:
           type: string
         truncated:
           type: boolean
+    JobStatus:
+      type: object
+      anyOf:
+      - $ref: '#/components/schemas/ControllerRunning'
+      - $ref: '#/components/schemas/ExecResult'
     NotExecuted:
       type: object
       title: NotExecuted
@@ -226,6 +430,17 @@ components:
       type: string
       enum:
       - not_executed
+    Pending:
+      type: object
+      title: Pending
+      required:
+      - outcome
+      - jobId
+      properties:
+        outcome:
+          $ref: '#/components/schemas/ControllerUnknown'
+        jobId:
+          type: string
     Quota:
       type: object
       title: Quota
@@ -264,6 +479,10 @@ components:
       properties:
         state:
           type: string
+    RunningState:
+      type: string
+      enum:
+      - running
     SessionBody:
       type: object
       title: SessionBody
@@ -288,6 +507,7 @@ components:
       type: string
       enum:
       - pending
+      - ready
     Terminal:
       type: object
       anyOf:

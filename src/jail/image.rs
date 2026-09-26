@@ -16,8 +16,7 @@ const MAX_ROOTFS: u64 = 64 * 1024 * 1024 * 1024;
 
 fn reference(digest: &str) -> Result<Reference> {
     let reference: Reference = digest.parse()?;
-    let hash = reference.digest().and_then(|s| s.strip_prefix("sha256:"));
-    if !hash.is_some_and(|s| s.len() == 64 && s.bytes().all(|c| c.is_ascii_hexdigit())) {
+    if !crate::config::digest_pinned(digest) {
         return Err(Error::ImageReference.into());
     }
     Ok(reference)

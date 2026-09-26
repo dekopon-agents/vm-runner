@@ -167,7 +167,9 @@ async fn launch(
         &serde_json::to_vec(&vm_config(image, work, shape))?,
     )
     .await?;
-    let console = shared_file(&work.join("serial.log"), &[])
+    // Kubernetes mounts a separately bounded emptyDir here; direct jail runs create it.
+    tokio::fs::create_dir_all(work.join("console")).await?;
+    let console = shared_file(&work.join("console/serial.log"), &[])
         .await?
         .into_std()
         .await;

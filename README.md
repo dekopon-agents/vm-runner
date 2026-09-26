@@ -44,12 +44,40 @@ names the controller's service account, not a C4 caller from `auth.subjects`:
 ```yaml
 jails:
   namespace: vm-runner
-  image: ghcr.io/dekopon-agents/vm-runner:<version>
+  image: ghcr.io/dekopon-agents/vm-runner@sha256:<64 hex digest>
   imageCacheHostPath: /var/lib/vm-runner/images
   controllerAudience: vm-runner-jail
   controllerSubject: system:serviceaccount:dekopon:vm-runner-controller
   tokenFile: /var/run/secrets/vm-runner-jail/token
+  fetchTimeoutSeconds: 900 # default; image fetch has a separate 15-minute bound
 ```
+
+`POST /v1/sessions/{id}/exec {"argv":["echo","hello"],"deadlineMs":25000}` boots the
+reserved pod on first use, then proxies C7. It returns a terminal result (200), or an opaque
+controller job ID (202) for `GET /v1/jobs/{jobId}`. Sessions and jobs are subject-scoped;
+stdout/stderr are capped at 64 KiB each. The job map is capped at 64 per session and 1024
+globally; a full map refuses exec before dispatch. `deadlineMs` must be 1000–25000.
+A jail's terminal unknown job returns 200 `not_executed` with reason `unknown` and removes
+the controller handle. Polling never refreshes session activity. Terminal boot failure retires
+the reservation; transport/health errors return 502 `not_executed` without destroying it.
+Terminating pods retain quota until confirmed gone. Jail and profile images require SHA-256 pins.
+
+Deployment also requires a C7-capable `jails.image`, the `vm-runner-jail` service account,
+KVM/TUN device resources, a writable node image cache, and controller RBAC for pod
+get/list/create/patch/delete and Secret create. Nodes must permit the pod's namespaced
+IP-forwarding/rp-filter sysctls. Low-port binding uses `ip_unprivileged_port_start=0`, not an
+extra capability. Pods drop ALL capabilities and add only NET_ADMIN/SETUID/SETGID, with
+fsGroup 1000. An owned Secret contains selected profile/shape/telemetry configuration;
+the controller token itself is never copied into the pod. Project `jails.tokenFile` with
+`controllerAudience`; it is reread on every C7 request. Jail readiness uses TCP plus an
+authenticated health check. The 60-second boot window starts at successful init completion,
+not pod creation. GETs and exec/boot use separate workers, leaving reads and
+health/whoami/session admission responsive. Credential volumes declare mode 0400.
+The jail root filesystem is read-only; runtime files use emptyDir, with a separate 16 MiB
+console volume. Pods have a 60-second termination grace period and request
+`smarter-devices/kvm` and `smarter-devices/net_tun`.
+POST bodies are bounded to 1 MiB minus 64 bytes and 30 seconds; C7 HTTP calls have a
+30-second timeout. Empty argv returns 400 and oversize bodies return 413.
 
 ## Explicit egress proxy
 

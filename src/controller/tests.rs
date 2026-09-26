@@ -49,7 +49,7 @@ async fn gone(mock: &mut Mock, method: &str, path: &str) {
         json!({"kind":"Status","apiVersion":"v1","status":"Failure","reason":"NotFound","message":"gone","code":404}).to_string().into_bytes()
     )).unwrap());
 }
-async fn setup(items: Vec<Value>) -> (Controller, Mock) {
+pub(crate) async fn setup(items: Vec<Value>) -> (Controller, Mock) {
     let (service, mut mock) = tower_test::mock::pair();
     let (controller, ()) = tokio::join!(
         Controller::new(config(), Client::new(service, "jails")),
@@ -94,6 +94,20 @@ async fn named_sessions_are_lazy_subject_scoped_and_profile_consistent() {
         panic!("existing session")
     };
     assert_eq!(same.session_id, first.session_id);
+    controller
+        .sessions
+        .lock()
+        .unwrap()
+        .get_mut(&first.session_id)
+        .unwrap()
+        .active = 1;
+    assert!(matches!(
+        controller
+            .create(SUBJECT_VALUE, create("travel", None))
+            .unwrap(),
+        Created::Existing(_)
+    ));
+    assert!(controller.sessions.lock().unwrap()[&first.session_id].active > 1);
     assert!(matches!(
         controller
             .create(SUBJECT_VALUE, create("other", None))
@@ -158,12 +172,9 @@ async fn quota_and_bad_profile_refusals_preserve_the_registry() {
 #[tokio::test]
 async fn rebuild_recovers_named_sessions_and_reaper_deletes_expired_pods() {
     let (controller, mut mock) = setup(vec![pod()]).await;
-    let Created::Existing(Json(body)) = controller
-        .create(SUBJECT_VALUE, create("travel", None))
-        .unwrap()
-    else {
-        panic!("rebuilt session")
-    };
+    let body = controller.sessions.lock().unwrap()["jail-rebuilt"]
+        .body
+        .clone();
     assert_eq!(body.session_id, "019591f2-439b-7000-8000-000000000001");
     controller.reap(499).await;
     assert_eq!(controller.sessions.lock().unwrap().len(), 1);

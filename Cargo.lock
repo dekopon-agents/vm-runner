@@ -3026,6 +3026,7 @@ dependencies = [
  "uuid",
  "vsock",
  "webpki-roots",
+ "x509-parser",
 ]
 
 [[package]]

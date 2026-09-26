@@ -50,6 +50,7 @@ struct Claims {
 struct Cache {
     keys: JwkSet,
     fetched: Instant,
+    verified: Instant,
     unknown: Option<Instant>,
 }
 struct Source {
@@ -121,6 +122,7 @@ impl Source {
             cache: Mutex::new(Cache {
                 keys: JwkSet { keys: vec![] },
                 fetched: Instant::now(),
+                verified: Instant::now(),
                 unknown: None,
             }),
         };
@@ -162,10 +164,22 @@ impl Source {
         let fetched = self.fetch().await;
         let mut cache = self.cache.lock().map_err(|_| Reason::Signature)?;
         match fetched {
-            Ok(keys) => cache.keys = keys,
-            // A failed refresh keeps serving keys already trusted; only unknown kids fail.
-            Err(reason) if cache.keys.find(kid).is_none() => return Err(reason),
-            Err(_) => {}
+            Ok(keys) => {
+                cache.keys = keys;
+                cache.verified = Instant::now();
+            }
+            Err(reason) => {
+                tracing::warn!(
+                    reason = reason.as_str(),
+                    "jwks refresh failed; serving cached keys"
+                );
+                // Cached keys outlive a failed refresh for a day, never for an unknown kid.
+                if cache.keys.find(kid).is_none()
+                    || cache.verified.elapsed() >= Duration::from_secs(86_400)
+                {
+                    return Err(reason);
+                }
+            }
         }
         DecodingKey::from_jwk(cache.keys.find(kid).ok_or(Reason::Signature)?).map_err(jwt_error)
     }
@@ -235,9 +249,10 @@ mod tests {
                 let (stream, _) = listener.accept().await.unwrap();
                 let (status, seen) = (Arc::clone(&status), Arc::clone(&seen));
                 let service = hyper::service::service_fn(move |req: hyper::Request<_>| {
-                    let auth = req.headers()[hyper::header::AUTHORIZATION]
-                        .to_str()
-                        .unwrap();
+                    let auth = req
+                        .headers()
+                        .get(hyper::header::AUTHORIZATION)
+                        .map_or("<none>", |v| v.to_str().unwrap());
                     seen.lock().unwrap().push(auth.to_owned());
                     let mut response = hyper::Response::new(http_body_util::Full::new(
                         hyper::body::Bytes::from_static(br#"{"keys":[{"kty":"EC","crv":"P-256","kid":"k","x":"MKBCTNIcKUSDii11ySs3526iDZ8AiTo7Tu6KPAqv7D4","y":"4Etl6SRW2YiLUrN5vfvVHuhp7x8PxltmWWlbbM4IFyM"}]}"#),
@@ -274,15 +289,24 @@ mod tests {
         .unwrap();
         std::fs::write(&token_file, "second").unwrap();
         status.store(401, std::sync::atomic::Ordering::SeqCst);
-        source.cache.lock().unwrap().fetched = Instant::now()
-            .checked_sub(Duration::from_secs(601))
-            .unwrap();
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(601)).await;
+        tokio::time::resume();
 
         assert!(source.key("k").await.is_ok());
         assert!(matches!(source.key("other").await, Err(Reason::Signature)));
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(86_400)).await;
+        tokio::time::resume();
+        assert!(matches!(source.key("k").await, Err(Reason::Signature)));
         assert_eq!(
             *seen.lock().unwrap(),
-            ["Bearer first", "Bearer second", "Bearer second"]
+            [
+                "Bearer first",
+                "Bearer second",
+                "Bearer second",
+                "Bearer second"
+            ]
         );
     }
 }

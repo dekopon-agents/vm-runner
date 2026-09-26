@@ -51,6 +51,25 @@ jails:
   tokenFile: /var/run/secrets/vm-runner-jail/token
 ```
 
+`POST /v1/sessions/{id}/exec {"argv":["echo","hello"],"deadlineMs":25000}` boots the
+reserved pod on first use, then proxies C7. It returns a terminal result (200), or an opaque
+controller job ID (202) for `GET /v1/jobs/{jobId}`. Sessions and jobs are subject-scoped;
+stdout/stderr are capped at 64 KiB each. The 1024-entry job map retains results until the
+session is reaped or the jail reports a missing job; a full map refuses exec before dispatch.
+Boot failure retires the reservation; terminating pods retain quota until confirmed gone.
+
+Deployment also requires a C7-capable `jails.image`, the `vm-runner-jail` service account,
+KVM/TUN device resources, a writable node image cache, and controller RBAC for pod
+get/list/create/patch/delete and Secret create. Nodes must permit the pod's namespaced
+IP-forwarding/rp-filter sysctls. Low-port binding uses `ip_unprivileged_port_start=0`, not an
+extra capability. Pods drop ALL capabilities and add only NET_ADMIN/SETUID/SETGID, with
+fsGroup 1000. An owned Secret contains selected profile/shape/telemetry configuration;
+the controller token itself is never copied into the pod. Project `jails.tokenFile` with
+`controllerAudience`; it is reread on every C7 request. Jail readiness uses TCP plus an
+authenticated health check, bounded by a 60-second boot window. Request-driven Kubernetes
+and C7 work uses one separate worker, leaving health/whoami/session admission responsive.
+POST bodies are bounded to 1 MiB and 30 seconds; C7 HTTP calls have a 30-second timeout.
+
 ## Explicit egress proxy
 
 ```sh

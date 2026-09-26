@@ -49,7 +49,7 @@ async fn gone(mock: &mut Mock, method: &str, path: &str) {
         json!({"kind":"Status","apiVersion":"v1","status":"Failure","reason":"NotFound","message":"gone","code":404}).to_string().into_bytes()
     )).unwrap());
 }
-async fn setup(items: Vec<Value>) -> (Controller, Mock) {
+pub(crate) async fn setup(items: Vec<Value>) -> (Controller, Mock) {
     let (service, mut mock) = tower_test::mock::pair();
     let (controller, ()) = tokio::join!(
         Controller::new(config(), Client::new(service, "jails")),

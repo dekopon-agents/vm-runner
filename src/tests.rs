@@ -122,6 +122,49 @@ pub(crate) fn span_attribute<'a>(
     value
 }
 #[tokio::test]
+async fn authenticated_oversized_session_id_is_exported_once_and_capped() {
+    use opentelemetry::trace::TracerProvider;
+    use tracing::instrument::WithSubscriber;
+    use tracing_subscriber::layer::SubscriberExt;
+    let mut fixture = Fixture::new().await;
+    let token = fixture.token(&fixture.claims(), "ec");
+    let (controller, _mock) = controller::tests::setup(vec![]).await;
+    let state = State {
+        auth: Authenticator::new(fixture.config.auth.clone())
+            .await
+            .unwrap(),
+        config: Arc::new(fixture.config),
+        controller: Some(Arc::new(controller)),
+    };
+    let client = TestClient::new(endpoint(
+        Arc::new(state),
+        Arc::new(tokio::sync::Semaphore::new(1)),
+    ));
+    let exporter = opentelemetry_sdk::trace::InMemorySpanExporter::default();
+    let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+        .with_simple_exporter(exporter.clone())
+        .build();
+    client
+        .post(format!("/v1/sessions/{}/exec", "a".repeat(5000)))
+        .header("Authorization", format!("Bearer {token}"))
+        .body_json(&json!({"argv":["true"],"deadlineMs":1}))
+        .send()
+        .with_subscriber(
+            tracing_subscriber::registry()
+                .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("oversized-id"))),
+        )
+        .await
+        .assert_status(StatusCode::NOT_FOUND);
+    let spans = exporter.get_finished_spans().unwrap();
+    let span = spans.iter().find(|s| s.name == "vm_runner.exec").unwrap();
+    let value = span_attribute(span, "vm_runner.session_id")
+        .unwrap()
+        .as_str();
+    assert!(value.len() <= 4096 && value.ends_with("…[truncated]"));
+    provider.shutdown().unwrap();
+    fixture.tasks.shutdown().await;
+}
+#[tokio::test]
 async fn session_route_authenticates_and_returns_named_create_or_get_statuses() {
     let mut fixture = Fixture::new().await;
     let token = fixture.token(&fixture.claims(), "ec");
@@ -153,10 +196,21 @@ async fn session_route_authenticates_and_returns_named_create_or_get_statuses() 
         config,
         controller: Some(Arc::new(controller.unwrap())),
     };
+    let execution = Arc::clone(&state.controller.as_ref().unwrap().execution);
+    let busy = execution.acquire().await.unwrap();
     let client = TestClient::new(endpoint(
         Arc::new(state),
         Arc::new(tokio::sync::Semaphore::new(1)),
     ));
+    client.get("/healthz").send().await.assert_status_is_ok();
+    drop(busy);
+    client
+        .post("/v1/sessions/absent/exec")
+        .header("Authorization", format!("Bearer {token}"))
+        .body_json(&json!({"argv":["true"],"deadlineMs":25001}))
+        .send()
+        .await
+        .assert_status(StatusCode::BAD_REQUEST);
     let malformed = client
         .post("/v1/sessions")
         .header("Content-Type", "application/json")

@@ -123,7 +123,7 @@ async fn run(command: Command) -> Result<(), Box<dyn std::error::Error + Send + 
         let (endpoint, requests) = app(config).await?;
         let server = poem::Server::new(poem::listener::TcpListener::bind(listen));
         let result = tokio::select! {
-            result = server.run_with_graceful_shutdown(endpoint, vm_runner::shutdown_signal(), None) => result.map_err(Into::into),
+            result = server.run_with_graceful_shutdown(endpoint, vm_runner::shutdown_signal(), Some(std::time::Duration::from_secs(30))) => result.map_err(Into::into),
             result = requests.reap() => result,
         };
         requests.drain().await?;

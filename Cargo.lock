@@ -3643,6 +3643,7 @@ dependencies = [
  "base64 0.22.1",
  "cap-std",
  "clap",
+ "futures-util",
  "hickory-proto",
  "http-body-util",
  "hyper",

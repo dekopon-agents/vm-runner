@@ -39,7 +39,7 @@ pub(crate) struct Issuer {
     pub ca_file: Option<PathBuf>,
     pub token_file: Option<PathBuf>,
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub(crate) struct Shape {
     pub vcpus: NonZeroU32,
@@ -48,7 +48,7 @@ pub(crate) struct Shape {
     #[serde(rename = "diskMiB")]
     pub disk: NonZeroU32,
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub(crate) struct Profile {
     pub shape: String,
@@ -59,13 +59,13 @@ pub(crate) struct Profile {
     pub max_seconds: u64,
     pub egress: Egress,
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 enum Browser {
     Headless,
     Headful,
 }
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub(crate) struct Egress {
     pub allow: Vec<String>,
@@ -92,7 +92,7 @@ const MAX_EGRESS_CONNECTIONS: u32 = 255;
 fn egress_connections() -> NonZeroU32 {
     const { NonZeroU32::new(128).expect("nonzero default") }
 }
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 enum Dns {
     Runner,
@@ -109,12 +109,12 @@ pub(crate) struct Quota {
     #[oai(rename = "maxSessions")]
     pub max_sessions: u32,
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Telemetry {
     pub(crate) otlp: Otlp,
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub(crate) struct Otlp {
     pub protocol: Protocol,
@@ -122,13 +122,13 @@ pub(crate) struct Otlp {
     pub ca_bundle_file: Option<PathBuf>,
     pub headers_file: Option<PathBuf>,
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum Protocol {
     Grpc,
     Http,
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub(crate) struct Jails {
     pub namespace: String,

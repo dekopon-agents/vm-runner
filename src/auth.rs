@@ -50,11 +50,13 @@ struct Claims {
 struct Cache {
     keys: JwkSet,
     fetched: Instant,
+    verified: Instant,
     unknown: Option<Instant>,
 }
 struct Source {
     client: reqwest::Client,
     url: String,
+    token_file: Option<std::path::PathBuf>,
     cache: Mutex<Cache>,
     refresh: tokio::sync::Mutex<()>,
 }
@@ -71,9 +73,19 @@ impl Source {
         reason = "issuer transport errors must not expose bearer headers or response bodies"
     )]
     async fn fetch(&self) -> Result<JwkSet, Reason> {
-        let mut response = self
-            .client
-            .get(&self.url)
+        let mut request = self.client.get(&self.url);
+        // Projected tokens rotate; a token read once at startup expires under a long-lived runner.
+        if let Some(path) = &self.token_file {
+            let token = tokio::fs::read_to_string(path)
+                .await
+                .map_err(|_| Reason::Signature)?;
+            let mut value =
+                reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token.trim()))
+                    .map_err(|_| Reason::Signature)?;
+            value.set_sensitive(true);
+            request = request.header(reqwest::header::AUTHORIZATION, value);
+        }
+        let mut response = request
             .send()
             .await
             .map_err(|_| Reason::Signature)?
@@ -90,7 +102,7 @@ impl Source {
     }
     #[expect(
         clippy::map_err_ignore,
-        reason = "startup errors must not expose token-file contents"
+        reason = "startup errors must not expose CA-file contents"
     )]
     async fn new(issuer: &Issuer) -> Result<Self, SetupError> {
         let mut builder = reqwest::Client::builder()
@@ -102,25 +114,15 @@ impl Source {
                 reqwest::Certificate::from_pem(&pem).map_err(|_| SetupError)?,
             );
         }
-        if let Some(path) = &issuer.token_file {
-            let token = tokio::fs::read_to_string(path)
-                .await
-                .map_err(|_| SetupError)?;
-            let mut value =
-                reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token.trim()))
-                    .map_err(|_| SetupError)?;
-            value.set_sensitive(true);
-            let mut headers = reqwest::header::HeaderMap::new();
-            headers.insert(reqwest::header::AUTHORIZATION, value);
-            builder = builder.default_headers(headers);
-        }
         let mut source = Self {
             refresh: tokio::sync::Mutex::new(()),
             client: builder.build().map_err(|_| SetupError)?,
+            token_file: issuer.token_file.clone(),
             url: format!("{}/openid/v1/jwks", issuer.issuer.trim_end_matches('/')),
             cache: Mutex::new(Cache {
                 keys: JwkSet { keys: vec![] },
                 fetched: Instant::now(),
+                verified: Instant::now(),
                 unknown: None,
             }),
         };
@@ -159,9 +161,26 @@ impl Source {
             }
             cache.fetched = Instant::now();
         }
-        let keys = self.fetch().await?;
+        let fetched = self.fetch().await;
         let mut cache = self.cache.lock().map_err(|_| Reason::Signature)?;
-        cache.keys = keys;
+        match fetched {
+            Ok(keys) => {
+                cache.keys = keys;
+                cache.verified = Instant::now();
+            }
+            Err(reason) => {
+                tracing::warn!(
+                    reason = reason.as_str(),
+                    "jwks refresh failed; serving cached keys"
+                );
+                // Cached keys outlive a failed refresh for a day, never for an unknown kid.
+                if cache.keys.find(kid).is_none()
+                    || cache.verified.elapsed() >= Duration::from_secs(86_400)
+                {
+                    return Err(reason);
+                }
+            }
+        }
         DecodingKey::from_jwk(cache.keys.find(kid).ok_or(Reason::Signature)?).map_err(jwt_error)
     }
 }
@@ -212,5 +231,82 @@ impl Authenticator {
             return Err(Reason::UnknownSubject);
         }
         Ok(claims.sub)
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    async fn issuer(
+        status: Arc<std::sync::atomic::AtomicU16>,
+        seen: Arc<Mutex<Vec<String>>>,
+    ) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (status, seen) = (Arc::clone(&status), Arc::clone(&seen));
+                let service = hyper::service::service_fn(move |req: hyper::Request<_>| {
+                    let auth = req
+                        .headers()
+                        .get(hyper::header::AUTHORIZATION)
+                        .map_or("<none>", |v| v.to_str().unwrap());
+                    seen.lock().unwrap().push(auth.to_owned());
+                    let mut response = hyper::Response::new(http_body_util::Full::new(
+                        hyper::body::Bytes::from_static(br#"{"keys":[{"kty":"EC","crv":"P-256","kid":"k","x":"MKBCTNIcKUSDii11ySs3526iDZ8AiTo7Tu6KPAqv7D4","y":"4Etl6SRW2YiLUrN5vfvVHuhp7x8PxltmWWlbbM4IFyM"}]}"#),
+                    ));
+                    *response.status_mut() = hyper::StatusCode::from_u16(
+                        status.load(std::sync::atomic::Ordering::SeqCst),
+                    )
+                    .unwrap();
+                    async move { Ok::<_, std::convert::Infallible>(response) }
+                });
+                hyper::server::conn::http1::Builder::new()
+                    .keep_alive(false)
+                    .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+                    .await
+                    .unwrap();
+            }
+        });
+        url
+    }
+
+    #[tokio::test]
+    async fn jwks_refresh_sends_the_rotated_token_and_keeps_cached_keys_on_failure() {
+        let status = Arc::new(std::sync::atomic::AtomicU16::new(200));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let dir = tempfile::tempdir().unwrap();
+        let token_file = dir.path().join("token");
+        std::fs::write(&token_file, "first\n").unwrap();
+        let source = Source::new(&Issuer {
+            issuer: issuer(Arc::clone(&status), Arc::clone(&seen)).await,
+            ca_file: None,
+            token_file: Some(token_file.clone()),
+        })
+        .await
+        .unwrap();
+        std::fs::write(&token_file, "second").unwrap();
+        status.store(401, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(601)).await;
+        tokio::time::resume();
+
+        assert!(source.key("k").await.is_ok());
+        assert!(matches!(source.key("other").await, Err(Reason::Signature)));
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(86_400)).await;
+        tokio::time::resume();
+        assert!(matches!(source.key("k").await, Err(Reason::Signature)));
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                "Bearer first",
+                "Bearer second",
+                "Bearer second",
+                "Bearer second"
+            ]
+        );
     }
 }

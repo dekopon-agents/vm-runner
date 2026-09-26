@@ -17,8 +17,10 @@ enum Command {
         config: PathBuf,
         #[arg(long)]
         profile: String,
+        #[arg(long, required_unless_present = "gateway")]
+        listen: Option<std::net::SocketAddr>,
         #[arg(long)]
-        listen: std::net::SocketAddr,
+        gateway: Option<std::net::Ipv4Addr>,
         #[arg(long)]
         ca_out: PathBuf,
     },
@@ -54,11 +56,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if let Command::Egress {
         profile,
         listen,
+        gateway,
         ca_out,
         ..
     } = command
     {
-        return vm_runner::egress::run(config, &profile, listen, &ca_out).await;
+        return vm_runner::egress::run(config, &profile, listen, gateway, &ca_out).await;
     }
     let provider = telemetry::init(config.telemetry.as_ref()).await?;
     let listen = config.listen;
@@ -74,4 +77,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     .await;
     tokio::task::spawn_blocking(move || provider.shutdown()).await??;
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn egress_requires_a_listener_and_gateway_accepts_only_ipv4() {
+        let base = [
+            "vm-runnerd",
+            "egress",
+            "--config",
+            "config.yaml",
+            "--profile",
+            "travel",
+            "--ca-out",
+            "/tmp/ca",
+        ];
+        assert_eq!(
+            Cli::try_parse_from(base).err().map(|e| e.kind()),
+            Some(clap::error::ErrorKind::MissingRequiredArgument)
+        );
+        for address in ["::1", "localhost", "127.0.0.1:53"] {
+            assert_eq!(
+                Cli::try_parse_from(base.into_iter().chain(["--gateway", address]))
+                    .err()
+                    .map(|e| e.kind()),
+                Some(clap::error::ErrorKind::ValueValidation)
+            );
+        }
+        assert!(Cli::try_parse_from(base.into_iter().chain(["--gateway", "127.0.0.1"])).is_ok());
+        assert!(
+            Cli::try_parse_from(base.into_iter().chain(["--listen", "127.0.0.1:8080"])).is_ok()
+        );
+        assert!(
+            Cli::try_parse_from(base.into_iter().chain([
+                "--gateway",
+                "127.0.0.1",
+                "--listen",
+                "127.0.0.1:8080"
+            ]))
+            .is_ok()
+        );
+    }
 }

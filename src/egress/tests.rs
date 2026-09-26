@@ -1,8 +1,13 @@
 use super::*;
+#[path = "gateway_tests.rs"]
+mod gateway_tests;
 use crate::tests::span_attribute;
 use opentelemetry::{KeyValue, trace::TracerProvider};
 use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider, SpanData};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpListener,
+};
 use tokio_rustls::{
     TlsAcceptor,
     rustls::pki_types::{CertificateDer, pem::PemObject},
@@ -39,13 +44,31 @@ impl Proxy {
         exporter: InMemorySpanExporter,
         processor_exporter: impl opentelemetry_sdk::trace::SpanExporter + 'static,
     ) -> Self {
+        Self::with_listeners(roots, egress, exporter, processor_exporter, None).await
+    }
+    async fn with_listeners(
+        roots: RootCertStore,
+        egress: Egress,
+        exporter: InMemorySpanExporter,
+        processor_exporter: impl opentelemetry_sdk::trace::SpanExporter + 'static,
+        listeners: Option<gateway::Listeners>,
+    ) -> Self {
         let (ca, pem) = Ca::new().unwrap();
         let mut trust = RootCertStore::empty();
         trust
             .add(CertificateDer::from_pem_slice(pem.as_bytes()).unwrap())
             .unwrap();
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
+        let listeners = match listeners {
+            Some(listeners) => listeners,
+            None => TcpListener::bind("127.0.0.1:0").await.unwrap().into(),
+        };
+        let addr = listeners
+            .explicit
+            .as_ref()
+            .or(listeners.http.as_ref())
+            .unwrap()
+            .local_addr()
+            .unwrap();
         let provider = SdkTracerProvider::builder()
             .with_simple_exporter(processor_exporter)
             .build();
@@ -66,7 +89,7 @@ impl Proxy {
         });
         let task = tokio::spawn(
             engine
-                .serve(listener, async {
+                .serve(listeners, async {
                     stopped.await.unwrap();
                 })
                 .with_subscriber(subscriber),
@@ -666,8 +689,12 @@ async fn idle_connection_closes_only_after_inactivity_and_reads_reset_the_deadli
     };
     let (mut client, stream) = tokio::io::duplex(4096);
     let mut record = ConnectionRecord::default();
-    let mut connection =
-        Box::pin(engine.bounded_connection(Box::new(stream), &mut record, Instant::now()));
+    let mut connection = Box::pin(engine.bounded_connection(
+        Box::new(stream),
+        &mut record,
+        Instant::now(),
+        gateway::Protocol::Http,
+    ));
     poll_pending(connection.as_mut()).await;
     tokio::time::advance(Duration::from_secs(80)).await;
     client.write_all(b"G").await.unwrap();
@@ -693,8 +720,12 @@ async fn maximum_lifetime_closes_even_an_active_connection() {
     };
     let (mut client, stream) = tokio::io::duplex(4096);
     let mut record = ConnectionRecord::default();
-    let mut connection =
-        Box::pin(engine.bounded_connection(Box::new(stream), &mut record, Instant::now()));
+    let mut connection = Box::pin(engine.bounded_connection(
+        Box::new(stream),
+        &mut record,
+        Instant::now(),
+        gateway::Protocol::Http,
+    ));
     poll_pending(connection.as_mut()).await;
     for byte in [b"G", b"E"] {
         tokio::time::advance(Duration::from_secs(80)).await;

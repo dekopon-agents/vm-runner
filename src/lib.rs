@@ -1,6 +1,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::disallowed_methods))]
 mod auth;
 pub mod config;
+pub mod egress;
 pub mod telemetry;
 use auth::{Authenticator, Reason};
 use config::{Config, Quota, Quotas};
@@ -125,6 +126,26 @@ pub async fn app(
             }
         });
     Ok((endpoint, requests))
+}
+/// Stop admission on either terminal interruption or pod termination.
+/// Callers drain their requests before shutting down (and flushing) telemetry.
+pub async fn shutdown_signal() {
+    #[cfg(unix)]
+    let result = async {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result,
+            _ = terminate.recv() => Ok(()),
+        }
+    }
+    .await;
+    #[cfg(not(unix))]
+    let result = tokio::signal::ctrl_c().await;
+    if let Err(error) = result {
+        tracing::error!(%error, "signal handler failed");
+    }
+    tracing::info!("shutdown signal received; draining requests");
 }
 #[cfg(test)]
 mod tests;

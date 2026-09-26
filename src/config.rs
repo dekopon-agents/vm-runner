@@ -16,7 +16,7 @@ pub struct Config {
     pub listen: SocketAddr,
     pub(crate) auth: Auth,
     shapes: Names<Shape>,
-    profiles: Names<Profile>,
+    pub(crate) profiles: Names<Profile>,
     pub(crate) quotas: Quotas,
     pub telemetry: Option<Telemetry>,
 }
@@ -50,15 +50,15 @@ struct Shape {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-struct Profile {
-    shape: String,
+pub(crate) struct Profile {
+    pub shape: String,
     #[serde(rename = "image")]
     _image: String,
     #[serde(rename = "browser")]
     _browser: Browser,
     idle_seconds: u64,
     max_seconds: u64,
-    egress: Egress,
+    pub egress: Egress,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -68,8 +68,8 @@ enum Browser {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Egress {
-    allow: Vec<String>,
+pub(crate) struct Egress {
+    pub allow: Vec<String>,
     #[serde(rename = "dns")]
     _dns: Dns,
 }
@@ -137,7 +137,7 @@ pub enum Conflict {
     Shape(String),
     #[error("empty allow list: {0}")]
     EmptyAllow(String),
-    #[error("malformed wildcard: {0}")]
+    #[error("malformed egress host pattern: {0}")]
     Wildcard(String),
     #[error("idleSeconds exceeds maxSeconds: {0}")]
     Lifetime(String),
@@ -196,7 +196,7 @@ impl Config {
             }
             for host in &profile.egress.allow {
                 let suffix = host.strip_prefix("*.").unwrap_or(host);
-                if suffix.is_empty() || suffix.contains('*') {
+                if suffix.is_empty() || suffix.contains(['*', ':', '/']) || !suffix.is_ascii() {
                     errors.push(Conflict::Wildcard(host.clone()));
                 }
             }

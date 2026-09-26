@@ -1,0 +1,138 @@
+name: Guest image
+
+on:
+  pull_request:
+  push:
+    tags: ['guest-v*']
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    if: startsWith(github.ref, 'refs/tags/guest-v')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 22
+    permissions:
+      contents: read
+      actions: read
+      checks: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+      - name: Require annotated tag on main and successful CI
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          test "$(git cat-file -t "$GITHUB_REF")" = tag
+          test "$(git rev-parse "$GITHUB_REF^{commit}")" = "$(git rev-parse origin/main)"
+          for ((attempt=0; attempt<60; attempt++)); do
+            suites=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$GITHUB_SHA&per_page=100" \
+              --jq '.workflow_runs[].check_suite_id' | jq -s .)
+            runs=$(gh api --paginate "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/check-runs?per_page=100&filter=latest" \
+              --jq '.check_runs[]' | jq -s --argjson suites "$suites" \
+              '[.[] | select(.app.slug == "github-actions" and (.check_suite.id as $id | $suites | index($id)))]')
+            if jq -e 'length > 0 and all(.status == "completed" and (.conclusion == "success" or .conclusion == "skipped"))' <<< "$runs"; then
+              exit 0
+            fi
+            jq '.[] | {name,status,conclusion}' <<< "$runs"
+            sleep 20
+          done
+          exit 1
+
+  build:
+    needs: verify
+    if: ${{ !cancelled() && (needs.verify.result == 'success' || needs.verify.result == 'skipped') }}
+    name: Guest (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: amd64
+            target: x86_64-unknown-linux-musl
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+            target: aarch64-unknown-linux-musl
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069
+      - uses: oras-project/setup-oras@931fc544afc94506508c2dadf2679cb0ae65b964
+        with:
+          version: 1.3.4
+      - name: Install native build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools e2fsprogs zstd
+          rustup target add '${{ matrix.target }}'
+      - name: Build static agent and guest rootfs
+        run: |
+          cargo build --release --locked --bin vm-guest-agent --target '${{ matrix.target }}'
+          bash images/guest/build.sh 'target/${{ matrix.target }}/release/vm-guest-agent' "$RUNNER_TEMP/guest"
+      - name: Prove init, agent, Chromium and Node are in ext4
+        run: bash images/guest/verify.sh "$RUNNER_TEMP/guest/rootfs.ext4"
+      - name: Pack two annotated layers without publishing
+        run: |
+          cd "$RUNNER_TEMP/guest"
+          bash "$GITHUB_WORKSPACE/images/guest/pack.sh" '${{ matrix.arch }}' "$RUNNER_TEMP/layout:guest" --oci-layout
+          jq -e '.layers | length == 2' manifest.json
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: guest-${{ matrix.arch }}
+          path: |
+            ${{ runner.temp }}/guest/rootfs.ext4.zst
+            ${{ runner.temp }}/guest/vmlinux
+            ${{ runner.temp }}/guest/manifest.json
+          compression-level: 0
+          retention-days: 2
+          if-no-files-found: error
+
+  publish:
+    needs: [verify, build]
+    if: startsWith(github.ref, 'refs/tags/guest-v')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    env:
+      REPOSITORY: ghcr.io/dekopon-agents/vm-runner-guest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: oras-project/setup-oras@931fc544afc94506508c2dadf2679cb0ae65b964
+        with:
+          version: 1.3.4
+      - uses: actions/download-artifact@484a0b528fb4d7bd804637ccb632e47a0e638317
+        with:
+          pattern: guest-*
+          path: ${{ runner.temp }}/guest
+      - name: Authenticate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: printf '%s' "$GH_TOKEN" | oras login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+      - name: Push by digest, assemble index
+        id: publish
+        run: |
+          digests=()
+          for arch in amd64 arm64; do
+            cd "$RUNNER_TEMP/guest/guest-$arch"
+            digest="sha256:$(sha256sum manifest.json | cut -d' ' -f1)"
+            bash "$GITHUB_WORKSPACE/images/guest/pack.sh" "$arch" "$REPOSITORY@$digest"
+            digests+=("$digest")
+          done
+          version=${GITHUB_REF_NAME#guest-}
+          oras manifest index create "$REPOSITORY:$version" "${digests[@]}" \
+            --annotation org.dekopon.vm-runner.guest.rootfs=rootfs.ext4 \
+            --annotation org.dekopon.vm-runner.guest.kernel=vmlinux
+          echo "digest=$(oras resolve "$REPOSITORY:$version")" >> "$GITHUB_OUTPUT"
+      - uses: actions/attest-build-provenance@9d57eef8c06cd9d6b433effeeb7a6a77b3ff94ad
+        with:
+          subject-name: ghcr.io/dekopon-agents/vm-runner-guest
+          subject-digest: ${{ steps.publish.outputs.digest }}
+          push-to-registry: true
+          create-storage-record: false

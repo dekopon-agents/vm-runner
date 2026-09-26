@@ -10,6 +10,7 @@ const ENDPOINT = `http://127.0.0.1:${PORT}`;
 const PROFILE = process.env.BROWSE_PROFILE || `${process.env.HOME || '/home/jail'}/.browse-profile`;
 const ARTIFACTS = process.env.BROWSE_ARTIFACTS || '/artifacts';
 const MAX_OUT = Number(process.env.BROWSE_MAX_CHARS || 6000);
+const STATE = `${PROFILE}.state.json`;
 
 const HELP = `browse: a browser that stays open for the life of the jail.
 
@@ -24,10 +25,12 @@ browse eval JS             evaluate an expression in the page and print the JSON
 browse wait MS             wait MS milliseconds (at most 20000)
 browse shot NAME           screenshot to /artifacts/NAME
 browse tabs | tab N        list tabs, or switch to tab N
-browse reset               close the browser; the next call starts a fresh one
+browse reset               stop the browser and delete its profile (cookies, tabs); the next call starts clean
 
 With no arguments, commands are read from stdin, one per line (quote arguments with
 spaces), and run in order in one call. Output is capped at ${MAX_OUT} characters per command.
+Page loads are bounded so single commands finish well inside a 25 s exec; a load that times
+out still reports the page as it stands. Long batches may outlive the exec: poll the job.
 Playwright scripts can attach to the same browser:
   const b = await chromium.connectOverCDP('${ENDPOINT}'); const page = b.contexts()[0].pages()[0];
 `;
@@ -53,25 +56,57 @@ async function alive() {
   }
 }
 
+function readState() {
+  try {
+    return JSON.parse(fs.readFileSync(STATE, 'utf8'));
+  } catch {
+    return {};
+  }
+}
+
+function writeState(patch) {
+  fs.writeFileSync(STATE, JSON.stringify({ ...readState(), ...patch }));
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
 async function ensureBrowser() {
   if (await alive()) return;
   fs.mkdirSync(PROFILE, { recursive: true });
+  // Playwright's own background-traffic switches: component and variation fetches would only hit the egress deny list.
   const child = spawn(process.env.BROWSE_CHROMIUM || chromium.executablePath(), [
     '--headless=new', '--no-sandbox', '--no-first-run', '--no-default-browser-check',
+    '--disable-background-networking', '--disable-component-update', '--disable-sync',
+    '--disable-dev-shm-usage', '--password-store=basic', '--use-mock-keychain',
     `--remote-debugging-port=${PORT}`, '--remote-debugging-address=127.0.0.1',
     `--user-data-dir=${PROFILE}`, '--lang=en-US', '--window-size=1280,900', 'about:blank',
   ], { detached: true, stdio: 'ignore' });
   child.unref();
-  for (let i = 0; i < 150; i++) {
+  writeState({ pid: child.pid, target: null });
+  for (let i = 0; i < 100; i++) {
     if (await alive()) return;
-    await new Promise((r) => setTimeout(r, 100));
+    await sleep(100);
   }
-  throw new Error('browser did not start within 15 s');
+  throw new Error('browser is still starting; run the command again');
 }
 
 async function settle(page) {
-  await page.waitForLoadState('domcontentloaded', { timeout: 15000 }).catch(() => {});
-  await page.waitForLoadState('networkidle', { timeout: 3000 }).catch(() => {});
+  await page.waitForLoadState('domcontentloaded', { timeout: 3000 }).catch(() => {});
+  await page.waitForLoadState('networkidle', { timeout: 1000 }).catch(() => {});
+}
+
+async function targetId(page) {
+  const session = await page.context().newCDPSession(page);
+  try {
+    return (await session.send('Target.getTargetInfo')).targetInfo.targetId;
+  } finally {
+    await session.detach().catch(() => {});
+  }
+}
+
+async function select(state, page) {
+  state.page = page;
+  writeState({ target: await targetId(page).catch(() => null) });
 }
 
 async function where(page) {
@@ -95,8 +130,11 @@ async function run(state, argv) {
       const tab = args[0] === '--tab';
       const url = tab ? args[1] : args[0];
       if (!url) throw new Error('usage: open [--tab] URL');
-      if (tab) state.page = await state.context.newPage();
-      await state.page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
+      if (tab) await select(state, await state.context.newPage());
+      // A slow page is still a page: report where it stands instead of failing the command.
+      await state.page.goto(url, { waitUntil: 'domcontentloaded', timeout: 8000 }).catch((error) => {
+        if (error.name !== 'TimeoutError') throw error;
+      });
       await settle(state.page);
       return where(state.page);
     }
@@ -140,7 +178,7 @@ async function run(state, argv) {
     case 'tab': {
       const next = state.context.pages()[Number(args[0])];
       if (!next) throw new Error(`no tab ${args[0]}`);
-      state.page = next;
+      await select(state, next);
       await next.bringToFront();
       return where(next);
     }
@@ -153,19 +191,36 @@ async function main() {
   const argv = process.argv.slice(2);
   if (argv[0] === '-h' || argv[0] === '--help') return process.stdout.write(HELP);
   if (argv[0] === 'reset') {
+    const { pid } = readState();
     if (await alive()) {
-      const browser = await chromium.connectOverCDP(ENDPOINT);
-      await browser.newBrowserCDPSession().then((s) => s.send('Browser.close')).catch(() => {});
+      await chromium.connectOverCDP(ENDPOINT, { timeout: 5000 })
+        .then((b) => b.newBrowserCDPSession())
+        .then((s) => s.send('Browser.close'))
+        .catch(() => {});
     }
-    return console.log('browser closed');
+    for (let i = 0; i < 100 && (await alive()); i++) await sleep(100);
+    if (pid) {
+      try {
+        process.kill(-pid, 'SIGKILL');
+      } catch {}
+    }
+    fs.rmSync(PROFILE, { recursive: true, force: true });
+    fs.rmSync(STATE, { force: true });
+    return console.log('browser stopped and profile deleted');
   }
   const batch = argv.length ? [argv] : fs.readFileSync(0, 'utf8').split('\n').map(words).filter((w) => w.length);
   if (!batch.length) return process.stdout.write(HELP);
   await ensureBrowser();
-  const browser = await chromium.connectOverCDP(ENDPOINT);
+  const browser = await chromium.connectOverCDP(ENDPOINT, { timeout: 10000 });
   const context = browser.contexts()[0];
   const pages = context.pages();
-  const state = { context, page: pages[pages.length - 1] || (await context.newPage()) };
+  const { target } = readState();
+  let current = null;
+  for (const page of target ? pages : []) {
+    if ((await targetId(page).catch(() => null)) === target) current = page;
+  }
+  const state = { context, page: current || pages[pages.length - 1] || (await context.newPage()) };
+  if (!current) await select(state, state.page);
   let failed = false;
   for (const command of batch) {
     if (batch.length > 1) console.log(`$ ${command.map((w) => (/\s/.test(w) ? JSON.stringify(w) : w)).join(' ')}`);

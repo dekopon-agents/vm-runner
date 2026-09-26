@@ -1,0 +1,74 @@
+openapi: 3.0.0
+info:
+  title: vm-runner
+  version: 0.1.0
+servers: []
+tags: []
+paths:
+  /healthz:
+    get:
+      responses:
+        '200':
+          description: ''
+          content:
+            text/plain; charset=utf-8:
+              schema:
+                type: string
+  /v1/whoami:
+    get:
+      responses:
+        '200':
+          description: ''
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/Identity'
+        '401':
+          description: ''
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/Refusal'
+components:
+  schemas:
+    Identity:
+      type: object
+      title: Identity
+      required:
+      - subject
+      - quota
+      properties:
+        subject:
+          type: string
+        quota:
+          $ref: '#/components/schemas/Quota'
+    Quota:
+      type: object
+      title: Quota
+      required:
+      - maxSessions
+      properties:
+        maxSessions:
+          type: integer
+          format: uint32
+    Reason:
+      type: string
+      enum:
+      - audience
+      - issuer
+      - expired
+      - not_yet_valid
+      - signature
+      - unknown_subject
+      - malformed
+    Refusal:
+      type: object
+      title: Refusal
+      required:
+      - error
+      - reason
+      properties:
+        error:
+          type: string
+        reason:
+          $ref: '#/components/schemas/Reason'

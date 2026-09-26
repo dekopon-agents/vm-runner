@@ -1,0 +1,29 @@
+listen: 127.0.0.1:8080
+auth:
+  audience: vm-runner
+  issuers:
+    - issuer: https://kubernetes.default.svc
+      caFile: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+      tokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
+  subjects:
+    - system:serviceaccount:dekopon:default
+shapes:
+  pw-1c1g: { vcpus: 1, memoryMiB: 1024, diskMiB: 4096 }
+profiles:
+  travel:
+    shape: pw-1c1g
+    image: <guest rootfs OCI ref @sha256>
+    browser: headless
+    idleSeconds: 300
+    maxSeconds: 1800
+    egress:
+      allow:
+        - www.google.com
+        - "*.google.com"
+        - "*.gstatic.com"
+        - "*.googleapis.com"
+      dns: runner
+quotas:
+  default: { maxSessions: 1 }
+  subjects:
+    system:serviceaccount:dekopon:default: { maxSessions: 2 }

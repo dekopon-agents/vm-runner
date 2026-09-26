@@ -1,0 +1,23 @@
+# Tracing span guards are RAII handles on a thread-local stack. Holding one across `.await`
+# reparents every span opened by whatever task the executor resumes on that thread.
+await-holding-invalid-types = [
+    { path = "tracing::span::Entered", reason = "guard across .await corrupts trace parenting; use span.in_scope(..) or .instrument(span)" },
+    { path = "tracing::span::EnteredSpan", reason = "use tracing::Instrument instead of entering a span across .await" },
+]
+
+# Concurrency: every task, thread and queue has an owner, a bound and a shutdown path. The raw forms
+# below skip one of those, so a use needs a site `#[expect(clippy::disallowed_methods, reason = "…")]`
+# naming its owner and bound; the reason is the registry, and rustc fails an expectation that no
+# longer fires. See AGENTS.md "Concurrency" for the forms to use instead. Tests spawn freely.
+disallowed-methods = [
+    { path = "tokio::task::spawn", reason = "a detached task has no owner; spawn into a JoinSet the owner joins at shutdown", allow-invalid = true },
+    { path = "tokio::runtime::Handle::spawn", reason = "a detached task has no owner; spawn into a JoinSet the owner joins at shutdown", allow-invalid = true },
+    { path = "tokio::runtime::Handle::spawn_blocking", reason = "await tokio::task::spawn_blocking so the caller observes the job", allow-invalid = true },
+    { path = "std::thread::spawn", reason = "a native thread needs a name, an owner and a join; use spawn_blocking", allow-invalid = true },
+    { path = "std::thread::Builder::spawn", reason = "a native thread needs an owner and a join; use spawn_blocking", allow-invalid = true },
+    { path = "tokio::sync::mpsc::unbounded_channel", reason = "use a bounded mpsc::channel(N) and name the full-queue policy", allow-invalid = true },
+    { path = "std::sync::mpsc::channel", reason = "use a bounded channel and name the full-queue policy", allow-invalid = true },
+]
+disallowed-types = [
+    { path = "std::sync::Condvar", reason = "a hand-rolled drain; the owner's lock or a JoinSet already is one", allow-invalid = true },
+]

@@ -127,6 +127,12 @@ paths:
             application/json; charset=utf-8:
               schema:
                 $ref: '#/components/schemas/ExecResult'
+        '403':
+          description: ''
+          content:
+            text/plain; charset=utf-8:
+              schema:
+                type: string
         '404':
           description: ''
           content:
@@ -168,6 +174,177 @@ paths:
             application/json; charset=utf-8:
               schema:
                 $ref: '#/components/schemas/Refusal'
+        '403':
+          description: ''
+          content:
+            text/plain; charset=utf-8:
+              schema:
+                type: string
+        '404':
+          description: ''
+          content:
+            text/plain; charset=utf-8:
+              schema:
+                type: string
+        '503':
+          description: ''
+          content:
+            text/plain; charset=utf-8:
+              schema:
+                type: string
+        '502':
+          description: ''
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/ExecResult'
+  /v1/sessions/{id}/artifacts:
+    get:
+      parameters:
+      - name: id
+        schema:
+          type: string
+        in: path
+        required: true
+        deprecated: false
+        explode: true
+      responses:
+        '200':
+          description: ''
+          content:
+            application/json; charset=utf-8:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ControllerArtifact'
+        '401':
+          description: ''
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/Refusal'
+        '403':
+          description: ''
+          content:
+            text/plain; charset=utf-8:
+              schema:
+                type: string
+        '404':
+          description: ''
+          content:
+            text/plain; charset=utf-8:
+              schema:
+                type: string
+        '503':
+          description: ''
+          content:
+            text/plain; charset=utf-8:
+              schema:
+                type: string
+        '502':
+          description: ''
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/ExecResult'
+  /v1/sessions/{id}/artifacts/{path}:
+    get:
+      parameters:
+      - name: id
+        schema:
+          type: string
+        in: path
+        required: true
+        deprecated: false
+        explode: true
+      - name: path
+        schema:
+          type: string
+        in: path
+        required: true
+        deprecated: false
+        explode: true
+      - name: Range
+        schema:
+          type: string
+        in: header
+        required: false
+        deprecated: false
+        explode: true
+      responses:
+        '200':
+          description: ''
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+          headers:
+            SHA256:
+              required: true
+              deprecated: false
+              schema:
+                type: string
+            CONTENT-LENGTH:
+              required: true
+              deprecated: false
+              schema:
+                type: integer
+                format: uint64
+            ACCEPT-RANGES:
+              required: true
+              deprecated: false
+              schema:
+                type: string
+        '206':
+          description: ''
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+          headers:
+            SHA256:
+              required: true
+              deprecated: false
+              schema:
+                type: string
+            CONTENT-LENGTH:
+              required: true
+              deprecated: false
+              schema:
+                type: integer
+                format: uint64
+            CONTENT-RANGE:
+              required: true
+              deprecated: false
+              schema:
+                type: string
+            ACCEPT-RANGES:
+              required: true
+              deprecated: false
+              schema:
+                type: string
+        '416':
+          description: ''
+          headers:
+            CONTENT-RANGE:
+              required: true
+              deprecated: false
+              schema:
+                type: string
+        '401':
+          description: ''
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/Refusal'
+        '403':
+          description: ''
+          content:
+            text/plain; charset=utf-8:
+              schema:
+                type: string
         '404':
           description: ''
           content:
@@ -349,6 +526,21 @@ components:
       type: string
       enum:
       - session_profile_conflict
+    ControllerArtifact:
+      type: object
+      title: ControllerArtifact
+      required:
+      - path
+      - bytes
+      - sha256
+      properties:
+        path:
+          type: string
+        bytes:
+          type: integer
+          format: uint64
+        sha256:
+          type: string
     ControllerExecuted:
       type: object
       title: ControllerExecuted

@@ -21,7 +21,7 @@ pub(crate) struct Fixture {
     calls: Arc<AtomicUsize>,
     gate: Arc<tokio::sync::Semaphore>,
     refresh_started: tokio::sync::oneshot::Receiver<()>,
-    tasks: tokio::task::JoinSet<()>,
+    pub(crate) tasks: tokio::task::JoinSet<()>,
 }
 impl Fixture {
     pub(crate) async fn new() -> Self {
@@ -146,23 +146,31 @@ async fn authenticated_oversized_session_id_is_exported_once_and_capped() {
     let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
         .with_simple_exporter(exporter.clone())
         .build();
-    client
-        .post(format!("/v1/sessions/{}/exec", "a".repeat(5000)))
-        .header("Authorization", format!("Bearer {token}"))
-        .body_json(&json!({"argv":["true"],"deadlineMs":1000}))
-        .send()
-        .with_subscriber(
-            tracing_subscriber::registry()
-                .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("oversized-id"))),
-        )
-        .await
-        .assert_status(StatusCode::NOT_FOUND);
+    let dispatch = tracing::Dispatch::new(
+        tracing_subscriber::registry()
+            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("oversized-id"))),
+    );
+    for request in [
+        client
+            .post(format!("/v1/sessions/{}/exec", "a".repeat(5000)))
+            .body_json(&json!({"argv":["true"],"deadlineMs":1000})),
+        client.get(format!("/v1/sessions/{}/artifacts/file", "a".repeat(5000))),
+    ] {
+        request
+            .header("Authorization", format!("Bearer {token}"))
+            .send()
+            .with_subscriber(dispatch.clone())
+            .await
+            .assert_status(StatusCode::NOT_FOUND);
+    }
     let spans = exporter.get_finished_spans().unwrap();
-    let span = spans.iter().find(|s| s.name == "vm_runner.exec").unwrap();
-    let value = span_attribute(span, "vm_runner.session_id")
-        .unwrap()
-        .as_str();
-    assert!(value.len() <= 4096 && value.ends_with("…[truncated]"));
+    for name in ["vm_runner.exec", "vm_runner.artifact.read"] {
+        let span = spans.iter().find(|s| s.name == name).unwrap();
+        let value = span_attribute(span, "vm_runner.session_id")
+            .unwrap()
+            .as_str();
+        assert!(value.len() <= 4096 && value.ends_with("…[truncated]"));
+    }
     provider.shutdown().unwrap();
     fixture.tasks.shutdown().await;
 }

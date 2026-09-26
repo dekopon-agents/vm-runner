@@ -8,11 +8,12 @@ use base64::{
 use http_body_util::{BodyExt, Full};
 use serde_json::{Value, json};
 use std::sync::atomic::{AtomicUsize, Ordering};
-const SUBJECT: &str = "system:serviceaccount:dekopon:default";
+pub(super) const SUBJECT: &str = "system:serviceaccount:dekopon:default";
 type Captures = Arc<Mutex<Vec<Value>>>;
-struct Fixture {
-    controller: Arc<Controller>,
-    tasks: tokio::task::JoinSet<()>,
+pub(super) struct Fixture {
+    pub(super) controller: Arc<Controller>,
+    pub(super) tasks: tokio::task::JoinSet<()>,
+    pub(super) artifact_list: Arc<Mutex<String>>,
     _files: tempfile::TempDir,
     captured: Captures,
     calls: Arc<AtomicUsize>,
@@ -24,7 +25,7 @@ struct Fixture {
     pod_status: Arc<Mutex<Option<Value>>>,
 }
 impl Fixture {
-    async fn new() -> Self {
+    pub(super) async fn new() -> Self {
         let files = tempfile::tempdir().unwrap();
         let token = format!("{}.{}.AA", URL_SAFE_NO_PAD.encode(r#"{"alg":"RS256"}"#), URL_SAFE_NO_PAD.encode(json!({"sub":"system:serviceaccount:runner:controller","iss":"https://kubernetes.default.svc","aud":["vm-runner-jail"]}).to_string()));
         let token_file = files.path().join("token");
@@ -109,6 +110,10 @@ impl Fixture {
         let counter = Arc::clone(&calls);
         let health_status = Arc::new(AtomicUsize::new(200));
         let health = Arc::clone(&health_status);
+        let artifact_list = Arc::new(Mutex::new(
+            json!([{"path":"nested/a file%.bin","bytes":6,"sha256":"a".repeat(64)}]).to_string(),
+        ));
+        let listing = Arc::clone(&artifact_list);
         tasks.spawn(async move {
             let jobs = Arc::new(AtomicUsize::new(0));
             loop {
@@ -117,15 +122,21 @@ impl Fixture {
                 let counter = Arc::clone(&counter);
                 let jobs = Arc::clone(&jobs);
                 let health = Arc::clone(&health);
+                let listing = Arc::clone(&listing);
                 let service = hyper::service::service_fn(move |request: hyper::Request<hyper::body::Incoming>| {
                     let token_file = token_file.clone();
                     let counter = Arc::clone(&counter);
                     let jobs = Arc::clone(&jobs);
                     let health = Arc::clone(&health);
+                    let listing = Arc::clone(&listing);
                     async move {
                         let token = tokio::fs::read_to_string(token_file).await.unwrap();
                         assert_eq!(request.headers()["authorization"], format!("Bearer {}", token.trim()));
                         let mut response = hyper::Response::builder();
+                        if request.uri().path() == "/artifacts/stall" {
+                            let stream = futures_util::stream::pending::<Result<hyper::body::Frame<hyper::body::Bytes>, std::convert::Infallible>>();
+                            return Ok(response.header("sha256", "a".repeat(64)).header("Content-Length", 6).body(http_body_util::StreamBody::new(stream).boxed()).unwrap());
+                        }
                         let body = match request.uri().path() {
                             "/healthz" => { response = response.status(u16::try_from(health.load(Ordering::SeqCst)).unwrap()); "ok".into() },
                             "/exec" => {
@@ -142,12 +153,26 @@ impl Fixture {
                             "/jobs/remote-id" if jobs.fetch_add(1, Ordering::SeqCst) == 0 => json!({"state":"running"}).to_string(),
                             "/jobs/remote-id" if jobs.load(Ordering::SeqCst) == 2 => { response = response.status(202); json!({"outcome":"unknown","jobId":"remote-id"}).to_string() },
                             "/jobs/remote-id" => json!({"outcome":"executed","exitCode":0,"stdout":"ok","stderr":"","truncated":false}).to_string(),
+                            "/artifacts" => listing.lock().unwrap().clone(),
+                            "/artifacts/nested%2Fa%20file%25.bin" => {
+                                response = response.header("sha256", "a".repeat(64));
+                                match request.headers().get("range").map(|v| v.to_str().unwrap()) {
+                                    None => "abcdef".into(),
+                                    Some("bytes=1-3") => { response = response.status(206).header("Content-Range", "bytes 1-3/6"); "bcd".into() }
+                                    Some("bytes=99-") => { response = response.status(416).header("Content-Range", "bytes */6"); String::new() }
+                                    _ => panic!("unexpected range"),
+                                }
+                            }
+                            "/artifacts/missing" => { response = response.status(404); String::new() }
+                            "/artifacts/forbidden" => { response = response.status(403); String::new() }
+                            "/artifacts/unavailable" => { response = response.status(503); String::new() }
+                            "/artifacts/malformed" => { response = response.header("sha256", "invalid"); "bad".into() }
                             _ => panic!("unexpected jail route: {}", request.uri()),
                         };
-                        Ok::<_, std::convert::Infallible>(response.body(Full::new(hyper::body::Bytes::from(body))).unwrap())
+                        Ok::<_, std::convert::Infallible>(response.body(Full::new(hyper::body::Bytes::from(body)).boxed()).unwrap())
                     }
                 });
-                hyper::server::conn::http1::Builder::new().keep_alive(false).serve_connection(hyper_util::rt::TokioIo::new(stream), service).await.unwrap();
+                let _disconnected = hyper::server::conn::http1::Builder::new().keep_alive(false).serve_connection(hyper_util::rt::TokioIo::new(stream), service).await;
             }
         });
         let mut controller = Controller::new(Arc::new(config), Client::new(service, "jails"))
@@ -166,9 +191,10 @@ impl Fixture {
             health_status,
             patches,
             pod_status,
+            artifact_list,
         }
     }
-    fn session(&self) -> String {
+    pub(super) fn session(&self) -> String {
         let Created::New(Json(session)) = self
             .controller
             .create(

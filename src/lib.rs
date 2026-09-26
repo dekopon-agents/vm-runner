@@ -127,9 +127,22 @@ impl Health {
         }
     }
 }
-fn service() -> OpenApiService<(Health, Api, controller::proxy::Api), ()> {
+fn service() -> OpenApiService<
+    (
+        Health,
+        Api,
+        controller::proxy::Api,
+        controller::proxy::artifacts::Api,
+    ),
+    (),
+> {
     OpenApiService::new(
-        (Health(None), Api, controller::proxy::Api),
+        (
+            Health(None),
+            Api,
+            controller::proxy::Api,
+            controller::proxy::artifacts::Api,
+        ),
         "vm-runner",
         env!("CARGO_PKG_VERSION"),
     )
@@ -138,7 +151,13 @@ pub fn openapi() -> String {
     #[cfg(unix)]
     {
         OpenApiService::new(
-            (Health(None), Api, controller::proxy::Api, jail::api::Api),
+            (
+                Health(None),
+                Api,
+                controller::proxy::Api,
+                controller::proxy::artifacts::Api,
+                jail::api::Api,
+            ),
             "vm-runner",
             env!("CARGO_PKG_VERSION"),
         )

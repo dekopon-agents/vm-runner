@@ -77,7 +77,10 @@ async fn run(command: Command) -> Result<(), Box<dyn std::error::Error + Send + 
     let path = match &command {
         #[cfg(unix)]
         Command::FetchImage { digest, cache } => {
-            return vm_runner::jail::image::fetch(digest, cache).await;
+            let provider = telemetry::init(None).await?;
+            let result = vm_runner::jail::image::fetch(digest, cache).await;
+            tokio::task::spawn_blocking(move || provider.shutdown()).await??;
+            return result;
         }
         #[cfg(unix)]
         Command::Jail { config, .. } => config,

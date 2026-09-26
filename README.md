@@ -167,7 +167,9 @@ policy as the explicit proxy; origin-form HTTP uses Host, and TLS uses SNI check
 `vm-runnerd fetch-image --digest <ref@sha256:…> --cache <dir>` anonymously selects the native
 Linux guest image, locks the cache directory, streams and verifies both layer digests, and
 unpacks the rootfs before atomically publishing a digest/architecture directory. Layers are
-limited to 16 GiB each and the expanded rootfs to 64 GiB. The cache is trusted host storage;
+limited to 16 GiB each and the expanded rootfs to 16 GiB. Registry references are restricted
+to `ghcr.io`; alternate layer URLs are refused. Verified files and staging metadata are
+fsynced before atomic rename, followed by fsync of the cache directory. The cache is trusted host storage;
 delete an affected digest directory while no jail uses it to reset a damaged entry.
 
 On Linux, `vm-runnerd jail --config <file> --profile <name> --session <UUIDv7>` boots Firecracker
@@ -180,7 +182,9 @@ requires uid 0 with exactly `NET_ADMIN`, `SETUID`, and `SETGID`, plus `/dev/kvm`
 Set pod `fsGroup: 1000`; the runtime volume must be
 owned by group 1000 and both devices accessible to that group (device-manager defaults to
 0666). Firecracker runs as uid/gid 1000, without supplementary groups or effective capabilities.
-Runtime files are group-writable; the private CA key stays in memory. Guest serial output
+Runtime files are group-writable; the private CA key stays in memory.
+Shape keys `diskMBps` (default 100) and `netMbps` (default 200) set nonzero SI bandwidth
+limits on the scratch drive and each NIC direction, using one-second token buckets. Guest serial output
 and VMM diagnostics go to `/run/vm-runner/serial.log`, separate from stdout JSON telemetry.
 Configure these **pod network-namespace sysctls before startup** (the container's default
 `/proc/sys` mount is read-only): `net.ipv4.ip_forward=0`,
@@ -188,7 +192,9 @@ Configure these **pod network-namespace sysctls before startup** (the container'
 Gateway ports also require `net.ipv4.ip_unprivileged_port_start=0` with this capability set.
 The jail verifies forwarding/rp_filter and the new tap's inherited `rp_filter=1`, installs the guest-source
 and gateway-port firewall, then brings tap0 up. Node policy must permit those pod sysctls.
-The runtime image includes digest-verified Firecracker 1.17.0, iproute2, nftables and e2fsprogs.
+The runtime image includes digest-verified Firecracker 1.17.0, iproute2, nftables and e2fsprogs;
+curl is removed after the Firecracker download (the guest retains curl). Fetch, tap, nftables
+and drive failures emit `vm_runner.boot` spans with a phase and bounded failure cause.
 SIGTERM kills and reaps the VM before flushing telemetry; the pod owns netns/emptyDir cleanup.
 
 The same process serves gateway DNS, HTTP and HTTPS using the CA supplied to the guest.
@@ -202,6 +208,17 @@ at 64 KiB each on a UTF-8 boundary, setting `truncated: true` when cut. A respon
 an unknown outcome, never a false success or automatic retry. The table retains at most 64
 jobs, evicting non-running records first; when all slots are active, exec returns
 `{outcome: not_executed, reason: quota}` without sending anything to the guest.
+
+Authenticated `GET /artifacts` lists guest files; `GET /artifacts/{path}` streams bytes with
+a `sha256` header for the whole file. Percent-encode the path parameter, including `/` in
+nested names (for example, `nested%2Fscreenshot.png`). Single byte ranges return 206 with
+`Content-Range`; unsatisfiable byte ranges return 416. Unsupported units and multi-range requests are served in full.
+At most four response bodies stream concurrently, in 64 KiB chunks, with slots released on
+completion or cancellation. Transfers use a one-chunk backpressure channel and share the
+existing 64-worker lifecycle owner with exec. Fetch artifacts after execution finishes: metadata is an
+observation of guest files, not an immutable snapshot. Short or inconsistent chunks fail the
+transfer rather than succeeding with truncation.
+
 The explicit `cargo test --locked --test kvm` target requires the runtime setup above and
 `KVM_GUEST_IMAGE`; ordinary `cargo test` excludes it. The KVM workflow probes `/dev/kvm` and
 omits the hardware job when unavailable; when present it boots under the stated capability,

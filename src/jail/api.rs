@@ -13,6 +13,7 @@ use std::{
 use tokio::{sync::watch, task::JoinSet};
 use tracing::Instrument;
 
+mod artifacts;
 const JOB_CAP: usize = 64;
 #[derive(Object)]
 #[oai(rename_all = "camelCase")]
@@ -119,6 +120,7 @@ pub(super) struct State {
     guest: Arc<Guest>,
     ready: Arc<AtomicBool>,
     jobs: Mutex<Jobs>,
+    transfers: Arc<tokio::sync::Semaphore>,
 }
 impl State {
     pub(super) fn mark_ready(&self) {
@@ -201,6 +203,22 @@ impl State {
 pub(crate) struct Api;
 #[OpenApi]
 impl Api {
+    #[oai(path = "/artifacts", method = "get")]
+    async fn artifacts(
+        &self,
+        state: poem::web::Data<&Arc<State>>,
+    ) -> poem::Result<Json<Vec<artifacts::Artifact>>> {
+        artifacts::list(&state.guest).await
+    }
+    #[oai(path = "/artifacts/:path", method = "get")]
+    async fn artifact(
+        &self,
+        state: poem::web::Data<&Arc<State>>,
+        path: Path<String>,
+        #[oai(name = "Range")] range: poem_openapi::param::Header<Option<String>>,
+    ) -> poem::Result<artifacts::Download> {
+        artifacts::read(&state, path.0, range.0).await
+    }
     #[oai(path = "/exec", method = "post")]
     async fn exec(
         &self,
@@ -283,6 +301,7 @@ pub(super) async fn endpoint(
         guest,
         ready: Arc::new(AtomicBool::new(false)),
         jobs: Mutex::new(Jobs::default()),
+        transfers: Arc::new(tokio::sync::Semaphore::new(4)),
     });
     let endpoint: poem::endpoint::BoxEndpoint<'static, poem::Response> = OpenApiService::new(
         (crate::Health(Some(Arc::clone(&state.ready))), Api),

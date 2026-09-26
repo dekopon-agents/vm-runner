@@ -25,6 +25,7 @@ pub(crate) struct Fixture {
 }
 impl Fixture {
     pub(crate) async fn new() -> Self {
+        trace_exporter();
         let ec = EcdsaKeyPair::generate(&ECDSA_P256_SHA256_FIXED_SIGNING).unwrap();
         let rsa = aws_lc_rs::rsa::KeyPair::generate(aws_lc_rs::rsa::KeySize::Rsa2048).unwrap();
         let point = ec.public_key().as_ref();
@@ -528,19 +529,34 @@ async fn http_exporter_redacts_debug_but_delivers_headers() {
     let ((), exported) = tokio::join!(receiver, export);
     exported.unwrap();
 }
+// One process-wide subscriber, like production: concurrent unscoped callsites must not
+// cache NoSubscriber's interest while a different thread uses a private test subscriber.
+pub(crate) fn trace_exporter() -> opentelemetry_sdk::trace::InMemorySpanExporter {
+    static TRACES: std::sync::OnceLock<(
+        opentelemetry_sdk::trace::SdkTracerProvider,
+        opentelemetry_sdk::trace::InMemorySpanExporter,
+    )> = std::sync::OnceLock::new();
+    TRACES
+        .get_or_init(|| {
+            use opentelemetry::trace::TracerProvider;
+            use tracing_subscriber::layer::SubscriberExt;
+            let exporter = opentelemetry_sdk::trace::InMemorySpanExporter::default();
+            let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+                .with_simple_exporter(exporter.clone())
+                .build();
+            tracing::subscriber::set_global_default(
+                tracing_subscriber::registry()
+                    .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("test"))),
+            )
+            .unwrap();
+            (provider, exporter)
+        })
+        .1
+        .clone()
+}
 #[tokio::test]
 async fn refusal_span_has_reason_and_incoming_parent() {
-    use opentelemetry::trace::TracerProvider;
-    use tracing_subscriber::layer::SubscriberExt;
-    let exporter = opentelemetry_sdk::trace::InMemorySpanExporter::default();
-    let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
-        .with_simple_exporter(exporter.clone())
-        .build();
-    tracing::subscriber::set_global_default(
-        tracing_subscriber::registry()
-            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("test"))),
-    )
-    .unwrap();
+    let exporter = trace_exporter();
     let fixture = Fixture::new().await;
     let client = TestClient::new(app(fixture.config).await.unwrap().0);
     let response = client
@@ -569,5 +585,4 @@ async fn refusal_span_has_reason_and_incoming_parent() {
         span_attribute(span, "vm_runner.auth.reason"),
         Some(&"malformed".into())
     );
-    provider.shutdown().unwrap();
 }

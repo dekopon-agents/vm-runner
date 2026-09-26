@@ -26,6 +26,10 @@ impl Guest {
     pub(super) fn new(path: PathBuf) -> Self {
         Self { path }
     }
+    #[expect(
+        clippy::map_err_ignore,
+        reason = "Elapsed adds no cause; the owning operation records the typed deadline once"
+    )]
     pub(super) async fn call<T: DeserializeOwned>(
         &self,
         request: &Request,
@@ -45,11 +49,12 @@ impl Guest {
             )?)
         })
         .await
-        .map_err(|elapsed| {
-            tracing::warn!(%elapsed, "guest exchange timed out");
-            Error::Deadline
-        })?
+        .map_err(|_| Error::Deadline)?
     }
+    #[expect(
+        clippy::map_err_ignore,
+        reason = "Elapsed adds no cause; the boot phase records the typed deadline once"
+    )]
     pub(super) async fn ready(&self) -> Result<(), Error> {
         #[derive(serde::Deserialize)]
         struct Pong {
@@ -67,9 +72,6 @@ impl Guest {
             }
         })
         .await
-        .map_err(|elapsed| {
-            tracing::warn!(%elapsed, "guest did not become ready");
-            Error::Deadline
-        })
+        .map_err(|_| Error::Deadline)
     }
 }

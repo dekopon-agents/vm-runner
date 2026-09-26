@@ -186,6 +186,96 @@ paths:
             application/json; charset=utf-8:
               schema:
                 $ref: '#/components/schemas/ExecResult'
+  /artifacts:
+    get:
+      responses:
+        '200':
+          description: ''
+          content:
+            application/json; charset=utf-8:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Artifact'
+  /artifacts/{path}:
+    get:
+      parameters:
+      - name: path
+        schema:
+          type: string
+        in: path
+        required: true
+        deprecated: false
+        explode: true
+      - name: Range
+        schema:
+          type: string
+        in: header
+        required: false
+        deprecated: false
+        explode: true
+      responses:
+        '200':
+          description: ''
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+          headers:
+            SHA256:
+              required: true
+              deprecated: false
+              schema:
+                type: string
+            CONTENT-LENGTH:
+              required: true
+              deprecated: false
+              schema:
+                type: integer
+                format: uint64
+            ACCEPT-RANGES:
+              required: true
+              deprecated: false
+              schema:
+                type: string
+        '206':
+          description: ''
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+          headers:
+            SHA256:
+              required: true
+              deprecated: false
+              schema:
+                type: string
+            CONTENT-LENGTH:
+              required: true
+              deprecated: false
+              schema:
+                type: integer
+                format: uint64
+            CONTENT-RANGE:
+              required: true
+              deprecated: false
+              schema:
+                type: string
+            ACCEPT-RANGES:
+              required: true
+              deprecated: false
+              schema:
+                type: string
+        '416':
+          description: ''
+          headers:
+            CONTENT-RANGE:
+              required: true
+              deprecated: false
+              schema:
+                type: string
   /exec:
     post:
       requestBody:
@@ -232,6 +322,21 @@ paths:
                 $ref: '#/components/schemas/Unknown'
 components:
   schemas:
+    Artifact:
+      type: object
+      title: Artifact
+      required:
+      - path
+      - bytes
+      - sha256
+      properties:
+        path:
+          type: string
+        bytes:
+          type: integer
+          format: uint64
+        sha256:
+          type: string
     Conflict:
       type: object
       title: Conflict

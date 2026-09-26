@@ -47,6 +47,16 @@ pub(crate) struct Shape {
     pub memory: NonZeroU32,
     #[serde(rename = "diskMiB")]
     pub disk: NonZeroU32,
+    #[serde(default = "disk_rate", rename = "diskMBps")]
+    pub disk_mbps: NonZeroU32,
+    #[serde(default = "net_rate", rename = "netMbps")]
+    pub net_mbps: NonZeroU32,
+}
+fn disk_rate() -> NonZeroU32 {
+    const { NonZeroU32::new(100).expect("nonzero default") }
+}
+fn net_rate() -> NonZeroU32 {
+    const { NonZeroU32::new(200).expect("nonzero default") }
 }
 #[derive(Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]

@@ -13,8 +13,8 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
-struct Fixture {
-    config: Config,
+pub(crate) struct Fixture {
+    pub(crate) config: Config,
     ec: EncodingKey,
     rsa: EncodingKey,
     calls: Arc<AtomicUsize>,
@@ -23,7 +23,7 @@ struct Fixture {
     tasks: tokio::task::JoinSet<()>,
 }
 impl Fixture {
-    async fn new() -> Self {
+    pub(crate) async fn new() -> Self {
         let ec = EcdsaKeyPair::generate(&ECDSA_P256_SHA256_FIXED_SIGNING).unwrap();
         let rsa = aws_lc_rs::rsa::KeyPair::generate(aws_lc_rs::rsa::KeySize::Rsa2048).unwrap();
         let point = ec.public_key().as_ref();
@@ -90,11 +90,11 @@ impl Fixture {
             .unwrap(),
         }
     }
-    fn claims(&self) -> Value {
+    pub(crate) fn claims(&self) -> Value {
         let now = jsonwebtoken::get_current_timestamp();
         json!({"iss":self.config.auth.issuers[0].issuer, "sub":"system:serviceaccount:dekopon:default", "aud":["vm-runner"], "exp":now+300, "iat":now, "nbf":now})
     }
-    fn token(&self, claims: &Value, kid: &str) -> String {
+    pub(crate) fn token(&self, claims: &Value, kid: &str) -> String {
         let mut header = Header::new(if kid == "rsa" {
             Algorithm::RS256
         } else {

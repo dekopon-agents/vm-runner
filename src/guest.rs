@@ -20,7 +20,7 @@ use tokio::{
     time::{Instant, timeout},
 };
 
-const FRAME_CAP: usize = 1024 * 1024;
+pub(crate) const FRAME_CAP: usize = 1024 * 1024;
 const OUTPUT_CAP: usize = 64 * 1024;
 // Base64 plus the JSON envelope must fit in one response frame.
 const READ_CAP: u32 = ((FRAME_CAP - 64) / 4 * 3) as u32;
@@ -57,9 +57,9 @@ impl Error {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(tag = "op")]
-enum Request {
+pub(crate) enum Request {
     #[serde(rename = "exec", rename_all = "camelCase")]
     Exec {
         argv: Vec<String>,
@@ -136,12 +136,7 @@ pub async fn serve(stream: impl AsyncRead + AsyncWrite + Unpin) -> Result<(), Er
 
 impl Guest {
     async fn serve(&self, mut stream: impl AsyncRead + AsyncWrite + Unpin) -> Result<(), Error> {
-        let size = stream.read_u32().await? as usize;
-        if size > FRAME_CAP {
-            return Err(Error::FrameTooLarge);
-        }
-        let mut bytes = vec![0; size];
-        stream.read_exact(&mut bytes).await?;
+        let bytes = read_frame(&mut stream).await?;
         let result = match serde_json::from_slice(&bytes) {
             Ok(request) => self.dispatch(request).await,
             Err(error) => Err(error.into()),
@@ -153,12 +148,7 @@ impl Guest {
                 reason: error.reason(),
             },
         };
-        let bytes = serde_json::to_vec(&response)?;
-        if bytes.len() > FRAME_CAP {
-            return Err(Error::FrameTooLarge);
-        }
-        stream.write_u32(bytes.len() as u32).await?;
-        stream.write_all(&bytes).await?;
+        write_frame(&mut stream, &response).await?;
         stream.shutdown().await?;
         Ok(())
     }
@@ -314,6 +304,28 @@ fn list(root: &Dir) -> Result<Response, Error> {
     }
     artifacts.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(Response::List(artifacts))
+}
+
+pub(crate) async fn read_frame(stream: &mut (impl AsyncRead + Unpin)) -> Result<Vec<u8>, Error> {
+    let size = stream.read_u32().await? as usize;
+    if size > FRAME_CAP {
+        return Err(Error::FrameTooLarge);
+    }
+    let mut bytes = vec![0; size];
+    stream.read_exact(&mut bytes).await?;
+    Ok(bytes)
+}
+pub(crate) async fn write_frame(
+    stream: &mut (impl AsyncWrite + Unpin),
+    value: &impl Serialize,
+) -> Result<(), Error> {
+    let bytes = serde_json::to_vec(value)?;
+    if bytes.len() > FRAME_CAP {
+        return Err(Error::FrameTooLarge);
+    }
+    stream.write_u32(bytes.len() as u32).await?;
+    stream.write_all(&bytes).await?;
+    Ok(())
 }
 
 struct ProcessGroup(Option<Pid>);

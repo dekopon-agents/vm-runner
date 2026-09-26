@@ -59,9 +59,21 @@ fn conflicts(config: &Config, command: &Command) -> Vec<String> {
     conflicts
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let command = Cli::parse().command;
+    #[cfg(unix)]
+    if matches!(command, Command::Jail { .. }) {
+        // Set before starting threads: VMM-created sockets must admit the launcher's fsGroup.
+        rustix::process::umask(rustix::fs::Mode::from_raw_mode(0o007));
+    }
+    // Reserve room beyond egress's 255 connection/lookup pairs for bounded API and job workers.
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .max_blocking_threads(1024)
+        .build()?
+        .block_on(run(command))
+}
+async fn run(command: Command) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let path = match &command {
         #[cfg(unix)]
         Command::FetchImage { digest, cache } => {

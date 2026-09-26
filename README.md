@@ -121,7 +121,7 @@ peer set); port-zero datagrams are dropped. Unspecified, broadcast, multicast an
 idle timeout and shares the connection cap and maximum lifetime with HTTP/TLS. Both gateway HTTP ports use the same fail-closed classifier and upstream address
 policy as the explicit proxy; origin-form HTTP uses Host, and TLS uses SNI checked against Host.
 
-## Jail boot and image cache
+## Jail runtime and image cache
 
 `vm-runnerd fetch-image --digest <ref@sha256:…> --cache <dir>` anonymously selects the native
 Linux guest image, locks the cache directory, streams and verifies both layer digests, and
@@ -133,17 +133,29 @@ On Linux, `vm-runnerd jail --config <file> --profile <name> --session <UUIDv7>` 
 with the profile's shape, a read-only cached rootfs, a fresh CA drive padded to 4 KiB, and a
 sparse scratch ext4. Mount the cache read-only at `/images` and a fresh emptyDir at
 `/run/vm-runner`. Supply `vm_runner.subject` via `OTEL_RESOURCE_ATTRIBUTES`. The container
-requires uid 0, only `NET_ADMIN`, `/dev/kvm` and `/dev/net/tun`, with default seccomp.
+requires uid 0 with exactly `NET_ADMIN`, `SETUID`, and `SETGID`, plus `/dev/kvm` and
+`/dev/net/tun`, with default seccomp. Set pod `fsGroup: 1000`; the runtime volume must be
+owned by group 1000 and both devices accessible to that group (device-manager defaults to
+0666). Firecracker runs as uid/gid 1000, without supplementary groups or effective capabilities.
+Runtime files are group-writable; the private CA key stays in memory. Guest serial output
+and VMM diagnostics go to `/run/vm-runner/serial.log`, separate from stdout JSON telemetry.
 Configure these **pod network-namespace sysctls before startup** (the container's default
 `/proc/sys` mount is read-only): `net.ipv4.ip_forward=0`,
 `net.ipv4.conf.all.rp_filter=1`, and `net.ipv4.conf.default.rp_filter=1`.
-The jail verifies these and the new tap's inherited `rp_filter=1`, installs the guest-source
+Gateway ports also require `net.ipv4.ip_unprivileged_port_start=0` with this capability set.
+The jail verifies forwarding/rp_filter and the new tap's inherited `rp_filter=1`, installs the guest-source
 and gateway-port firewall, then brings tap0 up. Node policy must permit those pod sysctls.
 The runtime image includes digest-verified Firecracker 1.17.0, iproute2, nftables and e2fsprogs.
 SIGTERM kills and reaps the VM before flushing telemetry; the pod owns netns/emptyDir cleanup.
 
-This boot-only command does not yet serve the jail API or in-process egress; guest network
-traffic remains blocked beyond the allowed local gateway ports, which have no listener.
+The same process serves gateway DNS, HTTP and HTTPS using the CA supplied to the guest.
+After the guest answers `ping`, the jail serves `:8080`: authenticated `GET /healthz`,
+`POST /exec {argv, stdin?, deadlineMs}` and `GET /jobs/{id}`. Tokens must have audience
+`vm-runner-jail` and a configured controller subject. A response deadline (0–25000 ms) returns
+202 with a job ID; execution continues up to the guest's 600 s limit. Transport loss leaves
+an unknown outcome, never a false success or automatic retry. The table retains at most 64
+jobs, evicting non-running records first; when all slots are active, exec returns
+`{outcome: not_executed, reason: quota}` without sending anything to the guest.
 The explicit `cargo test --locked --test kvm` target requires the runtime setup above and
 `KVM_GUEST_IMAGE`; ordinary `cargo test` excludes it. The KVM workflow probes `/dev/kvm` and
 omits the hardware job when unavailable; when present it boots under the stated capability,

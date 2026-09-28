@@ -86,19 +86,98 @@ async fn cold_jail_503_is_polled_before_a_single_exec() {
     ));
 }
 
+fn old_healthy_pod_status(exit_code: i32) -> Value {
+    let finished =
+        k8s_openapi::jiff::Timestamp::from_second(i64::try_from(now() - 61).unwrap()).unwrap();
+    json!({
+        "podIP":"127.0.0.1","phase":"Running",
+        "conditions":[{"type":"Ready","status":"True"}],
+        "initContainerStatuses":[{"name":"fetch","image":"guest","imageID":"guest","ready":false,"restartCount":0,
+            "state":{"terminated":{"exitCode":exit_code,"finishedAt":finished}}}]
+    })
+}
+
+#[tokio::test]
+async fn warm_pod_older_than_boot_window_executes_once_without_recreating_pod() {
+    let f = Fixture::new().await;
+    let id = f.session();
+    assert!(matches!(
+        f.controller.exec(SUBJECT, &id, &exec()).await.unwrap(),
+        ExecResponse::Pending(_)
+    ));
+    let original_pod = f.controller.sessions.lock().unwrap()[&id].pod.clone();
+    *f.pod_status.lock().unwrap() = Some(old_healthy_pod_status(0));
+    assert!(matches!(
+        f.controller.exec(SUBJECT, &id, &exec()).await.unwrap(),
+        ExecResponse::Complete(Json(ExecResult::Executed(_)))
+    ));
+    let session = &f.controller.sessions.lock().unwrap()[&id];
+    assert!(!session.retiring);
+    assert_eq!(session.pod, original_pod);
+    assert_eq!(f.captured.lock().unwrap().len(), 2); // original pod and secret, no replacement
+    assert_eq!(f.calls.load(Ordering::SeqCst), 2); // one exec per request
+}
+
+#[tokio::test]
+async fn recovered_pod_older_than_boot_window_executes_once_without_recreating_pod() {
+    let f = Fixture::new().await;
+    let id = f.session();
+    assert!(matches!(
+        f.controller.exec(SUBJECT, &id, &exec()).await.unwrap(),
+        ExecResponse::Pending(_)
+    ));
+    // Rebuild reconstructs a Pending session pointing at the existing pod.
+    let original_pod = {
+        let mut sessions = f.controller.sessions.lock().unwrap();
+        let session = sessions.get_mut(&id).unwrap();
+        session.body.state = SessionState::Pending;
+        session.pod.clone()
+    };
+    *f.pod_status.lock().unwrap() = Some(old_healthy_pod_status(0));
+    assert!(matches!(
+        f.controller.exec(SUBJECT, &id, &exec()).await.unwrap(),
+        ExecResponse::Complete(Json(ExecResult::Executed(_)))
+    ));
+    let session = &f.controller.sessions.lock().unwrap()[&id];
+    assert!(matches!(session.body.state, SessionState::Ready));
+    assert!(!session.retiring);
+    assert_eq!(session.pod, original_pod);
+    assert_eq!(f.captured.lock().unwrap().len(), 2);
+    assert_eq!(f.calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn failed_init_is_terminal_even_if_an_old_pod_answers_healthy() {
+    let f = Fixture::new().await;
+    let id = f.session();
+    assert!(matches!(
+        f.controller.exec(SUBJECT, &id, &exec()).await.unwrap(),
+        ExecResponse::Pending(_)
+    ));
+    *f.pod_status.lock().unwrap() = Some(old_healthy_pod_status(1));
+    let ExecResponse::Complete(Json(ExecResult::NotExecuted(result))) =
+        f.controller.exec(SUBJECT, &id, &exec()).await.unwrap()
+    else {
+        panic!("failed init must refuse");
+    };
+    assert_eq!(result.reason, "boot_failure");
+    assert_eq!(f.calls.load(Ordering::SeqCst), 1);
+    assert!(
+        f.controller
+            .sessions
+            .lock()
+            .unwrap()
+            .get(&id)
+            .is_none_or(|s| s.retiring)
+    );
+}
+
 #[tokio::test]
 async fn cold_jail_503_stops_at_boot_timeout_without_exec() {
     let f = Fixture::new().await;
     let id = f.session();
     f.health_status.store(503, Ordering::SeqCst);
-    let finished =
-        k8s_openapi::jiff::Timestamp::from_second(i64::try_from(now() - 61).unwrap()).unwrap();
-    *f.pod_status.lock().unwrap() = Some(json!({
-        "podIP":"127.0.0.1","phase":"Running",
-        "conditions":[{"type":"Ready","status":"True"}],
-        "initContainerStatuses":[{"name":"fetch","image":"guest","imageID":"guest","ready":false,"restartCount":0,
-            "state":{"terminated":{"exitCode":0,"finishedAt":finished}}}]
-    }));
+    *f.pod_status.lock().unwrap() = Some(old_healthy_pod_status(0));
     let ExecResponse::Complete(Json(ExecResult::NotExecuted(result))) = tokio::time::timeout(
         std::time::Duration::from_secs(4),
         f.controller.exec(SUBJECT, &id, &exec()),

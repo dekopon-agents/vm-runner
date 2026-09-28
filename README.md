@@ -63,7 +63,13 @@ jails:
   controllerSubject: system:serviceaccount:dekopon:vm-runner-controller
   tokenFile: /var/run/secrets/vm-runner-jail/token
   fetchTimeoutSeconds: 900 # default; image fetch has a separate 15-minute bound
+  cpuRequestMilli: 250 # optional; default CPU request is the shape's full vCPU count
 ```
+
+`cpuRequestMilli` reserves CPU for both image-fetch init and jail containers without
+changing their limits (the shape's `vcpus`). It must be nonzero and no greater than
+each configured profile shape's `vcpus * 1000`. Memory request and limit remain
+`memoryMiB + 128Mi` for each container (for example, 512 MiB guests use 640 MiB).
 
 `POST /v1/sessions/{id}/exec {"argv":["echo","hello"],"deadlineMs":25000}` boots the
 reserved pod on first use, then proxies C7. It returns a terminal result (200), or an opaque

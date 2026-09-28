@@ -148,6 +148,9 @@ pub(crate) struct Jails {
     pub controller_audience: String,
     pub controller_subject: String,
     pub token_file: PathBuf,
+    // Controller-only scheduling setting; do not copy into the strict jail config.
+    #[serde(default, skip_serializing)]
+    pub cpu_request_milli: Option<NonZeroU32>,
     #[serde(default = "fetch_timeout")]
     pub fetch_timeout_seconds: u64,
 }
@@ -220,6 +223,16 @@ impl Config {
     pub fn conflicts(&self) -> Vec<Conflict> {
         let mut errors = Vec::new();
         if let Some(jails) = &self.jails {
+            if let Some(request) = jails.cpu_request_milli
+                && self.profiles.0.iter().any(|(_, profile)| {
+                    self.shapes.0.iter().any(|(name, shape)| {
+                        name == &profile.shape
+                            && u64::from(request.get()) > u64::from(shape.vcpus.get()) * 1000
+                    })
+                })
+            {
+                errors.push(Conflict::Jails("cpuRequestMilli"));
+            }
             for (valid, field) in [
                 (!jails.namespace.is_empty(), "namespace"),
                 (digest_pinned(&jails.image), "image"),

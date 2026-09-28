@@ -356,6 +356,43 @@ async fn pod_spec_golden_has_0400_credentials_readonly_root_60s_grace_console_li
     f.tasks.shutdown().await;
 }
 #[tokio::test]
+async fn jail_cpu_reservation_applies_to_fetch_and_jail_without_lowering_limits() {
+    let mut f = Fixture::new().await;
+    let config = Arc::get_mut(&mut Arc::get_mut(&mut f.controller).unwrap().config).unwrap();
+    config.jails.as_mut().unwrap().cpu_request_milli =
+        Some(std::num::NonZeroU32::new(250).unwrap());
+    config.shapes.0[0].1.memory = std::num::NonZeroU32::new(512).unwrap();
+    assert!(config.conflicts().is_empty());
+    let id = f.session();
+    assert!(matches!(
+        f.controller.exec(SUBJECT, &id, &exec()).await.unwrap(),
+        ExecResponse::Pending(_)
+    ));
+    let captured = f.captured.lock().unwrap();
+    assert_eq!(captured.len(), 2);
+    let pod = &captured[0];
+    let fetch = &pod["spec"]["initContainers"][0]["resources"];
+    let jail = &pod["spec"]["containers"][0]["resources"];
+    assert_eq!(fetch["requests"], json!({"cpu":"250m","memory":"640Mi"}));
+    assert_eq!(fetch["limits"], json!({"cpu":"1","memory":"640Mi"}));
+    assert_eq!(
+        jail["requests"],
+        json!({"cpu":"250m","memory":"640Mi","smarter-devices/kvm":"1","smarter-devices/net_tun":"1"})
+    );
+    assert_eq!(
+        jail["limits"],
+        json!({"cpu":"1","memory":"640Mi","smarter-devices/kvm":"1","smarter-devices/net_tun":"1"})
+    );
+    let config_json = STANDARD
+        .decode(captured[1]["data"]["config.json"].as_str().unwrap())
+        .unwrap();
+    let guest_config: Value = serde_json::from_slice(&config_json).unwrap();
+    assert!(guest_config["jails"].get("cpuRequestMilli").is_none());
+    let parsed_guest: Config = serde_json::from_slice(&config_json).unwrap();
+    assert!(parsed_guest.conflicts().is_empty());
+}
+
+#[tokio::test]
 async fn per_session_job_cap_still_admits_another_session() {
     let mut f = Fixture::new().await;
     let id = f.session();

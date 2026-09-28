@@ -355,6 +355,28 @@ fn jails_configuration_reports_all_invalid_fields() {
         .map(crate::config::Conflict::Jails)
     );
 }
+#[test]
+fn jail_cpu_request_must_be_nonzero_and_fit_every_used_shape() {
+    let mut config = config();
+    let config = Arc::get_mut(&mut config).unwrap();
+    let jails = config.jails.as_mut().unwrap();
+    jails.image = format!("runner@sha256:{}", "a".repeat(64));
+    let mut serialized = serde_json::to_value(&*jails).unwrap();
+    serialized["cpuRequestMilli"] = json!(0);
+    assert!(serde_json::from_value::<crate::config::Jails>(serialized).is_err());
+    jails.cpu_request_milli = Some(std::num::NonZeroU32::new(1001).unwrap());
+    assert_eq!(
+        config.conflicts(),
+        [crate::config::Conflict::Jails("cpuRequestMilli")]
+    );
+    config.jails.as_mut().unwrap().cpu_request_milli =
+        Some(std::num::NonZeroU32::new(1000).unwrap());
+    assert!(config.conflicts().is_empty());
+    config.jails.as_mut().unwrap().cpu_request_milli =
+        Some(std::num::NonZeroU32::new(250).unwrap());
+    assert!(config.conflicts().is_empty());
+}
+
 #[tokio::test]
 async fn maximum_lifetime_reaps_even_an_active_session() {
     let mut active = pod();

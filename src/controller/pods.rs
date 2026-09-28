@@ -313,9 +313,16 @@ impl Controller {
         );
         let hash = subject_hash(&session.subject);
         let compute = json!({"cpu":shape.vcpus.to_string(), "memory":format!("{}Mi", u64::from(shape.memory.get())+128)});
-        let mut resources = compute.clone();
-        resources["smarter-devices/kvm"] = json!("1");
-        resources["smarter-devices/net_tun"] = json!("1");
+        let mut compute_requests = compute.clone();
+        if let Some(cpu) = jails.cpu_request_milli {
+            compute_requests["cpu"] = json!(format!("{}m", cpu.get()));
+        }
+        let mut requests = compute_requests.clone();
+        let mut limits = compute.clone();
+        for resources in [&mut requests, &mut limits] {
+            resources["smarter-devices/kvm"] = json!("1");
+            resources["smarter-devices/net_tun"] = json!("1");
+        }
         let pod = serde_json::from_value(
             json!({"apiVersion":"v1", "kind":"Pod", "metadata":{"name":name,
             "labels":{SESSION:session.body.session_id, PROFILE:session.body.profile,SUBJECT_HASH:hash},
@@ -323,13 +330,13 @@ impl Controller {
             "spec":{"restartPolicy":"Never", "terminationGracePeriodSeconds":60, "serviceAccountName":"vm-runner-jail", "automountServiceAccountToken":false,
                 "securityContext":{"fsGroup":1000, "seccompProfile":{"type":"RuntimeDefault"}, "sysctls":[
                     {"name":"net.ipv4.ip_forward","value":"0"}, {"name":"net.ipv4.ip_unprivileged_port_start","value":"0"}, {"name":"net.ipv4.conf.all.rp_filter","value":"1"}, {"name":"net.ipv4.conf.default.rp_filter","value":"1"}]},
-                "initContainers":[{"name":"fetch", "image":jails.image, "args":["fetch-image","--digest",profile.image,"--cache","/images"], "resources":{"requests":compute,"limits":compute},
+                "initContainers":[{"name":"fetch", "image":jails.image, "args":["fetch-image","--digest",profile.image,"--cache","/images"], "resources":{"requests":compute_requests,"limits":compute},
                     "securityContext":{"runAsUser":0,"runAsGroup":1000,"allowPrivilegeEscalation":false,"capabilities":{"drop":["ALL"]}},
                     "volumeMounts":[{"name":"images","mountPath":"/images"}]}],
                 "containers":[{"name":"jail","image":jails.image,"args":["jail","--config","/config/config.json","--profile",session.body.profile,"--session",session.body.session_id],
                     "env":[{"name":"OTEL_RESOURCE_ATTRIBUTES","value":format!("vm_runner.subject={}",session.subject)}],
                     "securityContext":{"runAsUser":0,"runAsGroup":1000,"privileged":false,"allowPrivilegeEscalation":false,"readOnlyRootFilesystem":true,"capabilities":{"drop":["ALL"],"add":["NET_ADMIN","SETUID","SETGID"]}},
-                    "resources":{"requests":resources,"limits":resources}, "readinessProbe":{"tcpSocket":{"port":8080},"periodSeconds":1},
+                    "resources":{"requests":requests,"limits":limits}, "readinessProbe":{"tcpSocket":{"port":8080},"periodSeconds":1},
                     "volumeMounts":[{"name":"images","mountPath":"/images","readOnly":true},{"name":"runtime","mountPath":"/run/vm-runner"},{"name":"console","mountPath":"/run/vm-runner/console"},{"name":"config","mountPath":"/config","readOnly":true},{"name":"api","mountPath":"/kube","readOnly":true}]}],
                 "volumes":[{"name":"images","hostPath":{"path":jails.image_cache_host_path,"type":"DirectoryOrCreate"}},
                     {"name":"runtime","emptyDir":{"sizeLimit":format!("{}Mi",u64::from(shape.disk.get())+64)}},

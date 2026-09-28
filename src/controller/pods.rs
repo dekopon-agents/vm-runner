@@ -173,25 +173,33 @@ impl Controller {
                 {
                     return Err(Error::Boot);
                 }
-                let address = self.address(&pod)?;
-                if let Some(address) = address {
-                    let response = self
+                let fetch_seconds = self
+                    .config
+                    .jails
+                    .as_ref()
+                    .ok_or(Error::Boot)?
+                    .fetch_timeout_seconds;
+                boot_window(&pod, fetch_seconds, now())?;
+                if let Some(address) = self.address(&pod)? {
+                    // A Ready pod can precede the jail listener or the guest's ping. Only
+                    // these startup states are retried; auth and other failures propagate.
+                    match self
                         .send(reqwest::Method::GET, address.join("healthz")?, None)
-                        .await?;
-                    match response.status().as_u16() {
-                        200 => break address,
-                        status => return Err(Error::Status(status)),
+                        .await
+                    {
+                        Ok(response) if response.status().as_u16() == 200 => {
+                            boot_window(&pod, fetch_seconds, now())?;
+                            break address;
+                        }
+                        Ok(response) if response.status().as_u16() == 503 => {}
+                        Ok(response) => return Err(Error::Status(response.status().as_u16())),
+                        Err(Error::Http {
+                            connect: true,
+                            timeout: false,
+                        }) => {}
+                        Err(error) => return Err(error),
                     }
                 }
-                boot_window(
-                    &pod,
-                    self.config
-                        .jails
-                        .as_ref()
-                        .ok_or(Error::Boot)?
-                        .fetch_timeout_seconds,
-                    now(),
-                )?;
                 tick.tick().await;
                 pod = self.pods.get(&name).await?;
             };

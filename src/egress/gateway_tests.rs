@@ -40,6 +40,7 @@ impl Gateway {
             exporter,
             Some(listeners),
             Default::default(),
+            None,
         )
         .await;
         Self {
@@ -120,8 +121,28 @@ async fn dns_udp_and_tcp_answer_only_allowed_address_questions_and_span_each_onc
         }
     }
     drop(tcp);
-    let spans = gateway.proxy.finish().await;
+    let (spans, logs) = gateway.proxy.finish_with_logs().await;
     assert_eq!(spans.len(), cases.len() * 2);
+    assert_eq!(
+        logs.iter()
+            .filter(|log| log.record.event_name() == Some("egress.dns.rollup"))
+            .filter_map(|log| log_int(log, "egress.dns.count"))
+            .sum::<i64>(),
+        i64::try_from(cases.len() * 2).unwrap()
+    );
+    assert_eq!(
+        logs.iter()
+            .filter(|log| log.record.event_name() == Some("egress.dns.rollup"))
+            .filter_map(|log| log_int(log, "egress.dns.refused.count"))
+            .sum::<i64>(),
+        4
+    );
+    assert_eq!(
+        logs.iter()
+            .filter(|log| log.record.event_name() == Some("egress.refused"))
+            .count(),
+        4
+    );
     for (name, kind, _, decision) in cases {
         let matching: Vec<_> = spans
             .iter()

@@ -136,9 +136,11 @@ to 128. `maxConnections` must be 1–255: one blocking worker and one DNS lookup
 plus the refusal-export and gateway UDP workers, fit Tokio's default 512-thread blocking pool.
 Successful client reads or writes reset the idle timeout, not the maximum lifetime.
 Excess connections close immediately. One background worker coalesces their `refused:connections`
-spans to at most one per second, with `count` giving the number refused since the previous span;
-export never blocks the accept loop. Shutdown stops accepting and drains the bounded workers
-and final refusal count before shutting down telemetry.
+`egress.refused` logs to at most one per second, with `egress.refused.count` giving the sockets
+refused since the previous log; export never blocks the accept loop. Egress exchanges finish when
+the response body ends; destination, DNS, connection and header/query noise totals are logged every
+60 seconds and at shutdown. The jail also reports named nftables drop-counter deltas. Shutdown stops
+accepting and drains the bounded workers and final counts before shutting down telemetry.
 
 ## Guest agent
 

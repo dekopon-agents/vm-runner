@@ -42,13 +42,26 @@ impl Proxy {
     async fn configured(roots: RootCertStore, egress: Egress) -> Self {
         Self::configured_with_omit(roots, egress, Default::default()).await
     }
+    async fn drip(roots: RootCertStore) -> Self {
+        let exporter = InMemorySpanExporter::default();
+        Self::with_listeners(
+            roots,
+            local_egress(),
+            exporter.clone(),
+            exporter,
+            None,
+            Default::default(),
+            Some("info,egress.exchange=info,egress.connect=info,egress.dns=info,egress.drop=info"),
+        )
+        .await
+    }
     async fn configured_with_omit(
         roots: RootCertStore,
         egress: Egress,
         omit: crate::config::Omit,
     ) -> Self {
         let exporter = InMemorySpanExporter::default();
-        Self::with_listeners(roots, egress, exporter.clone(), exporter, None, omit).await
+        Self::with_listeners(roots, egress, exporter.clone(), exporter, None, omit, None).await
     }
     async fn with_listeners(
         roots: RootCertStore,
@@ -57,6 +70,7 @@ impl Proxy {
         processor_exporter: impl opentelemetry_sdk::trace::SpanExporter + 'static,
         listeners: Option<gateway::Listeners>,
         omit: crate::config::Omit,
+        filter: Option<&str>,
     ) -> Self {
         let (ca, pem) = Ca::new().unwrap();
         let mut trust = RootCertStore::empty();
@@ -94,7 +108,8 @@ impl Proxy {
                 opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new(
                     &log_provider,
                 ),
-            );
+            )
+            .with(filter.map(tracing_subscriber::EnvFilter::new));
         let (stop, stopped) = tokio::sync::oneshot::channel();
         let engine = Arc::new(Engine {
             ca,
@@ -150,6 +165,10 @@ impl Proxy {
                 assert!(span_attribute(span, kv.key.as_str()).is_some());
             }
             if span.name == "egress.request" {
+                assert_ne!(
+                    span_attribute(span, "http.response.status_code"),
+                    Some(&0_i64.into())
+                );
                 for key in ["egress.exchange.outcome", "egress.decision"] {
                     assert!(
                         span_attribute(span, key).is_some(),
@@ -273,10 +292,28 @@ async fn allowed_https_strips_trace_headers_and_exports_exactly_one_final_status
         request.span_context.trace_id().to_string(),
         "11111111111111111111111111111111"
     );
+    let connects: Vec<_> = spans
+        .iter()
+        .filter(|s| s.name == "egress.connect")
+        .collect();
+    assert_eq!(connects.len(), 1);
     assert_eq!(
-        spans.iter().filter(|s| s.name == "egress.connect").count(),
-        1
+        span_attribute(connects[0], "server.port"),
+        Some(&i64::from(port).into())
     );
+    for key in [
+        "egress.connect.dns_ms",
+        "egress.connect.tcp_ms",
+        "egress.connect.tls_ms",
+    ] {
+        assert!(
+            matches!(
+                span_attribute(connects[0], key),
+                Some(opentelemetry::Value::I64(_))
+            ),
+            "{key}"
+        );
+    }
 }
 #[tokio::test]
 async fn disallowed_plain_host_gets_exact_refusal_and_span_without_connecting() {
@@ -425,6 +462,10 @@ async fn plain_http_preserves_validated_host_and_streams_bodies() {
                     response
                         .headers_mut()
                         .insert(header::CONTENT_LENGTH, length);
+                    response.headers_mut().insert(
+                        header::CONTENT_TYPE,
+                        hyper::http::HeaderValue::from_static("text/plain"),
+                    );
                     Ok::<_, Infallible>(response)
                 }),
             )
@@ -433,10 +474,34 @@ async fn plain_http_preserves_validated_host_and_streams_bodies() {
     });
     let payload = "x".repeat(70000);
     let stream = TcpStream::connect(proxy.addr).await.unwrap();
-    let response = exchange(stream, &format!("POST http://localhost:{port}/echo HTTP/1.1\r\nHost: LOCALHOST:0{port}\r\ntraceparent: sentinel\r\nContent-Length: {}\r\nConnection: close, Host\r\n\r\n{payload}", payload.len())).await;
+    let response = exchange(stream, &format!("POST http://localhost:{port}/echo HTTP/1.1\r\nHost: LOCALHOST:0{port}\r\ntraceparent: sentinel\r\nContent-Length: {}\r\nContent-Type: text/plain\r\nConnection: close, Host\r\n\r\n{payload}", payload.len())).await;
     assert_eq!(response, (200, payload));
     peer.await.unwrap();
-    proxy.finish().await;
+    let (spans, logs) = proxy.finish_with_logs().await;
+    let request = spans
+        .iter()
+        .find(|span| attribute(span, "http.request.method", "POST"))
+        .unwrap();
+    assert_eq!(
+        span_attribute(request, "http.request.body.size"),
+        Some(&70_000_i64.into())
+    );
+    assert_eq!(
+        span_attribute(request, "http.response.body.size"),
+        Some(&70_000_i64.into())
+    );
+    for key in ["http.request.body.head", "http.response.body.head"] {
+        let head = span_attribute(request, key).unwrap().to_string();
+        assert!(head.starts_with(&"x".repeat(4000)), "{key}: {head}");
+        assert!(head.ends_with("…[truncated]"));
+        assert!(head.len() <= 4096);
+    }
+    let totals = logs
+        .iter()
+        .find(|log| log.record.event_name() == Some("egress.exchange.rollup"))
+        .unwrap();
+    assert_eq!(log_int(totals, "http.request.body.size.sum"), Some(70_000));
+    assert_eq!(log_int(totals, "http.response.body.size.sum"), Some(70_000));
 }
 #[tokio::test]
 async fn non_http_tunnel_bytes_close_with_protocol_refusal() {
@@ -482,7 +547,7 @@ async fn failed_tls_handshake_records_known_sni() {
     assert!(span_attribute(refusals[0], "http.response.status_code").is_none());
 }
 #[tokio::test]
-async fn truncated_upstream_body_does_not_relabel_allowed_request_as_protocol_refusal() {
+async fn truncated_upstream_body_is_body_error_after_the_streamed_bytes() {
     let proxy = Proxy::new(RootCertStore::empty()).await;
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -517,6 +582,66 @@ async fn truncated_upstream_body_does_not_relabel_allowed_request_as_protocol_re
         .collect();
     assert_eq!(requests.len(), 1, "{requests:?}");
     assert!(attribute(requests[0], "egress.decision", "allowed"));
+    assert!(
+        attribute(requests[0], "egress.exchange.outcome", "body-error"),
+        "{requests:?}"
+    );
+    assert!(attribute(
+        requests[0],
+        "egress.exchange.phase",
+        "response-body"
+    ));
+    assert_eq!(
+        span_attribute(requests[0], "http.response.body.size"),
+        Some(&7_i64.into())
+    );
+}
+#[tokio::test]
+async fn client_cancellation_after_response_bytes_records_abandoned_response_body() {
+    let proxy = Proxy::new(RootCertStore::empty()).await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let peer = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        while !request.ends_with(b"\r\n\r\n") {
+            request.push(stream.read_u8().await.unwrap());
+        }
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\n\r\npartial")
+            .await
+            .unwrap();
+        let disconnected =
+            tokio::time::timeout(Duration::from_secs(2), stream.read(&mut [0; 1])).await;
+        stream.shutdown().await.unwrap();
+        matches!(disconnected, Ok(Ok(0)))
+    });
+    let mut client = TcpStream::connect(proxy.addr).await.unwrap();
+    client.write_all(format!("GET http://localhost:{port}/ HTTP/1.1\r\nHost: localhost:{port}\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+    let mut response = Vec::new();
+    while !response.ends_with(b"partial") {
+        response.push(client.read_u8().await.unwrap());
+    }
+    drop(client);
+    let disconnected = peer.await.unwrap();
+    let spans = proxy.finish().await;
+    assert!(
+        disconnected,
+        "downstream cancellation left the upstream socket open"
+    );
+    let request = spans
+        .iter()
+        .find(|span| attribute(span, "http.request.method", "GET"))
+        .unwrap();
+    assert!(
+        attribute(request, "egress.exchange.outcome", "abandoned"),
+        "{request:?}"
+    );
+    assert!(attribute(request, "egress.exchange.phase", "response-body"));
+    assert_eq!(
+        span_attribute(request, "http.response.body.size"),
+        Some(&7_i64.into())
+    );
 }
 #[tokio::test]
 async fn cancelled_upstream_request_exports_abandoned_without_a_status() {
@@ -931,6 +1056,72 @@ async fn connection_cap_counts_all_refused_sockets_before_shutdown() {
     assert_eq!(refusals.iter().sum::<i64>(), 3);
     assert!(refusals.len() <= 2);
 }
+#[test]
+fn worker_unwind_records_one_abandoned_exchange() {
+    let exporter = InMemorySpanExporter::default();
+    let provider = SdkTracerProvider::builder()
+        .with_simple_exporter(exporter.clone())
+        .build();
+    let subscriber = tracing_subscriber::registry()
+        .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("worker-unwind")));
+    tracing::subscriber::with_default(subscriber, || {
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut exchange = Exchange::new(
+                "localhost",
+                Some(80),
+                "GET",
+                "http://localhost/",
+                &[],
+                Arc::new(Mutex::new(Rollups::new())),
+            );
+            exchange.status(StatusCode::OK);
+            exchange.phase(Phase::ResponseBody);
+            panic!("worker unwound");
+        }));
+        assert!(unwound.is_err());
+    });
+    let spans = exporter.get_finished_spans().unwrap();
+    assert_eq!(spans.len(), 1);
+    assert!(attribute(&spans[0], "egress.exchange.outcome", "abandoned"));
+    assert!(attribute(
+        &spans[0],
+        "egress.exchange.phase",
+        "response-body"
+    ));
+    provider.shutdown().unwrap();
+}
+#[tokio::test]
+async fn drip_keeps_failure_and_rollup_logs_without_an_exchange_span() {
+    let proxy = Proxy::drip(RootCertStore::empty()).await;
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = upstream.local_addr().unwrap().port();
+    let peer = tokio::spawn(async move {
+        drop(upstream.accept().await.unwrap());
+    });
+    let stream = TcpStream::connect(proxy.addr).await.unwrap();
+    assert_eq!(exchange(stream, &format!("GET http://localhost:{port}/ HTTP/1.1\r\nHost: localhost:{port}\r\nConnection: close\r\n\r\n")).await.0, 502);
+    peer.await.unwrap();
+    let (spans, logs) = proxy.finish_with_logs().await;
+    assert!(!spans.iter().any(|span| span.name == "egress.request"));
+    let failed = logs
+        .iter()
+        .find(|log| log.record.event_name() == Some("egress.exchange.failed"))
+        .unwrap();
+    assert_eq!(log_int(failed, "http.response.status_code"), Some(502));
+    assert!(
+        failed
+            .record
+            .attributes_iter()
+            .any(|(name, value)| name.as_str() == "egress.exchange.outcome"
+                && value == &opentelemetry::logs::AnyValue::from("upstream-failed"))
+    );
+    let rollup = logs
+        .iter()
+        .find(|log| log.record.event_name() == Some("egress.exchange.rollup"))
+        .unwrap();
+    assert_eq!(log_int(rollup, "egress.exchange.count"), Some(1));
+    assert_eq!(log_int(rollup, "egress.exchange.error.count"), Some(1));
+}
 #[tokio::test]
 async fn connect_is_its_own_completed_tunnel_record_without_zero_status() {
     let proxy = Proxy::new(RootCertStore::empty()).await;
@@ -973,6 +1164,8 @@ async fn client_error_completes_and_emits_a_failure_log() {
                     Ok::<_, Infallible>(
                         Response::builder()
                             .status(404)
+                            .header("set-cookie", "sentinel-cookie")
+                            .header("content-type", "text/plain")
                             .body(Full::new(Bytes::new()))
                             .unwrap(),
                     )
@@ -990,6 +1183,24 @@ async fn client_error_completes_and_emits_a_failure_log() {
         .find(|s| attribute(s, "http.request.method", "GET"))
         .unwrap();
     assert!(attribute(request, "egress.exchange.outcome", "completed"));
+    assert!(attribute(
+        request,
+        "http.response.header.content_type",
+        "text/plain"
+    ));
+    assert!(
+        span_attribute(request, "http.response.header.names")
+            .unwrap()
+            .to_string()
+            .contains("set-cookie")
+    );
+    assert!(
+        span_attribute(request, "http.response.header.values")
+            .unwrap()
+            .to_string()
+            .contains("[redacted]")
+    );
+    assert!(!format!("{spans:?}{logs:?}").contains("sentinel"));
     assert_eq!(
         span_attribute(request, "http.response.body.size"),
         Some(&0_i64.into())

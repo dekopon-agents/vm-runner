@@ -7,6 +7,7 @@ pub mod egress;
 pub mod guest;
 #[cfg(unix)]
 pub mod jail;
+mod request_rollups;
 pub mod telemetry;
 mod tls;
 pub(crate) const ROLLUP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
@@ -18,6 +19,7 @@ use poem_openapi::{
     ApiResponse, Object, OpenApi, OpenApiService,
     payload::{Json, PlainText},
 };
+use request_rollups::{Origin, RequestRollups};
 use tracing::Instrument;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
@@ -176,36 +178,52 @@ pub struct Requests {
     // Only shutdown waits on this: a cancelled reap future leaves its blocking worker alive.
     reaper_drain: std::sync::Arc<tokio::sync::Semaphore>,
     controller: Option<std::sync::Arc<controller::Controller>>,
+    rollups: std::sync::Arc<std::sync::Mutex<RequestRollups>>,
 }
 impl Requests {
+    fn tick(&self) {
+        if let Some(controller) = &self.controller {
+            controller.health();
+        }
+        if let Ok(mut rollups) = self.rollups.lock() {
+            let batch = rollups.tick();
+            drop(rollups);
+            batch.emit();
+        }
+    }
     pub async fn reap(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let Some(controller) = &self.controller else {
-            return std::future::pending().await;
-        };
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
-        let mut last_health = None;
+        let mut ticker = tokio::time::interval_at(
+            tokio::time::Instant::now() + ROLLUP_INTERVAL,
+            ROLLUP_INTERVAL,
+        );
+        if let Some(controller) = &self.controller {
+            controller.health();
+        }
         loop {
-            interval.tick().await;
-            let now = std::time::Instant::now();
-            if last_health
-                .is_none_or(|last: std::time::Instant| now.duration_since(last) >= ROLLUP_INTERVAL)
-            {
-                controller.health();
-                last_health = Some(now);
+            tokio::select! {
+                _ = ticker.tick() => self.tick(),
+                _ = interval.tick(), if self.controller.is_some() => {
+                    if let Some(controller) = &self.controller {
+                        let permit = std::sync::Arc::clone(&self.reaper_drain).acquire_owned().await?;
+                        let controller = std::sync::Arc::clone(controller);
+                        let runtime = tokio::runtime::Handle::current();
+                        let dispatch = tracing::dispatcher::get_default(Clone::clone);
+                        let mut worker = tokio::task::spawn_blocking(move || {
+                            let _permit = permit;
+                            tracing::dispatcher::with_default(&dispatch, || {
+                                runtime.block_on(controller.reap(controller::now()))
+                            })
+                        });
+                        loop {
+                            tokio::select! {
+                                result = &mut worker => { result?; break; }
+                                _ = ticker.tick() => self.tick(),
+                            }
+                        }
+                    }
+                }
             }
-            let permit = std::sync::Arc::clone(&self.reaper_drain)
-                .acquire_owned()
-                .await?;
-            let controller = std::sync::Arc::clone(controller);
-            let runtime = tokio::runtime::Handle::current();
-            let dispatch = tracing::dispatcher::get_default(Clone::clone);
-            tokio::task::spawn_blocking(move || {
-                let _permit = permit;
-                tracing::dispatcher::with_default(&dispatch, || {
-                    runtime.block_on(controller.reap(controller::now()))
-                })
-            })
-            .await?;
         }
     }
     // Call after the server stops, before shutting down telemetry.
@@ -216,6 +234,11 @@ impl Requests {
             let _read = controller.reads.acquire().await?;
         }
         let _reaped = self.reaper_drain.acquire().await?;
+        if let Ok(mut rollups) = self.rollups.lock() {
+            let batch = rollups.flush();
+            drop(rollups);
+            batch.emit();
+        }
         Ok(())
     }
 }
@@ -250,21 +273,30 @@ pub async fn app(
         controller: controller.as_ref().map(std::sync::Arc::clone),
     };
     let admission = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+    let rollups = std::sync::Arc::new(std::sync::Mutex::new(RequestRollups::new(
+        Origin::Controller,
+    )));
     let requests = Requests {
         admission: std::sync::Arc::clone(&admission),
         reaper_drain: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
         controller,
+        rollups: std::sync::Arc::clone(&rollups),
     };
-    Ok((endpoint(std::sync::Arc::new(state), admission), requests))
+    Ok((
+        endpoint(std::sync::Arc::new(state), admission, rollups),
+        requests,
+    ))
 }
 fn endpoint(
     state: std::sync::Arc<State>,
     admission: std::sync::Arc<tokio::sync::Semaphore>,
+    rollups: std::sync::Arc<std::sync::Mutex<RequestRollups>>,
 ) -> impl Endpoint {
     service()
         .data(std::sync::Arc::clone(&state))
         .around(move |ep, mut req| {
             let state = std::sync::Arc::clone(&state);
+            let rollups = std::sync::Arc::clone(&rollups);
             // Slow C4 operations never own API admission. GETs have their own worker
             // so a cold boot or long exec cannot block job/artifact reads.
             // Poem matches literal path segments before percent-decoding captured parameters.
@@ -294,40 +326,49 @@ fn endpoint(
                     let _permit = permit;
                     tracing::dispatcher::with_default(&dispatch, || {
                         let span = request_span(&req);
+                        let path = req.uri().path().to_owned();
+                        let health = path == "/healthz" && req.method() == poem::http::Method::GET;
                         runtime.block_on(
                             async move {
-                                if req.uri().path() != "/healthz"
-                                    || req.method() != poem::http::Method::GET
-                                {
-                                    match state.authenticate(&req).await {
-                                        Ok(subject) => {
-                                            req.extensions_mut().insert(Subject(subject));
-                                        }
-                                        Err(refusal) => {
-                                            return Ok(poem::web::Json(refusal)
-                                                .with_status(poem::http::StatusCode::UNAUTHORIZED)
-                                                .into_response());
+                                let result = async {
+                                    if req.uri().path() != "/healthz"
+                                        || req.method() != poem::http::Method::GET
+                                    {
+                                        match state.authenticate(&req).await {
+                                            Ok(subject) => {
+                                                req.extensions_mut().insert(Subject(subject));
+                                            }
+                                            Err(refusal) => {
+                                                return Ok(poem::web::Json(refusal)
+                                                    .with_status(
+                                                        poem::http::StatusCode::UNAUTHORIZED,
+                                                    )
+                                                    .into_response());
+                                            }
                                         }
                                     }
-                                }
-                                if req.method() == poem::http::Method::POST {
-                                    let body = tokio::time::timeout(
-                                        std::time::Duration::from_secs(30),
-                                        req.take_body()
-                                            .into_bytes_limit(controller::proxy::BODY_LIMIT),
-                                    )
-                                    .await
-                                    .map_err(poem::error::RequestTimeout)?;
-                                    match body {
-                                        Ok(body) => req.set_body(body),
-                                        Err(poem::error::ReadBodyError::PayloadTooLarge) => {
-                                            return Ok(controller::proxy::oversized());
+                                    if req.method() == poem::http::Method::POST {
+                                        let body = tokio::time::timeout(
+                                            std::time::Duration::from_secs(30),
+                                            req.take_body()
+                                                .into_bytes_limit(controller::proxy::BODY_LIMIT),
+                                        )
+                                        .await
+                                        .map_err(poem::error::RequestTimeout)?;
+                                        match body {
+                                            Ok(body) => req.set_body(body),
+                                            Err(poem::error::ReadBodyError::PayloadTooLarge) => {
+                                                return Ok(controller::proxy::oversized());
+                                            }
+                                            Err(error) => return Err(error.into()),
                                         }
-                                        Err(error) => return Err(error.into()),
                                     }
+                                    ep.call(req).await
                                 }
-                                let result = ep.call(req).await;
-                                record_route(&result);
+                                .await;
+                                if !health {
+                                    record_request(&rollups, &result, &path);
+                                }
                                 result
                             }
                             .instrument(span),
@@ -340,12 +381,28 @@ fn endpoint(
         })
 }
 #[cfg(unix)]
-pub(crate) struct TracedRequests([std::sync::Arc<tokio::sync::Semaphore>; 2], u32);
+pub(crate) struct TracedRequests {
+    admission: [std::sync::Arc<tokio::sync::Semaphore>; 2],
+    capacity: u32,
+    rollups: std::sync::Arc<std::sync::Mutex<RequestRollups>>,
+}
 #[cfg(unix)]
 impl TracedRequests {
+    pub(crate) fn tick(&self) {
+        if let Ok(mut rollups) = self.rollups.lock() {
+            let batch = rollups.tick();
+            drop(rollups);
+            batch.emit();
+        }
+    }
     pub async fn drain(self) -> Result<(), tokio::sync::AcquireError> {
-        let _exec_idle = self.0[0].acquire_many(self.1).await?;
-        let _get_idle = self.0[1].acquire_many(self.1).await?;
+        let _exec_idle = self.admission[0].acquire_many(self.capacity).await?;
+        let _get_idle = self.admission[1].acquire_many(self.capacity).await?;
+        if let Ok(mut rollups) = self.rollups.lock() {
+            let batch = rollups.flush();
+            drop(rollups);
+            batch.emit();
+        }
         Ok(())
     }
 }
@@ -357,8 +414,14 @@ pub(crate) fn traced(
     let admission = std::array::from_fn(|_| {
         std::sync::Arc::new(tokio::sync::Semaphore::new(capacity as usize))
     });
-    let requests = TracedRequests(admission.each_ref().map(std::sync::Arc::clone), capacity);
+    let rollups = std::sync::Arc::new(std::sync::Mutex::new(RequestRollups::new(Origin::Jail)));
+    let requests = TracedRequests {
+        admission: admission.each_ref().map(std::sync::Arc::clone),
+        capacity,
+        rollups: std::sync::Arc::clone(&rollups),
+    };
     let endpoint = endpoint.map_to_response().around(move |ep, req| {
+        let rollups = std::sync::Arc::clone(&rollups);
         let admission =
             std::sync::Arc::clone(&admission[usize::from(req.method() == poem::http::Method::GET)]);
         async move {
@@ -374,10 +437,14 @@ pub(crate) fn traced(
                 let _permit = permit;
                 tracing::dispatcher::with_default(&dispatch, || {
                     let span = request_span(&req);
+                    let path = req.uri().path().to_owned();
+                    let health = path == "/healthz" && req.method() == poem::http::Method::GET;
                     runtime.block_on(
                         async move {
                             let result = ep.call(req).await;
-                            record_route(&result);
+                            if !health {
+                                record_request(&rollups, &result, &path);
+                            }
                             result
                         }
                         .instrument(span),
@@ -438,7 +505,21 @@ impl RequestTrace {
 fn request_span(req: &poem::Request) -> tracing::Span {
     RequestTrace::from_request(req).span()
 }
-fn record_route(result: &poem::Result<poem::Response>) {
+fn record_request(
+    rollups: &std::sync::Mutex<RequestRollups>,
+    result: &poem::Result<poem::Response>,
+    path: &str,
+) {
+    let route = record_route(result);
+    let status = match result {
+        Ok(response) => response.status(),
+        Err(error) => error.status(),
+    };
+    if let Ok(mut rollups) = rollups.lock() {
+        rollups.record(route, path, status);
+    }
+}
+fn record_route(result: &poem::Result<poem::Response>) -> String {
     let pattern = match result {
         Ok(response) => response.data::<poem::PathPattern>(),
         Err(error) => error.data::<poem::PathPattern>(),
@@ -458,7 +539,8 @@ fn record_route(result: &poem::Result<poem::Response>) {
                 .join("/")
         },
     );
-    tracing::Span::current().record("http.route", route);
+    tracing::Span::current().record("http.route", &route);
+    route
 }
 /// Stop admission on either terminal interruption or pod termination.
 /// Callers drain their requests before shutting down (and flushing) telemetry.

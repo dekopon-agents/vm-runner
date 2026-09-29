@@ -39,7 +39,10 @@ use tracing::Instrument;
 
 mod gateway;
 mod observability;
-use observability::{Exchange, HeaderSide, Outcome, Phase, Recorded, RequestMeasure, Rollups};
+use observability::{
+    ConnectAttempt, ConnectOutcome, Exchange, HeaderSide, Outcome, Phase, Recorded, RequestMeasure,
+    Rollups,
+};
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
 type HttpBody = UnsyncBoxBody<Bytes, Error>;
@@ -148,6 +151,9 @@ impl Refusal {
             Self::Connections => "refused:connections",
         }
     }
+}
+pub(crate) fn cut_error(value: &str) -> String {
+    observability::cut_text(value)
 }
 pub(crate) fn cut(value: &str) -> String {
     const MARKER: &str = "…[truncated]";
@@ -422,6 +428,7 @@ impl Engine {
             egress.connect.dns_ms = tracing::field::Empty,
             egress.connect.tcp_ms = tracing::field::Empty,
             egress.connect.tls_ms = tracing::field::Empty);
+        let mut attempt = ConnectAttempt::new(&self.rollups, host, port);
         let result = async {
             let standard = tracing::enabled!(target: "egress.connect", tracing::Level::DEBUG);
             let started = Instant::now();
@@ -461,9 +468,10 @@ impl Engine {
         }
         .instrument(span.clone())
         .await;
-        if let Ok(mut rollups) = self.rollups.lock() {
-            rollups.connect(host, port, result.is_err());
-        }
+        attempt.complete(match &result {
+            Ok(_) => ConnectOutcome::Succeeded,
+            Err(_) => ConnectOutcome::Failed,
+        });
         result
     }
     async fn forward(

@@ -195,18 +195,17 @@ async fn exec(api: &reqwest::Client, token: &str, script: &str) -> Value {
 }
 async fn dropped() -> u64 {
     let output = Command::new("nft")
-        .args(["-j", "list", "chain", "inet", "vm_runner", "input"])
+        .args(["-j", "list", "counters", "table", "inet", "vm_runner"])
         .output()
         .await
         .unwrap();
     assert!(output.status.success());
-    let rules: Value = serde_json::from_slice(&output.stdout).unwrap();
-    rules["nftables"]
+    let counters: Value = serde_json::from_slice(&output.stdout).unwrap();
+    counters["nftables"]
         .as_array()
         .unwrap()
         .iter()
-        .filter_map(|item| item["rule"]["expr"].as_array())
-        .flat_map(|expr| expr.iter())
-        .filter_map(|expr| expr["counter"]["packets"].as_u64())
-        .sum()
+        .find(|entry| entry["counter"]["name"] == "input_drop")
+        .and_then(|entry| entry["counter"]["packets"].as_u64())
+        .unwrap()
 }

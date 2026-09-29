@@ -1,13 +1,15 @@
 table inet vm_runner {
+    counter input_drop {}
+    counter forward_drop {}
     chain input {
         type filter hook input priority -10; policy accept;
         iifname "tap0" ip saddr 10.0.2.2 ip daddr 10.0.2.1 ct state established,related accept
         iifname "tap0" ip saddr 10.0.2.2 ip daddr 10.0.2.1 udp dport 53 accept
         iifname "tap0" ip saddr 10.0.2.2 ip daddr 10.0.2.1 tcp dport { 53, 80, 443 } accept
-        iifname "tap0" counter drop
+        iifname "tap0" counter name input_drop drop
     }
     chain forward {
         type filter hook forward priority -10; policy accept;
-        iifname "tap0" counter drop
+        iifname "tap0" counter name forward_drop drop
     }
 }

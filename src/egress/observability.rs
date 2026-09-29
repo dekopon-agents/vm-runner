@@ -89,7 +89,7 @@ struct ExchangeData {
     status: Option<StatusCode>,
     request: Arc<Mutex<RequestMeasure>>,
     response_bytes: u64,
-    response_head: Vec<u8>,
+    response_head: BodyHead,
     request_text: bool,
     response_text: bool,
     rollups: Arc<Mutex<Rollups>>,
@@ -119,22 +119,40 @@ impl HeaderSide {
         }
     }
 }
+struct BodyHead {
+    bytes: Vec<u8>,
+    max_bytes: usize,
+}
+impl BodyHead {
+    fn new() -> Self {
+        Self {
+            bytes: Vec::new(),
+            max_bytes: 4096,
+        }
+    }
+    fn append(&mut self, bytes: &[u8]) {
+        let take = (self.max_bytes - self.bytes.len()).min(bytes.len());
+        self.bytes.extend_from_slice(&bytes[..take]);
+    }
+    fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+}
 pub(super) struct RequestMeasure {
-    pub(super) bytes: u64,
-    pub(super) head: Vec<u8>,
+    bytes: u64,
+    head: BodyHead,
 }
 impl RequestMeasure {
     pub(super) fn new() -> Self {
         Self {
             bytes: 0,
-            head: Vec::new(),
+            head: BodyHead::new(),
         }
     }
     pub(super) fn append(&mut self, bytes: &[u8]) {
         self.bytes = self.bytes.saturating_add(bytes.len() as u64);
         if tracing::enabled!(target: "egress.exchange", tracing::Level::TRACE) {
-            let take = (4096 - self.head.len()).min(bytes.len());
-            self.head.extend_from_slice(&bytes[..take]);
+            self.head.append(bytes);
         }
     }
 }
@@ -183,22 +201,23 @@ impl Exchange {
         if tracing::enabled!(target: "egress.exchange", tracing::Level::DEBUG)
             && let Some(url) = &parsed
         {
-            span.record("url.path", cut_text(url.path(), 1024));
-            let pairs = url
-                .query_pairs()
-                .filter(|(key, _)| !omitted(key, omit_query))
-                .take(64)
-                .map(|(key, value)| {
-                    let value = if redact(&key) {
-                        "[redacted]".into()
-                    } else {
-                        value
-                    };
-                    (cut_text(&key, 1024), cut_text(&value, 1024))
-                })
-                .collect::<Vec<_>>();
-            let (keys, values): (Vec<_>, Vec<_>) = pairs.into_iter().unzip();
-            set_pairs(&span, "url.query.keys", "url.query.values", keys, values);
+            span.record("url.path", cut_text(url.path()));
+            let mut pairs = ParallelFields::new();
+            for (key, value) in url.query_pairs() {
+                if pairs.full() {
+                    break;
+                }
+                if omitted(&key, omit_query) {
+                    continue;
+                }
+                let value = if redact(&key) {
+                    "[redacted]".into()
+                } else {
+                    value
+                };
+                pairs.push(cut_text(&key), cut_text(&value));
+            }
+            pairs.record(&span, "url.query.keys", "url.query.values");
         }
         Self {
             data: Some(ExchangeData {
@@ -211,7 +230,7 @@ impl Exchange {
                 status: None,
                 request: Arc::new(Mutex::new(RequestMeasure::new())),
                 response_bytes: 0,
-                response_head: Vec::new(),
+                response_head: BodyHead::new(),
                 request_text: false,
                 response_text: false,
                 rollups,
@@ -239,8 +258,16 @@ impl Exchange {
             let text = headers
                 .get(hyper::header::CONTENT_TYPE)
                 .is_some_and(|content| {
-                    content.as_bytes().starts_with(b"text/")
-                        || content.as_bytes().starts_with(b"application/json")
+                    let kind = content
+                        .as_bytes()
+                        .iter()
+                        .copied()
+                        .take_while(|byte| *byte != b';')
+                        .map(|byte| byte.to_ascii_lowercase())
+                        .collect::<Vec<_>>();
+                    kind.starts_with(b"text/")
+                        || kind == b"application/json"
+                        || kind.ends_with(b"+json")
                 });
             match side {
                 HeaderSide::Request => data.request_text = text,
@@ -252,8 +279,7 @@ impl Exchange {
         };
         let standard = tracing::enabled!(target: "egress.exchange", tracing::Level::DEBUG);
         let full = tracing::enabled!(target: "egress.exchange", tracing::Level::TRACE);
-        let mut names = Vec::new();
-        let mut values = Vec::new();
+        let mut pairs = ParallelFields::new();
         for (name, value) in headers {
             let name = name.as_str();
             if omitted(name, omit) {
@@ -263,26 +289,26 @@ impl Exchange {
                 totals.noise(NoiseKind::Header, name, value.as_bytes());
             }
             if standard && name == "content-type" {
-                let content = cut_text(&String::from_utf8_lossy(value.as_bytes()), 1024);
+                let content = cut_text(&String::from_utf8_lossy(value.as_bytes()));
                 data.span.record(side.content_type(), content);
             }
             if standard && matches!(side, HeaderSide::Request) && name == "user-agent" {
                 data.span.record(
                     "user_agent.original",
-                    cut_text(&String::from_utf8_lossy(value.as_bytes()), 1024),
+                    cut_text(&String::from_utf8_lossy(value.as_bytes())),
                 );
             }
-            if full && names.len() < 64 {
-                names.push(cut_text(name, 1024));
-                values.push(if redact(name) {
+            if full && !pairs.full() {
+                let value = if redact(name) {
                     "[redacted]".into()
                 } else {
-                    cut_text(&String::from_utf8_lossy(value.as_bytes()), 1024)
-                });
+                    cut_text(&String::from_utf8_lossy(value.as_bytes()))
+                };
+                pairs.push(cut_text(name), value);
             }
         }
         if full {
-            set_pairs(&data.span, side.names(), side.values(), names, values);
+            pairs.record(&data.span, side.names(), side.values());
         }
     }
     pub(super) fn phase(&mut self, phase: Phase) {
@@ -305,8 +331,7 @@ impl Exchange {
             if data.response_text
                 && tracing::enabled!(target: "egress.exchange", tracing::Level::TRACE)
             {
-                let take = (4096 - data.response_head.len()).min(bytes.len());
-                data.response_head.extend_from_slice(&bytes[..take]);
+                data.response_head.append(bytes);
             }
         }
     }
@@ -345,7 +370,7 @@ fn record(data: ExchangeData, outcome: Outcome, error: Option<&str>) {
         {
             data.span.record(
                 "http.request.body.head",
-                cut_text(&String::from_utf8_lossy(&measure.head), 4096),
+                body_head(&measure.head, measure.bytes),
             );
         }
         measure.bytes
@@ -360,7 +385,7 @@ fn record(data: ExchangeData, outcome: Outcome, error: Option<&str>) {
     {
         data.span.record(
             "http.response.body.head",
-            cut_text(&String::from_utf8_lossy(&data.response_head), 4096),
+            body_head(&data.response_head, data.response_bytes),
         );
     }
     data.span.record(
@@ -387,7 +412,7 @@ fn record(data: ExchangeData, outcome: Outcome, error: Option<&str>) {
         | Outcome::Abandoned(_) => true,
     };
     if failed {
-        let error = error.map(|error| cut_text(error, 1024));
+        let error = error.map(cut_text);
         tracing::info!(name: "egress.exchange.failed", target: "egress.exchange", {
             telemetry.detail = crate::telemetry::detail!(crate::config::Category::EgressExchange),
             server.address = %data.host, server.port = data.port.map(i64::from),
@@ -398,12 +423,46 @@ fn record(data: ExchangeData, outcome: Outcome, error: Option<&str>) {
     }
 }
 
+pub(super) struct ConnectAttempt<'a> {
+    rollups: &'a Mutex<Rollups>,
+    host: &'a str,
+    port: u16,
+    outcome: ConnectOutcome,
+}
+#[derive(Clone, Copy)]
+pub(super) enum ConnectOutcome {
+    Abandoned,
+    Succeeded,
+    Failed,
+}
+impl<'a> ConnectAttempt<'a> {
+    pub(super) fn new(rollups: &'a Mutex<Rollups>, host: &'a str, port: u16) -> Self {
+        Self {
+            rollups,
+            host,
+            port,
+            outcome: ConnectOutcome::Abandoned,
+        }
+    }
+    pub(super) fn complete(&mut self, outcome: ConnectOutcome) {
+        self.outcome = outcome;
+    }
+}
+impl Drop for ConnectAttempt<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut rollups) = self.rollups.lock() {
+            rollups.connect(self.host, self.port, self.outcome);
+        }
+    }
+}
+
 pub(super) struct Rollups {
     since: Instant,
-    exchanges: BTreeMap<(String, u16), ExchangeTotals>,
-    connects: BTreeMap<(String, u16), ConnectTotals>,
+    exchanges: BTreeMap<(String, Option<u16>), ExchangeTotals>,
+    connects: BTreeMap<(String, Option<u16>), ConnectTotals>,
     dns: BTreeMap<String, DnsTotals>,
     noise: BTreeMap<(NoiseKind, String), NoiseTotals>,
+    max_named_keys: usize,
     max_named_noise_keys: usize,
 }
 #[derive(Default)]
@@ -439,12 +498,40 @@ impl NoiseKind {
         }
     }
 }
-#[derive(Default)]
 struct NoiseTotals {
     count: u64,
     bytes: u64,
     hashes: HashSet<u64>,
     many: bool,
+    max_distinct: usize,
+}
+impl Default for NoiseTotals {
+    fn default() -> Self {
+        Self {
+            count: 0,
+            bytes: 0,
+            hashes: HashSet::new(),
+            many: false,
+            max_distinct: 257,
+        }
+    }
+}
+impl NoiseTotals {
+    fn observe(&mut self, value: &[u8]) {
+        self.count = self.count.saturating_add(1);
+        self.bytes = self
+            .bytes
+            .saturating_add(u64::try_from(value.len()).unwrap_or(u64::MAX));
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        value.hash(&mut hasher);
+        if self.hashes.len() < self.max_distinct {
+            self.hashes.insert(hasher.finish());
+        }
+        self.many |= self.hashes.len() >= self.max_distinct;
+    }
+    fn distinct_count(&self) -> i64 {
+        i64::try_from(self.hashes.len().min(self.max_distinct - 1)).unwrap_or(i64::MAX)
+    }
 }
 impl Rollups {
     pub(super) fn new() -> Self {
@@ -454,15 +541,17 @@ impl Rollups {
             connects: BTreeMap::new(),
             dns: BTreeMap::new(),
             noise: BTreeMap::new(),
+            max_named_keys: 63,
             max_named_noise_keys: 62,
         }
     }
     fn exchange(&mut self, data: &ExchangeData, outcome: &Outcome) {
-        let key = (data.host.clone(), data.port.unwrap_or(0));
-        let key = if self.exchanges.contains_key(&key) || self.exchanges.len() < 63 {
+        let key = (data.host.clone(), data.port);
+        let key = if self.exchanges.contains_key(&key) || self.exchanges.len() < self.max_named_keys
+        {
             key
         } else {
-            ("*".into(), 0)
+            ("*".into(), None)
         };
         let row = self.exchanges.entry(key).or_default();
         row.count += 1;
@@ -483,20 +572,23 @@ impl Rollups {
             .slowest_ms
             .max(u64::try_from(data.started.elapsed().as_millis()).unwrap_or(u64::MAX));
     }
-    pub(super) fn connect(&mut self, host: &str, port: u16, failed: bool) {
-        let key = (cut(host), port);
-        let key = if self.connects.contains_key(&key) || self.connects.len() < 63 {
+    pub(super) fn connect(&mut self, host: &str, port: u16, outcome: ConnectOutcome) {
+        let key = (cut(host), Some(port));
+        let key = if self.connects.contains_key(&key) || self.connects.len() < self.max_named_keys {
             key
         } else {
-            ("*".into(), 0)
+            ("*".into(), None)
         };
         let row = self.connects.entry(key).or_default();
         row.count += 1;
-        row.errors += u64::from(failed);
+        row.errors += match outcome {
+            ConnectOutcome::Abandoned | ConnectOutcome::Failed => 1,
+            ConnectOutcome::Succeeded => 0,
+        };
     }
     pub(super) fn dns(&mut self, name: &str, refused: bool) {
-        let key = cut_text(name, 1024);
-        let key = if self.dns.contains_key(&key) || self.dns.len() < 63 {
+        let key = cut_text(name);
+        let key = if self.dns.contains_key(&key) || self.dns.len() < self.max_named_keys {
             key
         } else {
             "*".into()
@@ -506,22 +598,14 @@ impl Rollups {
         row.refused += u64::from(refused);
     }
     pub(super) fn noise(&mut self, kind: NoiseKind, name: &str, value: &[u8]) {
-        let key = (kind, cut_text(&name.to_ascii_lowercase(), 1024));
+        let key = (kind, cut_text(&name.to_ascii_lowercase()));
         let named = self.noise.keys().filter(|(_, name)| name != "*").count();
         let key = if self.noise.contains_key(&key) || named < self.max_named_noise_keys {
             key
         } else {
             (kind, "*".into())
         };
-        let row = self.noise.entry(key).or_default();
-        row.count += 1;
-        row.bytes = row.bytes.saturating_add(value.len() as u64);
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        value.hash(&mut hasher);
-        if row.hashes.len() < 257 {
-            row.hashes.insert(hasher.finish());
-        }
-        row.many |= row.hashes.len() > 256;
+        self.noise.entry(key).or_default().observe(value);
     }
     pub(super) fn tick(&mut self) -> RollupBatch {
         self.drain(i64::try_from(crate::ROLLUP_INTERVAL.as_millis()).unwrap_or(i64::MAX))
@@ -542,8 +626,8 @@ impl Rollups {
 }
 pub(super) struct RollupBatch {
     interval: i64,
-    exchanges: BTreeMap<(String, u16), ExchangeTotals>,
-    connects: BTreeMap<(String, u16), ConnectTotals>,
+    exchanges: BTreeMap<(String, Option<u16>), ExchangeTotals>,
+    connects: BTreeMap<(String, Option<u16>), ConnectTotals>,
     dns: BTreeMap<String, DnsTotals>,
     noise: BTreeMap<(NoiseKind, String), NoiseTotals>,
 }
@@ -556,7 +640,7 @@ impl RollupBatch {
         for ((host, port), row) in self.exchanges {
             tracing::info!(name: "egress.exchange.rollup", target: "egress.exchange", {
                 telemetry.detail = crate::telemetry::detail!(crate::config::Category::EgressExchange),
-                server.address = %host, server.port = i64::from(port), rollup.interval_ms = self.interval,
+                server.address = %host, server.port = port.map(i64::from), rollup.interval_ms = self.interval,
                 egress.exchange.count = i64::try_from(row.count).unwrap_or(i64::MAX),
                 egress.exchange.error.count = i64::try_from(row.errors).unwrap_or(i64::MAX),
                 egress.exchange.client_error.count = i64::try_from(row.client_errors).unwrap_or(i64::MAX),
@@ -569,7 +653,7 @@ impl RollupBatch {
         for ((host, port), row) in self.connects {
             tracing::info!(name: "egress.connect.rollup", target: "egress.connect", {
                 telemetry.detail = crate::telemetry::detail!(crate::config::Category::EgressConnect),
-                server.address = %host, server.port = i64::from(port), rollup.interval_ms = self.interval,
+                server.address = %host, server.port = port.map(i64::from), rollup.interval_ms = self.interval,
                 egress.connect.count = i64::try_from(row.count).unwrap_or(i64::MAX),
                 egress.connect.error.count = i64::try_from(row.errors).unwrap_or(i64::MAX),
             }, "egress.connect.rollup");
@@ -588,7 +672,7 @@ impl RollupBatch {
                 egress.noise.kind = kind.label(), egress.noise.name = %name,
                 egress.noise.value.count = i64::try_from(row.count).unwrap_or(i64::MAX),
                 egress.noise.value.bytes = i64::try_from(row.bytes).unwrap_or(i64::MAX),
-                egress.noise.distinct.count = i64::try_from(row.hashes.len().min(256)).unwrap_or(i64::MAX),
+                egress.noise.distinct.count = row.distinct_count(),
                 egress.noise.distinct.many = row.many,
                 rollup.interval_ms = self.interval,
             }, "egress.exchange.noise");
@@ -622,33 +706,82 @@ pub(super) fn redact(name: &str) -> bool {
         || name.ends_with("key")
         || matches!(name.as_str(), "code" | "sig" | "state" | "appid")
 }
-pub(super) fn cut_text(value: &str, max: usize) -> String {
-    const MARKER: &str = "…[truncated]";
+const TRUNCATION: &str = "…[truncated]";
+fn body_head(head: &BodyHead, total: u64) -> String {
+    let text = String::from_utf8_lossy(&head.bytes);
+    if total > head.bytes.len() as u64 {
+        let mut end = text
+            .len()
+            .min(head.max_bytes.saturating_sub(TRUNCATION.len()));
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}{TRUNCATION}", &text[..end])
+    } else {
+        cut_at(&text, head.max_bytes)
+    }
+}
+struct TextCut {
+    max_bytes: usize,
+}
+impl TextCut {
+    fn new() -> Self {
+        Self { max_bytes: 1024 }
+    }
+    fn apply(&self, value: &str) -> String {
+        cut_at(value, self.max_bytes)
+    }
+}
+pub(super) fn cut_text(value: &str) -> String {
+    TextCut::new().apply(value)
+}
+fn cut_at(value: &str, max: usize) -> String {
     if value.len() <= max {
         return value.to_owned();
     }
-    let mut end = max.saturating_sub(MARKER.len());
+    let mut end = max.saturating_sub(TRUNCATION.len());
     while !value.is_char_boundary(end) {
         end -= 1;
     }
-    format!("{}{MARKER}", &value[..end])
+    format!("{}{TRUNCATION}", &value[..end])
 }
-pub(super) fn set_pairs(
-    span: &tracing::Span,
-    keys_name: &'static str,
-    values_name: &'static str,
+struct ParallelFields {
     keys: Vec<String>,
     values: Vec<String>,
-) {
-    if !keys.is_empty() {
-        span.set_attribute(
-            keys_name,
-            Value::Array(Array::String(keys.into_iter().map(Into::into).collect())),
-        );
-        span.set_attribute(
-            values_name,
-            Value::Array(Array::String(values.into_iter().map(Into::into).collect())),
-        );
+    max_elements: usize,
+}
+impl ParallelFields {
+    fn new() -> Self {
+        Self {
+            keys: Vec::new(),
+            values: Vec::new(),
+            max_elements: 64,
+        }
+    }
+    fn full(&self) -> bool {
+        self.keys.len() >= self.max_elements
+    }
+    fn push(&mut self, key: String, value: String) {
+        if !self.full() {
+            self.keys.push(key);
+            self.values.push(value);
+        }
+    }
+    fn record(self, span: &tracing::Span, keys_name: &'static str, values_name: &'static str) {
+        if !self.keys.is_empty() {
+            span.set_attribute(
+                keys_name,
+                Value::Array(Array::String(
+                    self.keys.into_iter().map(Into::into).collect(),
+                )),
+            );
+            span.set_attribute(
+                values_name,
+                Value::Array(Array::String(
+                    self.values.into_iter().map(Into::into).collect(),
+                )),
+            );
+        }
     }
 }
 
@@ -674,6 +807,16 @@ mod tests {
     }
     #[test]
     fn noise_distinct_values_saturate_at_256() {
+        use opentelemetry::logs::AnyValue;
+        use opentelemetry_sdk::logs::{InMemoryLogExporter, SdkLoggerProvider};
+        use tracing_subscriber::layer::SubscriberExt;
+        let exporter = InMemoryLogExporter::default();
+        let provider = SdkLoggerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(
+            opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new(&provider),
+        ));
         let mut rollups = Rollups::new();
         for n in 0..300_u64 {
             rollups.noise(NoiseKind::Header, "x-item", &n.to_le_bytes());
@@ -681,5 +824,75 @@ mod tests {
         let row = rollups.noise.values().next().unwrap();
         assert_eq!(row.hashes.len(), 257);
         assert!(row.many);
+        tracing::dispatcher::with_default(&dispatch, || rollups.flush().emit());
+        let logs = exporter.get_emitted_logs().unwrap();
+        let noise = logs
+            .iter()
+            .find(|log| log.record.event_name() == Some("egress.exchange.noise"))
+            .unwrap();
+        assert!(
+            noise
+                .record
+                .attributes_iter()
+                .any(|(key, value)| key.as_str() == "egress.noise.distinct.count"
+                    && value == &AnyValue::Int(256))
+        );
+        assert!(
+            noise
+                .record
+                .attributes_iter()
+                .any(|(key, value)| key.as_str() == "egress.noise.distinct.many"
+                    && value == &AnyValue::Boolean(true))
+        );
+        assert!(
+            noise
+                .record
+                .attributes_iter()
+                .any(|(key, value)| key.as_str() == "egress.noise.value.bytes"
+                    && value == &AnyValue::Int(2400))
+        );
+        provider.shutdown().unwrap();
+    }
+    #[test]
+    fn sixty_fifth_noise_key_folds_both_kinds_without_exceeding_the_map_bound() {
+        let mut rollups = Rollups::new();
+        for n in 0..63 {
+            rollups.noise(NoiseKind::Header, &format!("x-item-{n}"), b"v");
+        }
+        rollups.noise(NoiseKind::QueryKey, "q", b"query");
+        assert_eq!(rollups.noise.len(), 64);
+        assert_eq!(rollups.noise.values().map(|row| row.count).sum::<u64>(), 64);
+        assert_eq!(rollups.noise.values().map(|row| row.bytes).sum::<u64>(), 68);
+        assert_eq!(
+            rollups
+                .noise
+                .get(&(NoiseKind::Header, "*".into()))
+                .map(|row| row.count),
+            Some(1)
+        );
+        assert_eq!(
+            rollups
+                .noise
+                .get(&(NoiseKind::QueryKey, "*".into()))
+                .map(|row| row.count),
+            Some(1)
+        );
+    }
+    #[test]
+    fn cancelled_connect_still_contributes_an_error_to_its_rollup() {
+        let rollups = Mutex::new(Rollups::new());
+        drop(ConnectAttempt::new(&rollups, "localhost", 443));
+        let rows = &rollups.lock().unwrap().connects;
+        let row = rows.get(&("localhost".to_owned(), Some(443))).unwrap();
+        assert_eq!(row.count, 1);
+        assert_eq!(row.errors, 1);
+    }
+    #[tokio::test(start_paused = true)]
+    async fn regular_interval_is_sixty_seconds_and_final_interval_is_shorter() {
+        let mut rollups = Rollups::new();
+        tokio::time::advance(crate::ROLLUP_INTERVAL).await;
+        assert_eq!(rollups.tick().interval, 60_000);
+        tokio::time::advance(std::time::Duration::from_secs(7)).await;
+        assert_eq!(rollups.flush().interval, 7_000);
     }
 }

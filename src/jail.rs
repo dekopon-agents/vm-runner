@@ -21,6 +21,7 @@ use tracing::Instrument;
 
 pub(crate) mod api;
 mod client;
+mod firewall;
 pub mod image;
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 #[derive(Debug, thiserror::Error)]
@@ -369,9 +370,15 @@ pub async fn run(config: Config, profile: &str, session: &str) -> Result<()> {
             })
         });
         let mut vm = None;
+        let mut firewall = None;
         let result = async {
             let (ca, pem) = phase("ca", async { crate::egress::Ca::new() }).await?;
             network(&work).await?;
+            firewall = Some(firewall::Firewall::new());
+            let mut ticker = tokio::time::interval_at(
+                tokio::time::Instant::now() + crate::ROLLUP_INTERVAL,
+                crate::ROLLUP_INTERVAL,
+            );
             let gateway =
                 phase("gateway", crate::egress::Gateway::bind(selected.egress, ca, omit)).await?;
             let handle = tokio::runtime::Handle::current();
@@ -391,11 +398,19 @@ pub async fn run(config: Config, profile: &str, session: &str) -> Result<()> {
             vm = Some(child);
             let child = vm.as_mut().ok_or(Error::WorkerStopped)?;
             let ready = phase("ready", async {
-                tokio::select! {
-                    result = guest.ready() => { result?; Ok(true) },
-                    _ = &mut shutdown => Ok(false),
-                    status = child.wait() => Err(firecracker_exit(status?, &work).await.into()),
-                    worker = workers.join_next() => Err(worker_error(worker)),
+                let ready = guest.ready();
+                tokio::pin!(ready);
+                loop {
+                    tokio::select! {
+                        _ = ticker.tick() => {
+                            requests.tick();
+                            if let Some(firewall) = firewall.as_mut() { firewall.sample(firewall::Interval::Regular).await; }
+                        }
+                        result = &mut ready => break { result?; Ok(true) },
+                        _ = &mut shutdown => break Ok(false),
+                        status = child.wait() => break Err(firecracker_exit(status?, &work).await.into()),
+                        worker = workers.join_next() => break Err(worker_error(worker)),
+                    }
                 }
             })
             .await?;
@@ -408,10 +423,16 @@ pub async fn run(config: Config, profile: &str, session: &str) -> Result<()> {
                 telemetry.detail = depth,
                 process.pid = pid.map(i64::from),
             }, "jail ready");
-            tokio::select! {
-                _ = &mut shutdown => Ok(()),
-                status = child.wait() => Err(firecracker_exit(status?, &work).await.into()),
-                worker = workers.join_next() => Err(worker_error(worker)),
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        requests.tick();
+                        if let Some(firewall) = firewall.as_mut() { firewall.sample(firewall::Interval::Regular).await; }
+                    },
+                    _ = &mut shutdown => break Ok(()),
+                    status = child.wait() => break Err(firecracker_exit(status?, &work).await.into()),
+                    worker = workers.join_next() => break Err(worker_error(worker)),
+                }
             }
         }
         .await;
@@ -429,6 +450,9 @@ pub async fn run(config: Config, profile: &str, session: &str) -> Result<()> {
         }
         requests.drain().await?;
         state.drain().await?;
+        if let Some(firewall) = firewall.as_mut() {
+            firewall.sample(firewall::Interval::End).await;
+        }
         result.and(stopped_vm).and(drained)
     };
     let result = tokio::task::spawn_blocking(move || {

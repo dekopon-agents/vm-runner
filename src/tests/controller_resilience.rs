@@ -46,10 +46,14 @@ async fn reaper_kube_error_or_timeout_leaves_api_serving_and_retries_next_tick()
     );
     let controller = Arc::new(controller.unwrap());
     let admission = Arc::new(tokio::sync::Semaphore::new(1));
+    let rollups = Arc::new(std::sync::Mutex::new(RequestRollups::new(
+        Origin::Controller,
+    )));
     let requests = Arc::new(Requests {
         admission: Arc::clone(&admission),
         reaper_drain: Arc::new(tokio::sync::Semaphore::new(1)),
         controller: Some(Arc::clone(&controller)),
+        rollups: Arc::clone(&rollups),
     });
     let client = TestClient::new(endpoint(
         Arc::new(State {
@@ -58,6 +62,7 @@ async fn reaper_kube_error_or_timeout_leaves_api_serving_and_retries_next_tick()
             controller: Some(controller),
         }),
         admission,
+        rollups,
     ));
     tokio::time::pause();
     let mut tasks = tokio::task::JoinSet::new();

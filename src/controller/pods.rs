@@ -234,14 +234,12 @@ impl Controller {
                     stored.pod.is_some()
                 };
                 if !registered || delete_pod(&self.pods, &name).await? {
-                    if let Some(ended) = self
-                        .sessions
-                        .lock()
-                        .expect("session registry poisoned")
-                        .remove(key)
-                    {
-                        let reason = ended.retiring.unwrap_or(EndReason::BootFailure);
-                        ended.end(reason, now());
+                    let ended = {
+                        let mut sessions = self.sessions.lock().expect("session registry poisoned");
+                        remove_retired(&mut sessions, key, now())
+                    };
+                    if let Some(ended) = ended {
+                        ended.emit();
                     }
                     self.jobs
                         .lock()
@@ -253,7 +251,11 @@ impl Controller {
             other => other,
         }
     }
-    async fn manifests(&self, session: &Session, name: &str) -> Result<(Pod, Secret), Error> {
+    pub(super) async fn manifests(
+        &self,
+        session: &Session,
+        name: &str,
+    ) -> Result<(Pod, Secret), Error> {
         let jails = self.config.jails.as_ref().ok_or(Error::Boot)?;
         let profile = &self
             .config

@@ -206,7 +206,7 @@ impl Drop for RequestSpan {
 fn span(method: &str, url: &str, host: &str) -> RequestSpan {
     RequestSpan {
         span: tracing::debug_span!(target: crate::config::Category::EgressExchange.target(), parent: None, "egress.request",
-            telemetry.detail = crate::telemetry::detail!(crate::config::Category::EgressExchange, tracing::Level::DEBUG),
+            telemetry.detail = crate::telemetry::detail!(crate::config::Category::EgressExchange),
             http.request.method = %cut(method), url.full = %safe_url(url), server.address = %cut(host),
             http.response.status_code = tracing::field::Empty, egress.decision = tracing::field::Empty, count = tracing::field::Empty),
         status: 0,
@@ -428,7 +428,7 @@ impl Engine {
         }
         .instrument(
             tracing::debug_span!(target: crate::config::Category::EgressConnect.target(), "egress.connect",
-                telemetry.detail = crate::telemetry::detail!(crate::config::Category::EgressConnect, tracing::Level::DEBUG),
+                telemetry.detail = crate::telemetry::detail!(crate::config::Category::EgressConnect),
                 server.address = %cut(host), server.port = i64::from(port)),
         )
         .await
@@ -653,8 +653,9 @@ impl Engine {
         stop: impl Future<Output = ()>,
     ) -> Result<(), Error> {
         if let Some(listener) = listeners.explicit.as_ref().or(listeners.http.as_ref()) {
+            let depth = crate::telemetry::detail!(crate::config::Category::VmLifecycle);
             tracing::info!(name: "vm_runner.boot.egress_listening", target: crate::config::Category::VmLifecycle.target(), {
-                telemetry.detail = crate::telemetry::detail!(crate::config::Category::VmLifecycle),
+                telemetry.detail = depth,
                 addr = %listener.local_addr()?,
             }, "listening");
         }

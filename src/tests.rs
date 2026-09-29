@@ -338,6 +338,8 @@ fn omit_patterns_reject_empty_and_interior_wildcards() {
     for yaml in [
         "omit:\n  headers: ['']",
         "omit:\n  queryKeys: [pre*fix]",
+        "omit:\n  headers: ['**']",
+        "omit:\n  queryKeys: [foo**]",
         "omit:\n  headers: ['bad\u{0000}name']",
     ] {
         assert!(
@@ -547,7 +549,7 @@ async fn cancelled_request_finishes_off_runtime_before_shutdown() {
 }
 #[tokio::test]
 async fn http_exporter_redacts_debug_but_delivers_headers() {
-    use opentelemetry::trace::{Tracer, TracerProvider};
+    use opentelemetry::trace::Tracer;
     use std::io::Write;
     let secret = "otlp-sentinel-secret";
     let mut headers = tempfile::NamedTempFile::new().unwrap();
@@ -585,6 +587,7 @@ async fn http_exporter_redacts_debug_but_delivers_headers() {
     let export = tokio::task::spawn_blocking(move || {
         provider
             .tracer("header-test")
+            .unwrap()
             .in_span("test.export", |_| {});
         provider.shutdown().unwrap();
     });

@@ -189,8 +189,15 @@ async fn failed_init_is_terminal_even_if_an_old_pod_answers_healthy() {
             .attributes_iter()
             .any(
                 |(key, value)| key.as_str() == "vm_runner.session.end_reason"
-                    && format!("{value:?}").contains("boot_failure")
+                    && value == &opentelemetry::logs::AnyValue::from("boot_failure")
             )
+    );
+    assert!(
+        ended[0]
+            .record
+            .attributes_iter()
+            .any(|(key, value)| key.as_str() == "telemetry.detail"
+                && value == &opentelemetry::logs::AnyValue::from("full"))
     );
     provider.shutdown().unwrap();
     assert_eq!(f.calls.load(Ordering::SeqCst), 1);

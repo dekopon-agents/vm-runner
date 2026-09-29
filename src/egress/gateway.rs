@@ -114,7 +114,7 @@ impl Decision {
 }
 pub(super) fn refusal(decision: &'static str) {
     let _span = tracing::debug_span!(target: crate::config::Category::EgressDns.target(), parent: None, "egress.dns",
-        telemetry.detail = crate::telemetry::detail!(crate::config::Category::EgressDns, tracing::Level::DEBUG), dns.question.name = "", dns.question.type = "", egress.decision = decision);
+        telemetry.detail = crate::telemetry::detail!(crate::config::Category::EgressDns), dns.question.name = "", dns.question.type = "", egress.decision = decision);
 }
 fn answer(engine: &Engine, packet: &[u8], gateway: Ipv4Addr) -> Result<Option<Vec<u8>>, Error> {
     let query = match Message::from_vec(packet) {
@@ -150,7 +150,7 @@ fn answer(engine: &Engine, packet: &[u8], gateway: Ipv4Addr) -> Result<Option<Ve
             Decision::Allowed
         };
         let span = tracing::debug_span!(target: crate::config::Category::EgressDns.target(), parent: None, "egress.dns",
-            telemetry.detail = crate::telemetry::detail!(crate::config::Category::EgressDns, tracing::Level::DEBUG), dns.question.name = %cut(&name), dns.question.type = %kind,
+            telemetry.detail = crate::telemetry::detail!(crate::config::Category::EgressDns), dns.question.name = %cut(&name), dns.question.type = %kind,
             egress.decision = decision.as_str());
         reply.add_query(question.clone());
         if !matches!(decision, Decision::Allowed) {

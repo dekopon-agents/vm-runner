@@ -13,7 +13,7 @@ use poem_openapi::{
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tracing::Instrument;
 
@@ -24,6 +24,7 @@ const SUBJECT_HASH: &str = "vm-runner/subject-hash";
 const NAME: &str = "vm-runner/name";
 const CREATED: &str = "vm-runner/created";
 const ACTIVE: &str = "vm-runner/active";
+pub(crate) const ROLLUP_INTERVAL: Duration = Duration::from_secs(60);
 #[derive(Object)]
 #[oai(deny_unknown_fields)]
 pub(crate) struct Create {
@@ -113,15 +114,28 @@ enum EndReason {
     Terminal,
 }
 enum ReapAttempt {
-    First(EndReason),
-    Retry(EndReason),
+    First,
+    Retry,
 }
-impl ReapAttempt {
-    const fn reason(self) -> EndReason {
-        match self {
-            Self::First(reason) | Self::Retry(reason) => reason,
-        }
-    }
+struct Expired {
+    key: String,
+    session_id: String,
+    pod: Option<String>,
+    attempt: ReapAttempt,
+}
+#[must_use]
+fn remove_retired(
+    sessions: &mut HashMap<String, Session>,
+    key: &str,
+    at: u64,
+) -> Option<EndRecord> {
+    let reason = sessions.get(key)?.retiring?;
+    let session = sessions.remove(key)?;
+    Some(EndRecord {
+        session,
+        reason,
+        at,
+    })
 }
 impl EndReason {
     const fn label(self) -> &'static str {
@@ -144,41 +158,21 @@ impl EndRecord {
         let session = &self.session;
         let duration = i64::try_from(self.at.saturating_sub(session.created).saturating_mul(1000))
             .unwrap_or(i64::MAX);
-        if let Some(pod) = &session.pod {
-            tracing::info!(name: "vm_runner.session.ended", target: crate::config::Category::VmLifecycle.target(), {
-                telemetry.detail = crate::telemetry::detail!(crate::config::Category::VmLifecycle),
-                vm_runner.session_id = %session.body.session_id,
-                vm_runner.subject = %session.subject,
-                vm_runner.profile = %session.body.profile,
-                vm_runner.shape = %session.body.shape,
-                vm_runner.session.end_reason = self.reason.label(),
-                duration_ms = duration,
-                k8s.pod.name = %pod,
-            }, "session ended");
-        } else {
-            tracing::info!(name: "vm_runner.session.ended", target: crate::config::Category::VmLifecycle.target(), {
-                telemetry.detail = crate::telemetry::detail!(crate::config::Category::VmLifecycle),
-                vm_runner.session_id = %session.body.session_id,
-                vm_runner.subject = %session.subject,
-                vm_runner.profile = %session.body.profile,
-                vm_runner.shape = %session.body.shape,
-                vm_runner.session.end_reason = self.reason.label(),
-                duration_ms = duration,
-            }, "session ended");
-        }
+        tracing::info!(name: "vm_runner.session.ended", target: crate::config::Category::VmLifecycle.target(), {
+            telemetry.detail = crate::telemetry::detail!(crate::config::Category::VmLifecycle),
+            vm_runner.session_id = %session.body.session_id,
+            vm_runner.subject = %session.subject,
+            vm_runner.profile = %session.body.profile,
+            vm_runner.shape = %session.body.shape,
+            vm_runner.session.end_reason = self.reason.label(),
+            duration_ms = duration,
+            k8s.pod.name = session.pod.as_deref(),
+        }, "session ended");
     }
 }
 impl Session {
     fn is_retiring(&self) -> bool {
         self.retiring.is_some()
-    }
-    fn end(self, reason: EndReason, at: u64) {
-        EndRecord {
-            session: self,
-            reason,
-            at,
-        }
-        .emit();
     }
 }
 pub(crate) struct Controller {
@@ -296,7 +290,12 @@ impl Controller {
             {
                 match delete_pod(&pods, name).await {
                     Ok(true) => {
-                        session.end(reason, now());
+                        EndRecord {
+                            session,
+                            reason,
+                            at: now(),
+                        }
+                        .emit();
                         continue;
                     }
                     Ok(false) => {}
@@ -411,7 +410,7 @@ impl Controller {
             .len();
         tracing::info!(name: "telemetry.health", target: crate::config::Category::Telemetry.target(), {
             telemetry.detail = crate::telemetry::detail!(crate::config::Category::Telemetry),
-            rollup.interval_ms = 60_000_i64,
+            rollup.interval_ms = i64::try_from(ROLLUP_INTERVAL.as_millis()).unwrap_or(i64::MAX),
             vm_runner.session.live.count = i64::try_from(count).unwrap_or(i64::MAX),
         }, "telemetry healthy");
     }
@@ -442,29 +441,34 @@ impl Controller {
                             }
                         });
                 }
-                let reason = s.retiring?;
+                s.retiring?;
                 if s.starting {
                     return None;
                 }
-                let attempt = if was_retiring {
-                    ReapAttempt::Retry(reason)
-                } else {
-                    ReapAttempt::First(reason)
-                };
-                Some((
-                    key.clone(),
-                    s.body.session_id.clone(),
-                    s.pod.clone(),
-                    attempt,
-                ))
+                Some(Expired {
+                    key: key.clone(),
+                    session_id: s.body.session_id.clone(),
+                    pod: s.pod.clone(),
+                    attempt: if was_retiring {
+                        ReapAttempt::Retry
+                    } else {
+                        ReapAttempt::First
+                    },
+                })
             })
             .collect();
-        for (key, id, pod, attempt) in expired {
+        for Expired {
+            key,
+            session_id,
+            pod,
+            attempt,
+        } in expired
+        {
             let result = async {
                 let Some(pod) = pod else { return Ok(true) };
                 match attempt {
-                    ReapAttempt::First(_) => {}
-                    ReapAttempt::Retry(_) => {
+                    ReapAttempt::First => {}
+                    ReapAttempt::Retry => {
                         let Some(current) = self.pods.get_opt(&pod).await? else {
                             return Ok(true);
                         };
@@ -478,27 +482,29 @@ impl Controller {
             .await;
             match result {
                 Ok(true) => {
-                    let live = {
+                    let (ended, live) = {
                         let mut sessions = self.sessions.lock().expect("session registry poisoned");
-                        if let Some(session) = sessions.remove(&key) {
-                            session.end(attempt.reason(), now);
-                        }
-                        sessions
+                        let ended = remove_retired(&mut sessions, &key, now);
+                        let live = sessions
                             .values()
-                            .any(|s| !s.is_retiring() && s.body.session_id == id)
+                            .any(|s| !s.is_retiring() && s.body.session_id == session_id);
+                        (ended, live)
                     };
+                    if let Some(ended) = ended {
+                        ended.emit();
+                    }
                     if !live {
                         self.jobs
                             .lock()
                             .expect("job registry poisoned")
-                            .retain(|_, job| job.session != id);
+                            .retain(|_, job| job.session != session_id);
                     }
                 }
                 Ok(false) => {}
                 Err(error) => {
                     tracing::warn!(name: "vm_runner.reap.failed", target: crate::config::Category::VmLifecycle.target(), {
                         telemetry.detail = crate::telemetry::detail!(crate::config::Category::VmLifecycle),
-                        vm_runner.session_id = %id,
+                        vm_runner.session_id = %session_id,
                         %error,
                     }, "pod cleanup failed; retrying next tick")
                 }

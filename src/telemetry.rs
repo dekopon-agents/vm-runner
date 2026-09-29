@@ -6,7 +6,7 @@ use opentelemetry_sdk::{
     logs::{BatchConfigBuilder as LogBatchConfigBuilder, BatchLogProcessor, SdkLoggerProvider},
     trace::{BatchConfigBuilder, BatchSpanProcessor, Sampler, SdkTracerProvider},
 };
-use std::{collections::HashMap, ops::Deref, time::Duration};
+use std::{collections::HashMap, time::Duration};
 use tracing_subscriber::{Layer, layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Debug, thiserror::Error)]
@@ -16,39 +16,48 @@ use tracing_subscriber::{Layer, layer::SubscriberExt, util::SubscriberInitExt};
 pub struct SetupError;
 
 #[derive(Debug)]
-pub struct Providers {
+pub struct Providers(Option<Exporters>);
+#[derive(Debug)]
+struct Exporters {
     tracer: SdkTracerProvider,
-    logger: Option<SdkLoggerProvider>,
-    detail: DetailConfig,
-}
-impl Deref for Providers {
-    type Target = SdkTracerProvider;
-    fn deref(&self) -> &Self::Target {
-        &self.tracer
-    }
+    logger: SdkLoggerProvider,
 }
 impl Providers {
     pub fn shutdown(self) -> opentelemetry_sdk::error::OTelSdkResult {
-        let logs = self.logger.map_or(Ok(()), |logger| logger.shutdown());
-        let traces = self.tracer.shutdown();
+        let Some(exporters) = self.0 else {
+            return Ok(());
+        };
+        let logs = exporters.logger.shutdown();
+        let traces = exporters.tracer.shutdown();
         logs.and(traces)
+    }
+    #[cfg(test)]
+    pub(crate) fn tracer(&self, name: &'static str) -> Option<opentelemetry_sdk::trace::SdkTracer> {
+        self.0
+            .as_ref()
+            .map(|exporters| exporters.tracer.tracer(name))
+    }
+}
+impl Detail {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Drip => "drip",
+            Self::Standard => "standard",
+            Self::Full => "full",
+        }
     }
 }
 
 macro_rules! detail {
-    ($category:expr) => {
-        $crate::telemetry::detail!($category, tracing::Level::INFO)
-    };
-    ($category:expr, $level:expr) => {{
-        let level = if tracing::enabled!(target: $category.target(), tracing::Level::TRACE) {
-            "full"
-        } else if tracing::enabled!(target: $category.target(), tracing::Level::DEBUG) {
-            "standard"
-        } else {
-            "drip"
-        };
-        let _ = tracing::enabled!(target: $category.target(), $level);
-        level
+    ($category:expr) => {{
+        // Probe INFO last so per-layer filters do not retain a failed DEBUG probe for this record.
+        let levels = [
+            ($crate::config::Detail::Full, tracing::enabled!(target: $category.target(), tracing::Level::TRACE)),
+            ($crate::config::Detail::Standard, tracing::enabled!(target: $category.target(), tracing::Level::DEBUG)),
+            ($crate::config::Detail::Drip, tracing::enabled!(target: $category.target(), tracing::Level::INFO)),
+        ];
+        levels.into_iter().find(|(_, enabled)| *enabled)
+            .map_or($crate::config::Detail::Drip, |(detail, _)| detail).label()
     }};
 }
 pub(crate) use detail;
@@ -61,6 +70,12 @@ async fn build_provider(
     config: Option<&Telemetry>,
     jail: Vec<KeyValue>,
 ) -> Result<Providers, SetupError> {
+    let Some(config) = config else {
+        return Ok(Providers(None));
+    };
+    let Some(c) = config.otlp.as_ref() else {
+        return Ok(Providers(None));
+    };
     let role = if jail.is_empty() {
         "controller"
     } else {
@@ -76,40 +91,37 @@ async fn build_provider(
         ])
         .with_attributes(jail)
         .build();
-    let detail = config.map_or_else(DetailConfig::default, |c| c.detail.clone());
-    let mut tracer = SdkTracerProvider::builder()
-        .with_resource(resource.clone())
-        .with_sampler(Sampler::AlwaysOn);
-    let mut logger = None;
-    if let Some(c) = config.and_then(|c| c.otlp.as_ref()) {
-        let mut headers = HashMap::new();
-        if let Some(path) = &c.headers_file {
-            for line in tokio::fs::read_to_string(path)
-                .await
-                .map_err(|_| SetupError)?
-                .lines()
-            {
-                let (key, value) = line.split_once(':').ok_or(SetupError)?;
-                headers.insert(key.trim().to_owned(), value.trim().to_owned());
-            }
-        }
-        let ca = match &c.ca_bundle_file {
-            Some(path) => Some(tokio::fs::read(path).await.map_err(|_| SetupError)?),
-            None => None,
-        };
-        let c = c.clone();
-        let (spans, logs) = tokio::task::spawn_blocking(move || exporters(&c, headers, ca))
+    let mut headers = HashMap::new();
+    if let Some(path) = &c.headers_file {
+        for line in tokio::fs::read_to_string(path)
             .await
-            .map_err(|_| SetupError)??;
-        let queue = if Category::ALL
-            .iter()
-            .any(|category| detail.level(*category) == Detail::Full)
+            .map_err(|_| SetupError)?
+            .lines()
         {
-            64
-        } else {
-            512
-        };
-        tracer = tracer.with_span_processor(
+            let (key, value) = line.split_once(':').ok_or(SetupError)?;
+            headers.insert(key.trim().to_owned(), value.trim().to_owned());
+        }
+    }
+    let ca = match &c.ca_bundle_file {
+        Some(path) => Some(tokio::fs::read(path).await.map_err(|_| SetupError)?),
+        None => None,
+    };
+    let c = c.clone();
+    let (spans, logs) = tokio::task::spawn_blocking(move || exporters(&c, headers, ca))
+        .await
+        .map_err(|_| SetupError)??;
+    let queue = if Category::ALL
+        .iter()
+        .any(|category| config.detail.level(*category) == Detail::Full)
+    {
+        64
+    } else {
+        512
+    };
+    let tracer = SdkTracerProvider::builder()
+        .with_resource(resource.clone())
+        .with_sampler(Sampler::AlwaysOn)
+        .with_span_processor(
             BatchSpanProcessor::builder(spans)
                 .with_batch_config(
                     BatchConfigBuilder::default()
@@ -118,28 +130,22 @@ async fn build_provider(
                         .build(),
                 )
                 .build(),
-        );
-        logger = Some(
-            SdkLoggerProvider::builder()
-                .with_resource(resource)
-                .with_log_processor(
-                    BatchLogProcessor::builder(logs)
-                        .with_batch_config(
-                            LogBatchConfigBuilder::default()
-                                .with_max_queue_size(512)
-                                .with_max_export_batch_size(128)
-                                .build(),
-                        )
+        )
+        .build();
+    let logger = SdkLoggerProvider::builder()
+        .with_resource(resource)
+        .with_log_processor(
+            BatchLogProcessor::builder(logs)
+                .with_batch_config(
+                    LogBatchConfigBuilder::default()
+                        .with_max_queue_size(512)
+                        .with_max_export_batch_size(128)
                         .build(),
                 )
                 .build(),
-        );
-    }
-    Ok(Providers {
-        tracer: tracer.build(),
-        logger,
-        detail,
-    })
+        )
+        .build();
+    Ok(Providers(Some(Exporters { tracer, logger })))
 }
 #[expect(
     clippy::map_err_ignore,
@@ -236,7 +242,8 @@ fn exporters(
     }
 }
 pub async fn init(config: Option<&Telemetry>) -> Result<Providers, SetupError> {
-    install(provider(config).await?)
+    let detail = config.map_or_else(DetailConfig::default, |c| c.detail.clone());
+    install(provider(config).await?, &detail)
 }
 pub(crate) async fn provider(config: Option<&Telemetry>) -> Result<Providers, SetupError> {
     build_provider(config, Vec::new()).await
@@ -271,6 +278,7 @@ pub(crate) async fn init_jail(
     {
         return Err(SetupError);
     }
+    let detail = config.map_or_else(DetailConfig::default, |c| c.detail.clone());
     install(
         build_provider(
             config,
@@ -282,21 +290,22 @@ pub(crate) async fn init_jail(
             ],
         )
         .await?,
+        &detail,
     )
 }
 #[expect(
     clippy::map_err_ignore,
     reason = "subscriber setup errors need no credential-bearing diagnostics"
 )]
-fn install(providers: Providers) -> Result<Providers, SetupError> {
-    let filter = providers.detail.filter();
-    let traces = providers.logger.as_ref().map(|_| {
+fn install(providers: Providers, detail: &DetailConfig) -> Result<Providers, SetupError> {
+    let filter = detail.filter();
+    let traces = providers.0.as_ref().map(|exporters| {
         tracing_opentelemetry::layer()
-            .with_tracer(providers.tracer.tracer("vm-runner"))
+            .with_tracer(exporters.tracer.tracer("vm-runner"))
             .with_filter(tracing_subscriber::EnvFilter::new(&filter))
     });
-    let logs = providers.logger.as_ref().map(|logger| {
-        opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new(logger)
+    let logs = providers.0.as_ref().map(|exporters| {
+        opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new(&exporters.logger)
             .with_filter(tracing_subscriber::EnvFilter::new(&filter))
     });
     tracing_subscriber::registry()

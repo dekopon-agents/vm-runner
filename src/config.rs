@@ -147,7 +147,7 @@ impl Detail {
         }
     }
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Category {
     VmLifecycle,
     VmExec,
@@ -169,6 +169,11 @@ impl Category {
         Self::EgressDrop,
         Self::Telemetry,
     ];
+    pub(crate) fn from_target(target: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|category| category.target() == target)
+    }
     pub(crate) const fn target(self) -> &'static str {
         match self {
             Self::VmLifecycle => "vm.lifecycle",
@@ -182,39 +187,44 @@ impl Category {
         }
     }
 }
+impl serde::Serialize for Category {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.target())
+    }
+}
 #[derive(Clone, Debug, Default, Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct DetailConfig {
     #[serde(default)]
     pub default: Detail,
     #[serde(default, deserialize_with = "categories")]
-    pub categories: BTreeMap<String, Detail>,
+    pub categories: BTreeMap<Category, Detail>,
 }
 fn categories<'de, D: Deserializer<'de>>(
     deserializer: D,
-) -> Result<BTreeMap<String, Detail>, D::Error> {
+) -> Result<BTreeMap<Category, Detail>, D::Error> {
     let entries = BTreeMap::<String, Detail>::deserialize(deserializer)?;
-    let unknown: Vec<_> = entries
-        .keys()
-        .filter(|key| {
-            !Category::ALL
-                .iter()
-                .any(|category| category.target() == key.as_str())
-        })
-        .cloned()
-        .collect();
+    let mut categories = BTreeMap::new();
+    let mut unknown = Vec::new();
+    for (key, detail) in entries {
+        if let Some(category) = Category::from_target(&key) {
+            categories.insert(category, detail);
+        } else {
+            unknown.push(key);
+        }
+    }
     if !unknown.is_empty() {
         return Err(serde::de::Error::custom(format!(
             "unknown telemetry categories: {}",
             unknown.join(", ")
         )));
     }
-    Ok(entries)
+    Ok(categories)
 }
 impl DetailConfig {
     pub(crate) fn level(&self, category: Category) -> Detail {
         self.categories
-            .get(category.target())
+            .get(&category)
             .copied()
             .unwrap_or(self.default)
     }
@@ -239,22 +249,36 @@ pub(crate) struct Omit {
     #[serde(default)]
     pub query_keys: Vec<OmitName>,
 }
-#[derive(Clone, serde::Serialize)]
-#[serde(transparent)]
-pub(crate) struct OmitName(String);
+#[derive(Clone)]
+pub(crate) enum OmitName {
+    Exact(String),
+    Prefix(String),
+}
+impl serde::Serialize for OmitName {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Exact(name) => serializer.serialize_str(name),
+            Self::Prefix(stem) => serializer.serialize_str(&format!("{stem}*")),
+        }
+    }
+}
 impl<'de> Deserialize<'de> for OmitName {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let name = String::deserialize(deserializer)?;
-        if name.is_empty()
-            || name.chars().any(char::is_control)
-            || name.trim_end_matches('*').contains('*')
-            || name == "*"
-        {
+        let name = String::deserialize(deserializer)?.to_lowercase();
+        let (stem, prefix) = match name.strip_suffix('*') {
+            Some(stem) => (stem, true),
+            None => (name.as_str(), false),
+        };
+        if stem.is_empty() || stem.contains('*') || stem.chars().any(char::is_control) {
             return Err(serde::de::Error::custom(
                 "omit name must be nonempty and may have only a trailing *",
             ));
         }
-        Ok(Self(name))
+        Ok(if prefix {
+            Self::Prefix(stem.into())
+        } else {
+            Self::Exact(stem.into())
+        })
     }
 }
 #[derive(Clone, Deserialize, serde::Serialize)]

@@ -95,7 +95,7 @@ async fn jail_vmm_has_no_new_privileges_and_confined_identity_and_egress() {
                 ready
                     .take()
                     .unwrap()
-                    .send(record["fields"]["pid"].as_u64().unwrap())
+                    .send(record["fields"]["process.pid"].as_u64().unwrap())
                     .unwrap();
             }
         }

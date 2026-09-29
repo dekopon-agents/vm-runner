@@ -186,9 +186,9 @@ impl Requests {
         loop {
             interval.tick().await;
             let now = std::time::Instant::now();
-            if last_health
-                .is_none_or(|last: std::time::Instant| now.duration_since(last).as_secs() >= 60)
-            {
+            if last_health.is_none_or(|last: std::time::Instant| {
+                now.duration_since(last) >= controller::ROLLUP_INTERVAL
+            }) {
                 controller.health();
                 last_health = Some(now);
             }
@@ -411,19 +411,21 @@ impl RequestTrace {
         match self {
             Self::Health => tracing::Span::none(),
             Self::Root => {
+                let depth = telemetry::detail!(crate::config::Category::VmExec);
                 tracing::debug_span!(target: crate::config::Category::VmExec.target(), "vm_runner.request",
                 otel.kind = "server", http.route = tracing::field::Empty,
-                telemetry.detail = telemetry::detail!(crate::config::Category::VmExec, tracing::Level::DEBUG),
+                telemetry.detail = depth,
                 vm_runner.auth.reason = tracing::field::Empty)
             }
             Self::Parent(parent) => {
+                let depth = telemetry::detail!(crate::config::Category::VmExec);
                 let span = tracing::info_span!(target: crate::config::Category::VmExec.target(), "vm_runner.request",
                     otel.kind = "server", http.route = tracing::field::Empty,
-                    telemetry.detail = telemetry::detail!(crate::config::Category::VmExec),
+                    telemetry.detail = depth,
                     vm_runner.auth.reason = tracing::field::Empty);
                 if let Err(error) = span.set_parent(parent) {
                     tracing::warn!(name: "vm_runner.request.parent_rejected", target: crate::config::Category::VmExec.target(), {
-                        telemetry.detail = telemetry::detail!(crate::config::Category::VmExec),
+                        telemetry.detail = depth,
                         %error,
                     }, "could not attach trace parent");
                 }
@@ -473,12 +475,14 @@ pub async fn shutdown_signal() {
     #[cfg(not(unix))]
     let result = tokio::signal::ctrl_c().await;
     if let Err(error) = result {
+        let depth = telemetry::detail!(crate::config::Category::VmExec);
         tracing::error!(name: "vm_runner.shutdown.signal_failed", target: crate::config::Category::VmExec.target(), {
-            telemetry.detail = telemetry::detail!(crate::config::Category::VmExec), %error,
+            telemetry.detail = depth, %error,
         }, "signal handler failed");
     }
+    let depth = telemetry::detail!(crate::config::Category::VmExec);
     tracing::info!(name: "vm_runner.shutdown.started", target: crate::config::Category::VmExec.target(), {
-        telemetry.detail = telemetry::detail!(crate::config::Category::VmExec),
+        telemetry.detail = depth,
     }, "shutdown signal received; draining requests");
 }
 #[cfg(test)]

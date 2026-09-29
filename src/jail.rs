@@ -399,16 +399,11 @@ pub async fn run(config: Config, profile: &str, session: &str) -> Result<()> {
                 return Ok(());
             }
             state.mark_ready();
-            if let Some(pid) = pid {
-                tracing::info!(name: "vm_runner.boot.ready", target: crate::config::Category::VmLifecycle.target(), {
-                    telemetry.detail = telemetry::detail!(crate::config::Category::VmLifecycle),
-                    process.pid = i64::from(pid),
-                }, "jail ready");
-            } else {
-                tracing::info!(name: "vm_runner.boot.ready", target: crate::config::Category::VmLifecycle.target(), {
-                    telemetry.detail = telemetry::detail!(crate::config::Category::VmLifecycle),
-                }, "jail ready");
-            }
+            let depth = telemetry::detail!(crate::config::Category::VmLifecycle);
+            tracing::info!(name: "vm_runner.boot.ready", target: crate::config::Category::VmLifecycle.target(), {
+                telemetry.detail = depth,
+                process.pid = pid.map(i64::from),
+            }, "jail ready");
             tokio::select! {
                 _ = &mut shutdown => Ok(()),
                 status = child.wait() => Err(firecracker_exit(status?, &work).await.into()),

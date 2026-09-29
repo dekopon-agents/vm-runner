@@ -71,28 +71,74 @@ fn create(profile: &str, name: Option<&str>) -> Create {
 const SUBJECT_VALUE: &str = "system:serviceaccount:dekopon:default";
 const POD_PATH: &str = "/api/v1/namespaces/jails/pods/jail-rebuilt";
 
-#[test]
-fn controller_telemetry_round_trips_into_strict_jail_config() {
-    let config: Config = serde_yaml_ng::from_str(
-        &include_str!("../../examples/vm-runner.yaml")
-            .replace("headers: []", "headers: [Authorization, x-token*]")
-            .replace("queryKeys: []", "queryKeys: [apiKey, source*]"),
-    )
-    .unwrap();
-    let telemetry = config.telemetry.as_ref().unwrap();
-    let encoded = serde_json::to_value(telemetry).unwrap();
-    let mut jail_config: Value =
-        serde_yaml_ng::from_str(include_str!("../../examples/vm-runner.yaml")).unwrap();
-    jail_config["telemetry"] = encoded.clone();
-    let decoded: Config = serde_json::from_value(jail_config).unwrap();
-    let decoded = decoded.telemetry.unwrap();
-    assert_eq!(decoded.detail.filter(), telemetry.detail.filter());
-    assert!(decoded.otlp.is_none());
+#[tokio::test]
+async fn controller_telemetry_round_trips_into_strict_jail_config() {
+    use base64::Engine;
+    let mut config = config();
+    let telemetry: crate::config::Telemetry = serde_yaml_ng::from_str(
+        "detail:\n  default: full\n  categories:\n    egress.exchange: drip\nomit:\n  headers: [Authorization, x-token*]\n  queryKeys: [apiKey, source*]",
+    ).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let token_file = directory.path().join("token");
+    let token = format!(
+        "{}.{}.AA",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r#"{"alg":"RS256"}"#),
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+            json!({
+                "sub":"system:serviceaccount:test:controller",
+                "iss":"https://kubernetes.default.svc", "aud":["vm-runner-jail"]
+            })
+            .to_string()
+        )
+    );
+    tokio::fs::write(&token_file, token).await.unwrap();
+    let mutable = Arc::get_mut(&mut config).unwrap();
+    mutable.telemetry = Some(telemetry);
+    mutable.jails.as_mut().unwrap().token_file = token_file;
+    let (service, mut mock) = tower_test::mock::pair();
+    let (controller, ()) = tokio::join!(
+        Controller::new(config, Client::new(service, "jails")),
+        reply(
+            &mut mock,
+            "GET",
+            "/api/v1/namespaces/jails/pods",
+            json!({"apiVersion":"v1","kind":"PodList","metadata":{},"items":[]})
+        )
+    );
+    let controller = controller.unwrap();
+    let Created::New(Json(body)) = controller
+        .create(SUBJECT_VALUE, create("travel", None))
+        .unwrap()
+    else {
+        panic!("new session")
+    };
+    let (_, session) = controller.session(SUBJECT_VALUE, &body.session_id).unwrap();
+    let (_, secret) = controller.manifests(&session, "jail-test").await.unwrap();
+    let files = secret.data.unwrap();
+    let jail: Config = serde_yaml_ng::from_slice(&files["config.json"].0).unwrap();
+    let encoded = serde_json::to_value(jail.telemetry.as_ref().unwrap()).unwrap();
+    assert_eq!(
+        jail.telemetry
+            .as_ref()
+            .unwrap()
+            .detail
+            .level(crate::config::Category::EgressExchange),
+        crate::config::Detail::Drip
+    );
+    assert_eq!(
+        jail.telemetry
+            .as_ref()
+            .unwrap()
+            .detail
+            .level(crate::config::Category::VmExec),
+        crate::config::Detail::Full
+    );
+    assert!(jail.telemetry.as_ref().unwrap().otlp.is_none());
     assert_eq!(
         encoded["omit"]["headers"],
-        json!(["Authorization", "x-token*"])
+        json!(["authorization", "x-token*"])
     );
-    assert_eq!(encoded["omit"]["queryKeys"], json!(["apiKey", "source*"]));
+    assert_eq!(encoded["omit"]["queryKeys"], json!(["apikey", "source*"]));
 }
 #[tokio::test]
 async fn stuck_delete_ends_the_session_only_when_the_pod_is_gone() {
@@ -111,11 +157,12 @@ async fn stuck_delete_ends_the_session_only_when_the_pod_is_gone() {
         controller.reap(1901).with_subscriber(dispatch.clone()),
         reply(&mut mock, "DELETE", POD_PATH, pod())
     );
-    let mut terminating = pod();
-    terminating["metadata"]["deletionTimestamp"] = json!("2026-09-25T00:10:00Z");
     tokio::join!(
         controller.reap(1902).with_subscriber(dispatch.clone()),
-        reply(&mut mock, "GET", POD_PATH, terminating)
+        async {
+            reply(&mut mock, "GET", POD_PATH, pod()).await;
+            reply(&mut mock, "DELETE", POD_PATH, pod()).await;
+        }
     );
     assert!(
         exporter
@@ -182,9 +229,10 @@ async fn session_lifecycle_and_health_are_typed_logs_with_detail() {
         );
     }
     assert!(logs.iter().all(|log| {
-        log.record
-            .attributes_iter()
-            .any(|(key, _)| key.as_str() == "telemetry.detail")
+        log.record.attributes_iter().any(|(key, value)| {
+            key.as_str() == "telemetry.detail"
+                && value == &opentelemetry::logs::AnyValue::from("full")
+        })
     }));
     let ended = logs
         .iter()
@@ -196,7 +244,7 @@ async fn session_lifecycle_and_health_are_typed_logs_with_detail() {
             .attributes_iter()
             .any(
                 |(key, value)| key.as_str() == "vm_runner.session.end_reason"
-                    && format!("{value:?}").contains("max_seconds")
+                    && value == &opentelemetry::logs::AnyValue::from("max_seconds")
             )
     );
     let health = logs
@@ -207,13 +255,17 @@ async fn session_lifecycle_and_health_are_typed_logs_with_detail() {
         health
             .record
             .attributes_iter()
-            .any(|(key, _)| key.as_str() == "rollup.interval_ms")
+            .any(|(key, value)| key.as_str() == "rollup.interval_ms"
+                && value == &opentelemetry::logs::AnyValue::Int(60_000))
     );
     assert!(
         health
             .record
             .attributes_iter()
-            .any(|(key, _)| key.as_str() == "vm_runner.session.live.count")
+            .any(
+                |(key, value)| key.as_str() == "vm_runner.session.live.count"
+                    && value == &opentelemetry::logs::AnyValue::Int(1)
+            )
     );
 }
 

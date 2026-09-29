@@ -245,7 +245,8 @@ pub(super) async fn read(
         })
     }
     .instrument(tracing::info_span!(
-        "vm_runner.artifact.read",
+        target: crate::config::Category::VmExec.target(), "vm_runner.artifact.read",
+        telemetry.detail = crate::telemetry::detail!(crate::config::Category::VmExec),
         error.message = tracing::field::Empty
     ))
     .await

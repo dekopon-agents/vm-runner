@@ -77,7 +77,8 @@ async fn phase<T>(
         result
     }
     .instrument(tracing::info_span!(
-        "vm_runner.boot",
+        target: crate::config::Category::VmLifecycle.target(), "vm_runner.boot",
+        telemetry.detail = telemetry::detail!(crate::config::Category::VmLifecycle),
         boot.phase = name,
         error.message = tracing::field::Empty
     ))
@@ -398,7 +399,16 @@ pub async fn run(config: Config, profile: &str, session: &str) -> Result<()> {
                 return Ok(());
             }
             state.mark_ready();
-            tracing::info!(pid, "jail ready");
+            if let Some(pid) = pid {
+                tracing::info!(name: "vm_runner.boot.ready", target: crate::config::Category::VmLifecycle.target(), {
+                    telemetry.detail = telemetry::detail!(crate::config::Category::VmLifecycle),
+                    process.pid = i64::from(pid),
+                }, "jail ready");
+            } else {
+                tracing::info!(name: "vm_runner.boot.ready", target: crate::config::Category::VmLifecycle.target(), {
+                    telemetry.detail = telemetry::detail!(crate::config::Category::VmLifecycle),
+                }, "jail ready");
+            }
             tokio::select! {
                 _ = &mut shutdown => Ok(()),
                 status = child.wait() => Err(firecracker_exit(status?, &work).await.into()),

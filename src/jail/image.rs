@@ -164,7 +164,8 @@ pub async fn fetch(digest: &str, cache: &Path) -> Result<()> {
     tokio::task::spawn_blocking(move || {
         tracing::dispatcher::with_default(&dispatch, || {
             let span = tracing::info_span!(
-                "vm_runner.boot",
+                target: crate::config::Category::VmLifecycle.target(), "vm_runner.boot",
+                telemetry.detail = crate::telemetry::detail!(crate::config::Category::VmLifecycle),
                 boot.phase = "fetch",
                 error.message = tracing::field::Empty
             );

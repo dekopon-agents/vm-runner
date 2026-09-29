@@ -68,7 +68,7 @@ impl Controller {
             .lock()
             .expect("session registry poisoned")
             .iter()
-            .find(|(_, s)| !s.retiring && s.subject == subject && s.body.session_id == id)
+            .find(|(_, s)| !s.is_retiring() && s.subject == subject && s.body.session_id == id)
             .map(|(key, session)| (key.clone(), session.clone()))
             .ok_or(Error::NotFound)
     }
@@ -118,7 +118,7 @@ impl Controller {
             .lock()
             .expect("session registry poisoned")
             .get_mut(key)
-            .filter(|s| !s.retiring)
+            .filter(|s| !s.is_retiring())
         {
             stored.active = active;
         } else {
@@ -131,7 +131,7 @@ impl Controller {
             .lock()
             .expect("session registry poisoned")
             .get_mut(key)
-            .filter(|s| !s.retiring)
+            .filter(|s| !s.is_retiring())
             .ok_or(Error::NotFound)?
             .starting = true;
         // A reap may retire this entry, but cannot free it while pod creation is in flight.
@@ -151,7 +151,7 @@ impl Controller {
                     .lock()
                     .expect("session registry poisoned")
                     .get_mut(key)
-                    .filter(|s| !s.retiring)
+                    .filter(|s| !s.is_retiring())
                 {
                     stored.pod = Some(name.clone());
                 } else {
@@ -170,7 +170,7 @@ impl Controller {
                     .lock()
                     .expect("session registry poisoned")
                     .get(key)
-                    .is_none_or(|s| s.retiring)
+                    .is_none_or(|s| s.is_retiring())
                 {
                     return Err(Error::Boot);
                 }
@@ -211,7 +211,7 @@ impl Controller {
                 .lock()
                 .expect("session registry poisoned")
                 .get_mut(key)
-                .filter(|s| !s.retiring)
+                .filter(|s| !s.is_retiring())
             {
                 stored.body.state = SessionState::Ready;
             } else {
@@ -220,7 +220,8 @@ impl Controller {
             Ok(address)
         }
         .instrument(tracing::info_span!(
-            "vm_runner.boot",
+            target: crate::config::Category::VmLifecycle.target(), "vm_runner.boot",
+            telemetry.detail = crate::telemetry::detail!(crate::config::Category::VmLifecycle),
             vm_runner.session_id = session.body.session_id
         ))
         .await;
@@ -229,14 +230,19 @@ impl Controller {
                 let registered = {
                     let mut sessions = self.sessions.lock().expect("session registry poisoned");
                     let stored = sessions.get_mut(key).ok_or(Error::NotFound)?;
-                    stored.retiring = true;
+                    stored.retiring.get_or_insert(EndReason::BootFailure);
                     stored.pod.is_some()
                 };
                 if !registered || delete_pod(&self.pods, &name).await? {
-                    self.sessions
+                    if let Some(ended) = self
+                        .sessions
                         .lock()
                         .expect("session registry poisoned")
-                        .remove(key);
+                        .remove(key)
+                    {
+                        let reason = ended.retiring.unwrap_or(EndReason::BootFailure);
+                        ended.end(reason, now());
+                    }
                     self.jobs
                         .lock()
                         .expect("job registry poisoned")
@@ -287,10 +293,10 @@ impl Controller {
         }
         let mut files = BTreeMap::new();
         let mut telemetry = serde_json::to_value(&self.config.telemetry)?;
-        if let Some(t) = &self.config.telemetry {
+        if let Some(t) = self.config.telemetry.as_ref().and_then(|t| t.otlp.as_ref()) {
             for (key, filename, path) in [
-                ("caBundleFile", "otlp-ca", &t.otlp.ca_bundle_file),
-                ("headersFile", "otlp-headers", &t.otlp.headers_file),
+                ("caBundleFile", "otlp-ca", &t.ca_bundle_file),
+                ("headersFile", "otlp-headers", &t.headers_file),
             ] {
                 if let Some(path) = path {
                     files.insert(

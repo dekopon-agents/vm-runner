@@ -34,7 +34,7 @@ impl Drop for Daemon {
 #[tokio::test]
 async fn sigterm_and_sigint_drain_both_roles_before_telemetry_shutdown() {
     // A watchdog only: all ordering below comes from socket and channel acknowledgements.
-    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+    tokio::time::timeout(std::time::Duration::from_secs(60), async {
         for role in ["egress", "serve"] {
             for signal in ["-TERM", "-INT"] {
                 let collector = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -91,27 +91,35 @@ telemetry:
                 let request = if role == "egress" {
                     "GET http://denied.invalid/ HTTP/1.1\r\nHost: denied.invalid\r\nConnection: close\r\n\r\n"
                 } else {
-                    "GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+                    "GET /v1/sessions HTTP/1.1\r\nHost: localhost\r\ntraceparent: 00-0123456789abcdef0123456789abcdef-0123456789abcdef-01\r\nConnection: close\r\n\r\n"
                 };
                 stream.write_all(request.as_bytes()).await.unwrap();
                 let (received, exported) = oneshot::channel();
                 let release = Arc::new(Semaphore::new(0));
                 let held = Arc::clone(&release);
                 let receiver = tokio::spawn(async move {
-                    let (socket, _) = collector.accept().await.unwrap();
-                    let received = std::sync::Mutex::new(Some(received));
-                    hyper::server::conn::http1::Builder::new().keep_alive(false)
-                        .serve_connection(TokioIo::new(socket), service_fn(|req: Request<Incoming>| {
-                            let received = received.lock().unwrap().take().unwrap();
-                            let held = Arc::clone(&held);
-                            async move {
-                                assert_eq!(req.uri().path(), "/v1/traces");
-                                let body = req.into_body().collect().await.unwrap().to_bytes();
-                                received.send(body).unwrap();
-                                let _permit = held.acquire().await.unwrap();
-                                Ok::<_, Infallible>(Response::new(Empty::<Bytes>::new()))
-                            }
-                        })).await.unwrap();
+                    let received = Arc::new(std::sync::Mutex::new(Some(received)));
+                    loop {
+                        let (socket, _) = collector.accept().await.unwrap();
+                        let received_for_service = Arc::clone(&received);
+                        let held = Arc::clone(&held);
+                        hyper::server::conn::http1::Builder::new().keep_alive(false)
+                            .serve_connection(TokioIo::new(socket), service_fn(move |req: Request<Incoming>| {
+                                let received = Arc::clone(&received_for_service);
+                                let held = Arc::clone(&held);
+                                async move {
+                                    let trace = req.uri().path() == "/v1/traces";
+                                    assert!(trace || req.uri().path() == "/v1/logs");
+                                    let body = req.into_body().collect().await.unwrap().to_bytes();
+                                    if trace {
+                                        received.lock().unwrap().take().unwrap().send(body).unwrap();
+                                        let _permit = held.acquire().await.unwrap();
+                                    }
+                                    Ok::<_, Infallible>(Response::new(Empty::<Bytes>::new()))
+                                }
+                            })).await.unwrap();
+                        if received.lock().unwrap().is_none() { break; }
+                    }
                 });
                 let body = exported.await.unwrap();
                 let name = if role == "egress" { "egress.request" } else { "vm_runner.request" };
@@ -123,7 +131,7 @@ telemetry:
                 receiver.await.unwrap();
                 let mut response = String::new();
                 stream.read_to_string(&mut response).await.unwrap();
-                assert!(response.starts_with(if role == "egress" { "HTTP/1.1 403 " } else { "HTTP/1.1 200 " }), "{response}");
+                assert!(response.starts_with(if role == "egress" { "HTTP/1.1 403 " } else { "HTTP/1.1 401 " }), "{response}");
                 let status = tokio::task::spawn_blocking(move || daemon.0.wait().unwrap()).await.unwrap();
                 assert!(status.success(), "{role} did not drain and shut telemetry down: {status}");
                 logs.join().unwrap();

@@ -116,8 +116,11 @@ impl Reload {
                 Some(config)
             }
             Err(error) => {
-                tracing::warn_span!("vm_runner.tls.reload", error = %error)
-                    .in_scope(|| tracing::warn!("retaining previous TLS certificate/key pair"));
+                tracing::warn_span!(target: crate::config::Category::VmLifecycle.target(), "vm_runner.tls.reload",
+                    telemetry.detail = crate::telemetry::detail!(crate::config::Category::VmLifecycle), error = %error)
+                    .in_scope(|| tracing::warn!(name: "vm_runner.tls.reload_failed", target: crate::config::Category::VmLifecycle.target(), {
+                        telemetry.detail = crate::telemetry::detail!(crate::config::Category::VmLifecycle),
+                    }, "retaining previous TLS certificate/key pair"));
                 None
             }
         }

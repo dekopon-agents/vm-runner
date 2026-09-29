@@ -11,7 +11,7 @@ pub mod telemetry;
 mod tls;
 use auth::{Authenticator, Reason};
 use config::{Config, Quota};
-use opentelemetry::propagation::TextMapPropagator;
+use opentelemetry::{propagation::TextMapPropagator, trace::TraceContextExt};
 use poem::{Endpoint, EndpointExt, IntoResponse, Request};
 use poem_openapi::{
     ApiResponse, Object, OpenApi, OpenApiService,
@@ -63,8 +63,9 @@ impl Api {
                 "jails are not configured",
             )));
         };
-        tracing::info_span!("vm_runner.session.create")
-            .in_scope(|| controller.create(&subject, body.0))
+        tracing::info_span!(target: crate::config::Category::VmLifecycle.target(), "vm_runner.session.create",
+            telemetry.detail = telemetry::detail!(crate::config::Category::VmLifecycle))
+        .in_scope(|| controller.create(&subject, body.0))
     }
     #[oai(path = "/v1/whoami", method = "get")]
     async fn whoami(
@@ -181,8 +182,16 @@ impl Requests {
             return std::future::pending().await;
         };
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+        let mut last_health = None;
         loop {
             interval.tick().await;
+            let now = std::time::Instant::now();
+            if last_health
+                .is_none_or(|last: std::time::Instant| now.duration_since(last).as_secs() >= 60)
+            {
+                controller.health();
+                last_health = Some(now);
+            }
             let permit = std::sync::Arc::clone(&self.reaper_drain)
                 .acquire_owned()
                 .await?;
@@ -283,16 +292,7 @@ fn endpoint(
                 tokio::task::spawn_blocking(move || {
                     let _permit = permit;
                     tracing::dispatcher::with_default(&dispatch, || {
-                        let span = tracing::info_span!(
-                            "vm_runner.request",
-                            otel.kind = "server",
-                            vm_runner.auth.reason = tracing::field::Empty
-                        );
-                        let parent = opentelemetry_sdk::propagation::TraceContextPropagator::new()
-                            .extract(&telemetry::Headers(req.headers()));
-                        if let Err(error) = span.set_parent(parent) {
-                            tracing::warn!(%error, "could not attach trace parent");
-                        }
+                        let span = request_span(&req);
                         runtime.block_on(
                             async move {
                                 if req.uri().path() != "/healthz"
@@ -325,7 +325,9 @@ fn endpoint(
                                         Err(error) => return Err(error.into()),
                                     }
                                 }
-                                ep.call(req).await
+                                let result = ep.call(req).await;
+                                record_route(&result);
+                                result
                             }
                             .instrument(span),
                         )
@@ -370,17 +372,15 @@ pub(crate) fn traced(
             tokio::task::spawn_blocking(move || {
                 let _permit = permit;
                 tracing::dispatcher::with_default(&dispatch, || {
-                    let span = tracing::info_span!(
-                        "vm_runner.request",
-                        otel.kind = "server",
-                        vm_runner.auth.reason = tracing::field::Empty
-                    );
-                    let parent = opentelemetry_sdk::propagation::TraceContextPropagator::new()
-                        .extract(&telemetry::Headers(req.headers()));
-                    if let Err(error) = span.set_parent(parent) {
-                        tracing::warn!(%error, "could not attach trace parent");
-                    }
-                    runtime.block_on(ep.call(req).instrument(span))
+                    let span = request_span(&req);
+                    runtime.block_on(
+                        async move {
+                            let result = ep.call(req).await;
+                            record_route(&result);
+                            result
+                        }
+                        .instrument(span),
+                    )
                 })
             })
             .await
@@ -388,6 +388,74 @@ pub(crate) fn traced(
         }
     });
     (endpoint, requests)
+}
+enum RequestTrace {
+    Health,
+    Root,
+    Parent(opentelemetry::Context),
+}
+impl RequestTrace {
+    fn from_request(req: &poem::Request) -> Self {
+        if req.uri().path() == "/healthz" && req.method() == poem::http::Method::GET {
+            return Self::Health;
+        }
+        let parent = opentelemetry_sdk::propagation::TraceContextPropagator::new()
+            .extract(&telemetry::Headers(req.headers()));
+        if parent.span().span_context().is_valid() {
+            Self::Parent(parent)
+        } else {
+            Self::Root
+        }
+    }
+    fn span(self) -> tracing::Span {
+        match self {
+            Self::Health => tracing::Span::none(),
+            Self::Root => {
+                tracing::debug_span!(target: crate::config::Category::VmExec.target(), "vm_runner.request",
+                otel.kind = "server", http.route = tracing::field::Empty,
+                telemetry.detail = telemetry::detail!(crate::config::Category::VmExec, tracing::Level::DEBUG),
+                vm_runner.auth.reason = tracing::field::Empty)
+            }
+            Self::Parent(parent) => {
+                let span = tracing::info_span!(target: crate::config::Category::VmExec.target(), "vm_runner.request",
+                    otel.kind = "server", http.route = tracing::field::Empty,
+                    telemetry.detail = telemetry::detail!(crate::config::Category::VmExec),
+                    vm_runner.auth.reason = tracing::field::Empty);
+                if let Err(error) = span.set_parent(parent) {
+                    tracing::warn!(name: "vm_runner.request.parent_rejected", target: crate::config::Category::VmExec.target(), {
+                        telemetry.detail = telemetry::detail!(crate::config::Category::VmExec),
+                        %error,
+                    }, "could not attach trace parent");
+                }
+                span
+            }
+        }
+    }
+}
+fn request_span(req: &poem::Request) -> tracing::Span {
+    RequestTrace::from_request(req).span()
+}
+fn record_route(result: &poem::Result<poem::Response>) {
+    let pattern = match result {
+        Ok(response) => response.data::<poem::PathPattern>(),
+        Err(error) => error.data::<poem::PathPattern>(),
+    };
+    let route = pattern.map_or_else(
+        || "unmatched".to_owned(),
+        |p| {
+            p.0.split('/')
+                .map(|part| {
+                    if let Some(param) = part.strip_prefix(':') {
+                        format!("{{{param}}}")
+                    } else {
+                        part.to_owned()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("/")
+        },
+    );
+    tracing::Span::current().record("http.route", route);
 }
 /// Stop admission on either terminal interruption or pod termination.
 /// Callers drain their requests before shutting down (and flushing) telemetry.
@@ -405,9 +473,13 @@ pub async fn shutdown_signal() {
     #[cfg(not(unix))]
     let result = tokio::signal::ctrl_c().await;
     if let Err(error) = result {
-        tracing::error!(%error, "signal handler failed");
+        tracing::error!(name: "vm_runner.shutdown.signal_failed", target: crate::config::Category::VmExec.target(), {
+            telemetry.detail = telemetry::detail!(crate::config::Category::VmExec), %error,
+        }, "signal handler failed");
     }
-    tracing::info!("shutdown signal received; draining requests");
+    tracing::info!(name: "vm_runner.shutdown.started", target: crate::config::Category::VmExec.target(), {
+        telemetry.detail = telemetry::detail!(crate::config::Category::VmExec),
+    }, "shutdown signal received; draining requests");
 }
 #[cfg(test)]
 mod tests;

@@ -113,8 +113,8 @@ impl Decision {
     }
 }
 pub(super) fn refusal(decision: &'static str) {
-    let _span = tracing::info_span!(parent: None, "egress.dns",
-        dns.question.name = "", dns.question.type = "", egress.decision = decision);
+    let _span = tracing::debug_span!(target: crate::config::Category::EgressDns.target(), parent: None, "egress.dns",
+        telemetry.detail = crate::telemetry::detail!(crate::config::Category::EgressDns, tracing::Level::DEBUG), dns.question.name = "", dns.question.type = "", egress.decision = decision);
 }
 fn answer(engine: &Engine, packet: &[u8], gateway: Ipv4Addr) -> Result<Option<Vec<u8>>, Error> {
     let query = match Message::from_vec(packet) {
@@ -149,8 +149,8 @@ fn answer(engine: &Engine, packet: &[u8], gateway: Ipv4Addr) -> Result<Option<Ve
         } else {
             Decision::Allowed
         };
-        let span = tracing::info_span!(parent: None, "egress.dns",
-            dns.question.name = %cut(&name), dns.question.type = %kind,
+        let span = tracing::debug_span!(target: crate::config::Category::EgressDns.target(), parent: None, "egress.dns",
+            telemetry.detail = crate::telemetry::detail!(crate::config::Category::EgressDns, tracing::Level::DEBUG), dns.question.name = %cut(&name), dns.question.type = %kind,
             egress.decision = decision.as_str());
         reply.add_query(question.clone());
         if !matches!(decision, Decision::Allowed) {
@@ -205,7 +205,9 @@ pub(super) async fn udp(
         let (length, peer) = match received {
             Ok(received) => received,
             Err(error) => {
-                tracing::warn!(%error, "egress DNS receive failed");
+                tracing::warn!(name: "egress.dns.receive_failed", target: crate::config::Category::EgressDns.target(), {
+                    telemetry.detail = crate::telemetry::detail!(crate::config::Category::EgressDns), %error,
+                }, "egress DNS receive failed");
                 refusal("refused:protocol");
                 // A broken socket must not spin; shutdown still interrupts retries.
                 tokio::select! {
@@ -223,11 +225,17 @@ pub(super) async fn udp(
             Ok(Some(response)) => {
                 // The query already emitted its one DNS span, including on send failure.
                 if let Err(error) = socket.send_to(&response, peer).await {
-                    tracing::warn!(%error, %peer, "egress DNS send failed");
+                    tracing::warn!(name: "egress.dns.send_failed", target: crate::config::Category::EgressDns.target(), {
+                        telemetry.detail = crate::telemetry::detail!(crate::config::Category::EgressDns), %error, %peer,
+                    }, "egress DNS send failed");
                 }
             }
             Ok(None) => (),
-            Err(error) => tracing::warn!(%error, "egress DNS datagram refused"),
+            Err(error) => {
+                tracing::warn!(name: "egress.dns.datagram_refused", target: crate::config::Category::EgressDns.target(), {
+                telemetry.detail = crate::telemetry::detail!(crate::config::Category::EgressDns), %error,
+            }, "egress DNS datagram refused")
+            }
         }
     }
 }

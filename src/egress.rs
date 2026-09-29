@@ -205,7 +205,10 @@ impl Drop for RequestSpan {
 }
 fn span(method: &str, url: &str, host: &str) -> RequestSpan {
     RequestSpan {
-        span: tracing::info_span!(parent: None, "egress.request", http.request.method = %cut(method), url.full = %safe_url(url), server.address = %cut(host), http.response.status_code = tracing::field::Empty, egress.decision = tracing::field::Empty, count = tracing::field::Empty),
+        span: tracing::debug_span!(target: crate::config::Category::EgressExchange.target(), parent: None, "egress.request",
+            telemetry.detail = crate::telemetry::detail!(crate::config::Category::EgressExchange, tracing::Level::DEBUG),
+            http.request.method = %cut(method), url.full = %safe_url(url), server.address = %cut(host),
+            http.response.status_code = tracing::field::Empty, egress.decision = tracing::field::Empty, count = tracing::field::Empty),
         status: 0,
         decision: "allowed",
     }
@@ -230,7 +233,9 @@ fn forward_response(
             reply(StatusCode::FORBIDDEN, format!("egress refused: {host}"))
         }
         Err(error) => {
-            tracing::warn!(%error, "egress upstream failed");
+            tracing::warn!(name: "egress.exchange.failed", target: crate::config::Category::EgressExchange.target(), {
+                telemetry.detail = crate::telemetry::detail!(crate::config::Category::EgressExchange), %error,
+            }, "egress upstream failed");
             reply(StatusCode::BAD_GATEWAY, String::new())
         }
     }
@@ -422,7 +427,9 @@ impl Engine {
             }
         }
         .instrument(
-            tracing::info_span!("egress.connect", server.address = %cut(host), server.port = port),
+            tracing::debug_span!(target: crate::config::Category::EgressConnect.target(), "egress.connect",
+                telemetry.detail = crate::telemetry::detail!(crate::config::Category::EgressConnect, tracing::Level::DEBUG),
+                server.address = %cut(host), server.port = i64::from(port)),
         )
         .await
     }
@@ -530,7 +537,9 @@ impl Engine {
                             reply(StatusCode::OK, String::new())
                         }
                         Err(error) => {
-                            tracing::error!(%error, "egress upgrade lock poisoned");
+                            tracing::error!(name: "egress.exchange.lock_poisoned", target: crate::config::Category::EgressExchange.target(), {
+                                telemetry.detail = crate::telemetry::detail!(crate::config::Category::EgressExchange), %error,
+                            }, "egress upgrade lock poisoned");
                             reply(StatusCode::INTERNAL_SERVER_ERROR, String::new())
                         }
                     }
@@ -644,7 +653,10 @@ impl Engine {
         stop: impl Future<Output = ()>,
     ) -> Result<(), Error> {
         if let Some(listener) = listeners.explicit.as_ref().or(listeners.http.as_ref()) {
-            tracing::info!(addr = %listener.local_addr()?, "listening");
+            tracing::info!(name: "vm_runner.boot.egress_listening", target: crate::config::Category::VmLifecycle.target(), {
+                telemetry.detail = crate::telemetry::detail!(crate::config::Category::VmLifecycle),
+                addr = %listener.local_addr()?,
+            }, "listening");
         }
         let (dns_stop, stopped) = watch::channel(false);
         let mut dns_worker = listeners.udp.take().map(|(socket, address)| {
@@ -691,7 +703,9 @@ impl Engine {
                     let (stream, peer, protocol) = match accepted {
                         Ok(accepted) => accepted,
                         Err(error) => {
-                            tracing::warn!(%error, "egress accept failed");
+                            tracing::warn!(name: "egress.connect.accept_failed", target: crate::config::Category::EgressConnect.target(), {
+                                telemetry.detail = crate::telemetry::detail!(crate::config::Category::EgressConnect), %error,
+                            }, "egress accept failed");
                             continue;
                         }
                     };
@@ -715,7 +729,9 @@ impl Engine {
                         let mut record = ConnectionRecord::default();
                         if let Err(error) = runtime.block_on(engine.bounded_connection(Box::new(stream), &mut record, started, protocol)) {
                             if matches!(protocol, gateway::Protocol::Http) { record.failed(); }
-                            tracing::warn!(%error, "egress connection failed");
+                            tracing::warn!(name: "egress.connect.failed", target: crate::config::Category::EgressConnect.target(), {
+                                telemetry.detail = crate::telemetry::detail!(crate::config::Category::EgressConnect), %error,
+                            }, "egress connection failed");
                         }
                     }));
                 }

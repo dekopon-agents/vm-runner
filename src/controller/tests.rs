@@ -71,6 +71,152 @@ fn create(profile: &str, name: Option<&str>) -> Create {
 const SUBJECT_VALUE: &str = "system:serviceaccount:dekopon:default";
 const POD_PATH: &str = "/api/v1/namespaces/jails/pods/jail-rebuilt";
 
+#[test]
+fn controller_telemetry_round_trips_into_strict_jail_config() {
+    let config: Config = serde_yaml_ng::from_str(
+        &include_str!("../../examples/vm-runner.yaml")
+            .replace("headers: []", "headers: [Authorization, x-token*]")
+            .replace("queryKeys: []", "queryKeys: [apiKey, source*]"),
+    )
+    .unwrap();
+    let telemetry = config.telemetry.as_ref().unwrap();
+    let encoded = serde_json::to_value(telemetry).unwrap();
+    let mut jail_config: Value =
+        serde_yaml_ng::from_str(include_str!("../../examples/vm-runner.yaml")).unwrap();
+    jail_config["telemetry"] = encoded.clone();
+    let decoded: Config = serde_json::from_value(jail_config).unwrap();
+    let decoded = decoded.telemetry.unwrap();
+    assert_eq!(decoded.detail.filter(), telemetry.detail.filter());
+    assert!(decoded.otlp.is_none());
+    assert_eq!(
+        encoded["omit"]["headers"],
+        json!(["Authorization", "x-token*"])
+    );
+    assert_eq!(encoded["omit"]["queryKeys"], json!(["apiKey", "source*"]));
+}
+#[tokio::test]
+async fn stuck_delete_ends_the_session_only_when_the_pod_is_gone() {
+    use tracing::instrument::WithSubscriber;
+    use tracing_subscriber::layer::SubscriberExt;
+    let (controller, mut mock) = setup(vec![pod()]).await;
+    let exporter = opentelemetry_sdk::logs::InMemoryLogExporter::default();
+    let provider = opentelemetry_sdk::logs::SdkLoggerProvider::builder()
+        .with_simple_exporter(exporter.clone())
+        .build();
+    let dispatch =
+        tracing::Dispatch::new(tracing_subscriber::registry().with(
+            opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new(&provider),
+        ));
+    tokio::join!(
+        controller.reap(1901).with_subscriber(dispatch.clone()),
+        reply(&mut mock, "DELETE", POD_PATH, pod())
+    );
+    let mut terminating = pod();
+    terminating["metadata"]["deletionTimestamp"] = json!("2026-09-25T00:10:00Z");
+    tokio::join!(
+        controller.reap(1902).with_subscriber(dispatch.clone()),
+        reply(&mut mock, "GET", POD_PATH, terminating)
+    );
+    assert!(
+        exporter
+            .get_emitted_logs()
+            .unwrap()
+            .iter()
+            .all(|log| log.record.event_name() != Some("vm_runner.session.ended"))
+    );
+    tokio::join!(
+        controller.reap(1903).with_subscriber(dispatch),
+        gone(&mut mock, "GET", POD_PATH)
+    );
+    let logs = exporter.get_emitted_logs().unwrap();
+    assert_eq!(
+        logs.iter()
+            .filter(|log| log.record.event_name() == Some("vm_runner.session.ended"))
+            .count(),
+        1
+    );
+    provider.shutdown().unwrap();
+}
+#[tokio::test]
+async fn session_lifecycle_and_health_are_typed_logs_with_detail() {
+    use tracing::instrument::WithSubscriber;
+    use tracing_subscriber::layer::SubscriberExt;
+    let (controller, _mock) = setup(vec![]).await;
+    let exporter = opentelemetry_sdk::logs::InMemoryLogExporter::default();
+    let provider = opentelemetry_sdk::logs::SdkLoggerProvider::builder()
+        .with_simple_exporter(exporter.clone())
+        .build();
+    let dispatch =
+        tracing::Dispatch::new(tracing_subscriber::registry().with(
+            opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new(&provider),
+        ));
+    let id = tracing::dispatcher::with_default(&dispatch, || {
+        let Created::New(Json(session)) = controller
+            .create(SUBJECT_VALUE, create("travel", None))
+            .unwrap()
+        else {
+            panic!("new session")
+        };
+        controller.health();
+        session.session_id
+    });
+    let created = controller.sessions.lock().unwrap()[&id].created;
+    controller
+        .reap(created + 1801)
+        .with_subscriber(dispatch)
+        .await;
+    let logs = exporter.get_emitted_logs().unwrap();
+    provider.shutdown().unwrap();
+    assert!(!logs.is_empty(), "no logs emitted");
+    for event in [
+        "vm_runner.session.started",
+        "vm_runner.session.ended",
+        "telemetry.health",
+    ] {
+        assert_eq!(
+            logs.iter()
+                .filter(|log| log.record.event_name() == Some(event))
+                .count(),
+            1,
+            "{event}"
+        );
+    }
+    assert!(logs.iter().all(|log| {
+        log.record
+            .attributes_iter()
+            .any(|(key, _)| key.as_str() == "telemetry.detail")
+    }));
+    let ended = logs
+        .iter()
+        .find(|log| log.record.event_name() == Some("vm_runner.session.ended"))
+        .unwrap();
+    assert!(
+        ended
+            .record
+            .attributes_iter()
+            .any(
+                |(key, value)| key.as_str() == "vm_runner.session.end_reason"
+                    && format!("{value:?}").contains("max_seconds")
+            )
+    );
+    let health = logs
+        .iter()
+        .find(|log| log.record.event_name() == Some("telemetry.health"))
+        .unwrap();
+    assert!(
+        health
+            .record
+            .attributes_iter()
+            .any(|(key, _)| key.as_str() == "rollup.interval_ms")
+    );
+    assert!(
+        health
+            .record
+            .attributes_iter()
+            .any(|(key, _)| key.as_str() == "vm_runner.session.live.count")
+    );
+}
+
 #[tokio::test]
 async fn named_sessions_are_lazy_subject_scoped_and_profile_consistent() {
     let (controller, _mock) = setup(vec![]).await;
@@ -188,7 +334,7 @@ async fn rebuild_recovers_named_sessions_and_reaper_deletes_expired_pods() {
             .lock()
             .unwrap()
             .values()
-            .all(|s| s.retiring)
+            .all(|s| s.is_retiring())
     );
     tokio::join!(controller.reap(501), gone(&mut mock, "GET", POD_PATH));
     assert!(controller.sessions.lock().unwrap().is_empty());
@@ -219,7 +365,7 @@ async fn rebuild_deletes_terminal_pods_instead_of_leaking_them() {
             .lock()
             .unwrap()
             .values()
-            .all(|s| s.retiring)
+            .all(|s| s.is_retiring())
     );
 }
 #[tokio::test]
@@ -392,7 +538,7 @@ async fn maximum_lifetime_reaps_even_an_active_session() {
             .lock()
             .unwrap()
             .values()
-            .all(|s| s.retiring)
+            .all(|s| s.is_retiring())
     );
     tokio::join!(controller.reap(1901), gone(&mut mock, "GET", POD_PATH));
     assert!(controller.sessions.lock().unwrap().is_empty());

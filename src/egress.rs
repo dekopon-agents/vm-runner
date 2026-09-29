@@ -38,6 +38,7 @@ use tokio_rustls::{
 use tracing::Instrument;
 
 mod gateway;
+mod observability;
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
 type HttpBody = UnsyncBoxBody<Bytes, Error>;

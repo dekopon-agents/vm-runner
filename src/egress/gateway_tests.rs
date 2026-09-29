@@ -39,6 +39,7 @@ impl Gateway {
             exporter.clone(),
             exporter,
             Some(listeners),
+            Default::default(),
         )
         .await;
         Self {
@@ -169,10 +170,10 @@ async fn gateway_ports_classify_http_tls_and_refuse_non_protocol_streams() {
         assert_eq!(stream.read(&mut [0; 1]).await.unwrap(), 0);
     }
     let spans = gateway.proxy.finish().await;
-    for url in ["http://localhost/plain", "https://localhost/tls"] {
+    for (scheme, path) in [("http", "/plain"), ("https", "/tls")] {
         let requests: Vec<_> = spans
             .iter()
-            .filter(|s| attribute(s, "url.full", url))
+            .filter(|s| attribute(s, "url.scheme", scheme) && attribute(s, "url.path", path))
             .collect();
         assert_eq!(requests.len(), 2);
         for request in requests {
@@ -182,7 +183,7 @@ async fn gateway_ports_classify_http_tls_and_refuse_non_protocol_streams() {
     assert_eq!(
         spans
             .iter()
-            .filter(|s| attribute(s, "egress.decision", "refused:protocol"))
+            .filter(|s| attribute(s, "egress.exchange.outcome", "protocol-error"))
             .count(),
         2
     );
@@ -252,14 +253,11 @@ async fn tcp_dns_shares_the_http_connection_cap_but_udp_needs_no_connection_slot
         1
     );
     drop(first);
-    let spans = gateway.proxy.finish().await;
-    let refused: i64 = spans
+    let (_, logs) = gateway.proxy.finish_with_logs().await;
+    let refused: i64 = logs
         .iter()
-        .filter(|s| attribute(s, "egress.decision", "refused:connections"))
-        .map(|s| match span_attribute(s, "count").unwrap() {
-            opentelemetry::Value::I64(n) => *n,
-            other => panic!("{other:?}"),
-        })
+        .filter(|log| log.record.event_name() == Some("egress.refused"))
+        .filter_map(|log| log_int(log, "egress.refused.count"))
         .sum();
     assert_eq!(refused, 3);
 }
@@ -343,6 +341,8 @@ async fn datagram_fault_keeps_serving(port_zero: bool, receive_error: bool) {
         ca: Ca::new().unwrap().0,
         egress: local_egress(),
         tls: client_config(RootCertStore::empty()).unwrap(),
+        omit: Default::default(),
+        rollups: Arc::new(Mutex::new(Rollups::new())),
     };
     let exporter = InMemorySpanExporter::default();
     let provider = SdkTracerProvider::builder()
@@ -583,6 +583,8 @@ async fn tcp_dns_idle_closes_at_ten_seconds_and_activity_resets_the_deadline() {
         ca: Ca::new().unwrap().0,
         egress: local_egress(),
         tls: client_config(RootCertStore::empty()).unwrap(),
+        omit: Default::default(),
+        rollups: Arc::new(Mutex::new(Rollups::new())),
     };
     let exporter = InMemorySpanExporter::default();
     let provider = SdkTracerProvider::builder()

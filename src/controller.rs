@@ -13,7 +13,7 @@ use poem_openapi::{
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{SystemTime, UNIX_EPOCH},
 };
 use tracing::Instrument;
 
@@ -24,7 +24,6 @@ const SUBJECT_HASH: &str = "vm-runner/subject-hash";
 const NAME: &str = "vm-runner/name";
 const CREATED: &str = "vm-runner/created";
 const ACTIVE: &str = "vm-runner/active";
-pub(crate) const ROLLUP_INTERVAL: Duration = Duration::from_secs(60);
 #[derive(Object)]
 #[oai(deny_unknown_fields)]
 pub(crate) struct Create {
@@ -410,7 +409,7 @@ impl Controller {
             .len();
         tracing::info!(name: "telemetry.health", target: crate::config::Category::Telemetry.target(), {
             telemetry.detail = crate::telemetry::detail!(crate::config::Category::Telemetry),
-            rollup.interval_ms = i64::try_from(ROLLUP_INTERVAL.as_millis()).unwrap_or(i64::MAX),
+            rollup.interval_ms = i64::try_from(crate::ROLLUP_INTERVAL.as_millis()).unwrap_or(i64::MAX),
             vm_runner.session.live.count = i64::try_from(count).unwrap_or(i64::MAX),
         }, "telemetry healthy");
     }

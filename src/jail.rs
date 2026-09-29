@@ -316,6 +316,10 @@ pub async fn run(config: Config, profile: &str, session: &str) -> Result<()> {
         .find(|(name, _)| name == &selected.shape)
         .ok_or(Error::Profile)?
         .1;
+    let omit = config
+        .telemetry
+        .as_ref()
+        .map_or_else(Default::default, |telemetry| telemetry.omit.clone());
     let provider = telemetry::init_jail(
         config.telemetry.as_ref(),
         profile,
@@ -369,7 +373,7 @@ pub async fn run(config: Config, profile: &str, session: &str) -> Result<()> {
             let (ca, pem) = phase("ca", async { crate::egress::Ca::new() }).await?;
             network(&work).await?;
             let gateway =
-                phase("gateway", crate::egress::Gateway::bind(selected.egress, ca)).await?;
+                phase("gateway", crate::egress::Gateway::bind(selected.egress, ca, omit)).await?;
             let handle = tokio::runtime::Handle::current();
             let dispatch = tracing::dispatcher::get_default(Clone::clone);
             workers.spawn_blocking(move || {

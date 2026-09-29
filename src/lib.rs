@@ -9,6 +9,7 @@ pub mod guest;
 pub mod jail;
 pub mod telemetry;
 mod tls;
+pub(crate) const ROLLUP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 use auth::{Authenticator, Reason};
 use config::{Config, Quota};
 use opentelemetry::{propagation::TextMapPropagator, trace::TraceContextExt};
@@ -186,9 +187,9 @@ impl Requests {
         loop {
             interval.tick().await;
             let now = std::time::Instant::now();
-            if last_health.is_none_or(|last: std::time::Instant| {
-                now.duration_since(last) >= controller::ROLLUP_INTERVAL
-            }) {
+            if last_health
+                .is_none_or(|last: std::time::Instant| now.duration_since(last) >= ROLLUP_INTERVAL)
+            {
                 controller.health();
                 last_health = Some(now);
             }

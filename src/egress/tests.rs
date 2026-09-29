@@ -3,7 +3,10 @@ use super::*;
 mod gateway_tests;
 use crate::tests::span_attribute;
 use opentelemetry::{KeyValue, trace::TracerProvider};
-use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider, SpanData};
+use opentelemetry_sdk::{
+    logs::{InMemoryLogExporter, SdkLoggerProvider, in_memory_exporter::LogDataWithResource},
+    trace::{InMemorySpanExporter, SdkTracerProvider, SpanData},
+};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
@@ -21,6 +24,8 @@ struct Proxy {
     exporter: InMemorySpanExporter,
     logs: Arc<std::fs::File>,
     provider: SdkTracerProvider,
+    log_exporter: InMemoryLogExporter,
+    log_provider: SdkLoggerProvider,
     stop: tokio::sync::oneshot::Sender<()>,
     task: tokio::task::JoinHandle<Result<(), Error>>,
 }
@@ -35,16 +40,15 @@ impl Proxy {
         Self::configured(roots, local_egress()).await
     }
     async fn configured(roots: RootCertStore, egress: Egress) -> Self {
-        let exporter = InMemorySpanExporter::default();
-        Self::with_exporter(roots, egress, exporter.clone(), exporter).await
+        Self::configured_with_omit(roots, egress, Default::default()).await
     }
-    async fn with_exporter(
+    async fn configured_with_omit(
         roots: RootCertStore,
         egress: Egress,
-        exporter: InMemorySpanExporter,
-        processor_exporter: impl opentelemetry_sdk::trace::SpanExporter + 'static,
+        omit: crate::config::Omit,
     ) -> Self {
-        Self::with_listeners(roots, egress, exporter, processor_exporter, None).await
+        let exporter = InMemorySpanExporter::default();
+        Self::with_listeners(roots, egress, exporter.clone(), exporter, None, omit).await
     }
     async fn with_listeners(
         roots: RootCertStore,
@@ -52,6 +56,7 @@ impl Proxy {
         exporter: InMemorySpanExporter,
         processor_exporter: impl opentelemetry_sdk::trace::SpanExporter + 'static,
         listeners: Option<gateway::Listeners>,
+        omit: crate::config::Omit,
     ) -> Self {
         let (ca, pem) = Ca::new().unwrap();
         let mut trust = RootCertStore::empty();
@@ -73,6 +78,10 @@ impl Proxy {
             .with_simple_exporter(processor_exporter)
             .build();
         let logs = Arc::new(tempfile::tempfile().unwrap());
+        let log_exporter = InMemoryLogExporter::default();
+        let log_provider = SdkLoggerProvider::builder()
+            .with_simple_exporter(log_exporter.clone())
+            .build();
         let subscriber = tracing_subscriber::registry()
             .with(
                 tracing_subscriber::fmt::layer()
@@ -80,12 +89,19 @@ impl Proxy {
                     .with_writer(Arc::clone(&logs))
                     .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE),
             )
-            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("egress-test")));
+            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("egress-test")))
+            .with(
+                opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new(
+                    &log_provider,
+                ),
+            );
         let (stop, stopped) = tokio::sync::oneshot::channel();
         let engine = Arc::new(Engine {
             ca,
             egress,
             tls: client_config(roots).unwrap(),
+            omit,
+            rollups: Arc::new(Mutex::new(Rollups::new())),
         });
         let task = tokio::spawn(
             engine
@@ -100,6 +116,8 @@ impl Proxy {
             exporter,
             logs,
             provider,
+            log_exporter,
+            log_provider,
             stop,
             task,
         }
@@ -121,6 +139,9 @@ impl Proxy {
         stream
     }
     async fn finish(self) -> Vec<SpanData> {
+        self.finish_with_logs().await.0
+    }
+    async fn finish_with_logs(self) -> (Vec<SpanData>, Vec<LogDataWithResource>) {
         self.stop.send(()).unwrap();
         self.task.await.unwrap().unwrap();
         let spans = self.exporter.get_finished_spans().unwrap();
@@ -129,7 +150,7 @@ impl Proxy {
                 assert!(span_attribute(span, kv.key.as_str()).is_some());
             }
             if span.name == "egress.request" {
-                for key in ["http.response.status_code", "egress.decision"] {
+                for key in ["egress.exchange.outcome", "egress.decision"] {
                     assert!(
                         span_attribute(span, key).is_some(),
                         "missing {key}: {span:?}"
@@ -137,8 +158,10 @@ impl Proxy {
                 }
             }
         }
+        let logs = self.log_exporter.get_emitted_logs().unwrap();
         self.provider.shutdown().unwrap();
-        spans
+        self.log_provider.shutdown().unwrap();
+        (spans, logs)
     }
 }
 async fn exchange(mut stream: impl AsyncRead + AsyncWrite + Unpin, request: &str) -> (u16, String) {
@@ -153,6 +176,17 @@ async fn exchange(mut stream: impl AsyncRead + AsyncWrite + Unpin, request: &str
 }
 fn attribute(span: &SpanData, key: &str, value: &str) -> bool {
     span_attribute(span, key) == Some(&opentelemetry::Value::from(value.to_owned()))
+}
+fn log_int(log: &LogDataWithResource, key: &str) -> Option<i64> {
+    log.record.attributes_iter().find_map(|(name, value)| {
+        if name.as_str() != key {
+            return None;
+        }
+        match value {
+            opentelemetry::logs::AnyValue::Int(n) => Some(*n),
+            _ => None,
+        }
+    })
 }
 async fn upstream(listener: TcpListener, tls: Option<Arc<ServerConfig>>) -> hyper::HeaderMap {
     let (stream, _) = listener.accept().await.unwrap();
@@ -214,16 +248,22 @@ async fn allowed_https_strips_trace_headers_and_exports_exactly_one_final_status
         .find(|s| attribute(s, "http.request.method", "GET"))
         .unwrap();
     for (key, value) in [
-        ("url.full", format!("https://localhost:{port}/proof")),
-        ("server.address", "localhost".into()),
-        ("egress.decision", "allowed".into()),
+        ("url.scheme", "https"),
+        ("url.path", "/proof"),
+        ("server.address", "localhost"),
+        ("egress.decision", "allowed"),
     ] {
-        assert!(attribute(request, key, &value));
+        assert!(attribute(request, key, value));
     }
     assert_eq!(
         span_attribute(request, "http.response.status_code"),
         Some(&200_i64.into())
     );
+    assert_eq!(
+        span_attribute(request, "server.port"),
+        Some(&i64::from(port).into())
+    );
+    assert!(attribute(request, "egress.exchange.outcome", "completed"));
     assert_eq!(request.name, "egress.request");
     assert_eq!(
         request.parent_span_id,
@@ -243,7 +283,16 @@ async fn disallowed_plain_host_gets_exact_refusal_and_span_without_connecting() 
     let proxy = Proxy::new(RootCertStore::empty()).await;
     let stream = TcpStream::connect(proxy.addr).await.unwrap();
     assert_eq!(exchange(stream, "GET http://denied.invalid/ HTTP/1.1\r\nHost: denied.invalid\r\nConnection: close\r\n\r\n").await, (403, "egress refused: denied.invalid".into()));
-    let spans = proxy.finish().await;
+    let (spans, logs) = proxy.finish_with_logs().await;
+    assert!(
+        logs.iter()
+            .any(|log| log.record.event_name() == Some("egress.refused"))
+    );
+    assert!(
+        !logs
+            .iter()
+            .any(|log| log.record.event_name() == Some("egress.exchange.failed"))
+    );
     assert!(
         spans
             .iter()
@@ -259,11 +308,21 @@ async fn telemetry_keeps_public_url_components_without_credentials() {
     let stream = TcpStream::connect(proxy.addr).await.unwrap();
     assert_eq!(exchange(stream, "GET http://sentinel-user:sentinel-password@denied.invalid/path?access_token=sentinel-token&api-key=sentinel-api&x-api-key=sentinel-xapi&q=public HTTP/1.1\r\nHost: denied.invalid\r\nConnection: close\r\n\r\n").await.0, 403);
     let spans = proxy.finish().await;
-    assert!(spans.iter().any(|s| attribute(
-        s,
-        "url.full",
-        "http://denied.invalid/path?access_token=%5Bredacted%5D&api-key=%5Bredacted%5D&x-api-key=%5Bredacted%5D&q=public"
-    )));
+    let request = spans
+        .iter()
+        .find(|s| attribute(s, "url.path", "/path"))
+        .unwrap();
+    assert!(attribute(request, "url.scheme", "http"));
+    let keys = span_attribute(request, "url.query.keys").unwrap();
+    let values = span_attribute(request, "url.query.values").unwrap();
+    assert_eq!(
+        keys.to_string(),
+        r#"["access_token","api-key","x-api-key","q"]"#
+    );
+    assert_eq!(
+        values.to_string(),
+        r#"["[redacted]","[redacted]","[redacted]","public"]"#
+    );
     assert!(!format!("{spans:?}").contains("sentinel"));
     logs.rewind().unwrap();
     let mut text = String::new();
@@ -389,7 +448,7 @@ async fn non_http_tunnel_bytes_close_with_protocol_refusal() {
     let spans = proxy.finish().await;
     let refusal = spans
         .iter()
-        .find(|s| attribute(s, "egress.decision", "refused:protocol"))
+        .find(|s| attribute(s, "egress.exchange.outcome", "protocol-error"))
         .unwrap();
     assert!(attribute(refusal, "server.address", "localhost"));
     assert!(!spans.iter().any(|s| s.name == "egress.connect"));
@@ -416,10 +475,11 @@ async fn failed_tls_handshake_records_known_sni() {
     let spans = proxy.finish().await;
     let refusals: Vec<_> = spans
         .iter()
-        .filter(|s| attribute(s, "egress.decision", "refused:protocol"))
+        .filter(|s| attribute(s, "egress.exchange.outcome", "certificate-rejected"))
         .collect();
     assert_eq!(refusals.len(), 1);
     assert!(attribute(refusals[0], "server.address", "evil.invalid"));
+    assert!(span_attribute(refusals[0], "http.response.status_code").is_none());
 }
 #[tokio::test]
 async fn truncated_upstream_body_does_not_relabel_allowed_request_as_protocol_refusal() {
@@ -459,7 +519,7 @@ async fn truncated_upstream_body_does_not_relabel_allowed_request_as_protocol_re
     assert!(attribute(requests[0], "egress.decision", "allowed"));
 }
 #[tokio::test]
-async fn cancelled_upstream_request_exports_exactly_one_zero_status_without_protocol_refusal() {
+async fn cancelled_upstream_request_exports_abandoned_without_a_status() {
     let exporter = InMemorySpanExporter::default();
     let provider = SdkTracerProvider::builder()
         .with_simple_exporter(exporter.clone())
@@ -484,6 +544,8 @@ async fn cancelled_upstream_request_exports_exactly_one_zero_status_without_prot
             ca: Ca::new().unwrap().0,
             egress: local_egress(),
             tls: client_config(RootCertStore::empty()).unwrap(),
+            omit: Default::default(),
+            rollups: Arc::new(Mutex::new(Rollups::new())),
         };
         let (mut client, stream) = tokio::io::duplex(4096);
         client.write_all(format!("GET http://localhost:{port}/ HTTP/1.1\r\nHost: localhost:{port}\r\n\r\n").as_bytes()).await.unwrap();
@@ -496,7 +558,7 @@ async fn cancelled_upstream_request_exports_exactly_one_zero_status_without_prot
         // A deadline cancels by dropping this same future; no clock is needed.
         drop(connection);
         assert!(record.request.get());
-        record.failed();
+        record.failed(&engine.rollups);
         assert_eq!(client.read(&mut [0; 1]).await.unwrap(), 0);
     }
     .with_subscriber(subscriber)
@@ -509,10 +571,12 @@ async fn cancelled_upstream_request_exports_exactly_one_zero_status_without_prot
         .collect();
     assert_eq!(requests.len(), 1, "{requests:?}");
     assert!(attribute(requests[0], "egress.decision", "allowed"));
-    assert_eq!(
-        span_attribute(requests[0], "http.response.status_code"),
-        Some(&0_i64.into())
-    );
+    assert!(span_attribute(requests[0], "http.response.status_code").is_none());
+    assert!(attribute(
+        requests[0],
+        "egress.exchange.outcome",
+        "abandoned"
+    ));
     provider.shutdown().unwrap();
 }
 #[tokio::test]
@@ -686,6 +750,8 @@ async fn idle_connection_closes_only_after_inactivity_and_reads_reset_the_deadli
         ca: Ca::new().unwrap().0,
         egress: local_egress(),
         tls: client_config(RootCertStore::empty()).unwrap(),
+        omit: Default::default(),
+        rollups: Arc::new(Mutex::new(Rollups::new())),
     };
     let (mut client, stream) = tokio::io::duplex(4096);
     let mut record = ConnectionRecord::default();
@@ -717,6 +783,8 @@ async fn maximum_lifetime_closes_even_an_active_connection() {
         ca: Ca::new().unwrap().0,
         egress,
         tls: client_config(RootCertStore::empty()).unwrap(),
+        omit: Default::default(),
+        rollups: Arc::new(Mutex::new(Rollups::new())),
     };
     let (mut client, stream) = tokio::io::duplex(4096);
     let mut record = ConnectionRecord::default();
@@ -749,14 +817,16 @@ async fn connection_cap_closes_the_next_socket_and_exports_a_refusal() {
     let mut excess = TcpStream::connect(proxy.addr).await.unwrap();
     assert_eq!(excess.read(&mut [0; 1]).await.unwrap(), 0);
     drop(first);
-    let spans = proxy.finish().await;
-    let refusals: Vec<_> = spans
+    let (_, logs) = proxy.finish_with_logs().await;
+    let refusals: Vec<_> = logs
         .iter()
-        .filter(|s| attribute(s, "egress.decision", "refused:connections"))
+        .filter(|log| {
+            log.record.event_name() == Some("egress.refused")
+                && log_int(log, "egress.refused.count").is_some()
+        })
         .collect();
     assert_eq!(refusals.len(), 1);
-    assert_eq!(refusals[0].name, "egress.request");
-    assert_eq!(span_attribute(refusals[0], "count"), Some(&1_i64.into()));
+    assert_eq!(log_int(refusals[0], "egress.refused.count"), Some(1));
 }
 #[test]
 fn span_attribute_assertions_reject_duplicate_values_of_any_type() {
@@ -767,7 +837,16 @@ fn span_attribute_assertions_reject_duplicate_values_of_any_type() {
     let subscriber = tracing_subscriber::registry()
         .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("duplicate-test")));
     tracing::subscriber::with_default(subscriber, || {
-        drop(span("GET", "http://localhost/", "localhost"))
+        let mut exchange = Exchange::new(
+            "localhost",
+            Some(80),
+            "GET",
+            "http://localhost/",
+            &[],
+            Arc::new(Mutex::new(Rollups::new())),
+        );
+        exchange.status(StatusCode::OK);
+        let Recorded = exchange.finish(Outcome::Completed, None);
     });
     let original = exporter.get_finished_spans().unwrap().pop().unwrap();
     for duplicate in [
@@ -802,11 +881,22 @@ async fn failed_and_empty_dns_answers_have_distinct_single_refusal_decisions() {
             let error = resolved_addresses(answer, &[]).unwrap_err();
             assert_eq!(error.is::<DnsFailed>(), decision == "refused:dns");
             assert_eq!(error.is::<AddressRefused>(), decision == "refused:address");
-            let mut span = span("GET", "http://allowed.invalid/", "allowed.invalid");
-            let response = forward_response(Err(error), &mut span, "allowed.invalid");
-            assert_eq!(response.status(), StatusCode::FORBIDDEN);
-            span.status = response.status().as_u16().into();
-            assert_eq!(span.decision, decision);
+            let mut exchange = Exchange::new(
+                "allowed.invalid",
+                Some(80),
+                "GET",
+                "http://allowed.invalid/",
+                &[],
+                Arc::new(Mutex::new(Rollups::new())),
+            );
+            exchange.status(StatusCode::FORBIDDEN);
+            let reason = if error.is::<DnsFailed>() {
+                Refusal::Dns
+            } else {
+                Refusal::Address
+            };
+            assert_eq!(reason.decision(), decision);
+            let Recorded = exchange.finish(Outcome::Refused(reason), None);
         }
     });
     let spans = exporter.get_finished_spans().unwrap();
@@ -821,63 +911,180 @@ async fn failed_and_empty_dns_answers_have_distinct_single_refusal_decisions() {
     }
     provider.shutdown().unwrap();
 }
-#[derive(Debug)]
-struct SlowRefusalExporter {
-    inner: InMemorySpanExporter,
-    started: Arc<tokio::sync::Notify>,
-    release: Arc<tokio::sync::Notify>,
-    stalled: std::sync::atomic::AtomicBool,
-}
-impl opentelemetry_sdk::trace::SpanExporter for SlowRefusalExporter {
-    async fn export(&self, spans: Vec<SpanData>) -> opentelemetry_sdk::error::OTelSdkResult {
-        if spans
-            .iter()
-            .any(|s| attribute(s, "egress.decision", "refused:connections"))
-            && !self.stalled.swap(true, std::sync::atomic::Ordering::SeqCst)
-        {
-            self.started.notify_one();
-            self.release.notified().await;
-        }
-        self.inner.export(spans).await
-    }
-}
 #[tokio::test]
-async fn stalled_refusal_export_does_not_park_accept_and_shutdown_drains_coalesced_counts() {
-    let exporter = InMemorySpanExporter::default();
-    let started = Arc::new(tokio::sync::Notify::new());
-    let release = Arc::new(tokio::sync::Notify::new());
-    let slow = SlowRefusalExporter {
-        inner: exporter.clone(),
-        started: Arc::clone(&started),
-        release: Arc::clone(&release),
-        stalled: std::sync::atomic::AtomicBool::new(false),
-    };
+async fn connection_cap_counts_all_refused_sockets_before_shutdown() {
     let mut egress = local_egress();
     egress.max_connections = 1.try_into().unwrap();
-    let proxy = Proxy::with_exporter(RootCertStore::empty(), egress, exporter, slow).await;
+    let proxy = Proxy::configured(RootCertStore::empty(), egress).await;
     let first = proxy.tunnel(443).await;
-    let accepted = tokio::time::timeout(Duration::from_secs(5), async {
+    for _ in 0..3 {
         let mut excess = TcpStream::connect(proxy.addr).await.unwrap();
         assert_eq!(excess.read(&mut [0; 1]).await.unwrap(), 0);
-        started.notified().await;
-        for _ in 0..2 {
-            let mut excess = TcpStream::connect(proxy.addr).await.unwrap();
-            assert_eq!(excess.read(&mut [0; 1]).await.unwrap(), 0);
-        }
-    })
-    .await;
-    // Release even on timeout so a failing regression cannot strand a blocking worker.
-    release.notify_one();
+    }
     drop(first);
-    let spans = proxy.finish().await;
-    assert!(accepted.is_ok(), "accept loop awaited the stalled exporter");
-    let refusals: Vec<_> = spans
+    let (_, logs) = proxy.finish_with_logs().await;
+    let refusals: Vec<_> = logs
         .iter()
-        .filter(|s| attribute(s, "egress.decision", "refused:connections"))
+        .filter(|log| log.record.event_name() == Some("egress.refused"))
+        .filter_map(|log| log_int(log, "egress.refused.count"))
         .collect();
-    assert_eq!(refusals.len(), 2);
-    assert_eq!(span_attribute(refusals[0], "count"), Some(&1_i64.into()));
-    assert_eq!(span_attribute(refusals[1], "count"), Some(&2_i64.into()));
+    assert_eq!(refusals.iter().sum::<i64>(), 3);
+    assert!(refusals.len() <= 2);
+}
+#[tokio::test]
+async fn connect_is_its_own_completed_tunnel_record_without_zero_status() {
+    let proxy = Proxy::new(RootCertStore::empty()).await;
+    drop(proxy.tunnel(443).await);
+    let (spans, logs) = proxy.finish_with_logs().await;
+    let tunnel = spans
+        .iter()
+        .find(|s| attribute(s, "http.request.method", "CONNECT"))
+        .unwrap();
+    assert!(attribute(tunnel, "egress.exchange.outcome", "tunnel"));
+    assert_eq!(
+        span_attribute(tunnel, "http.response.status_code"),
+        Some(&200_i64.into())
+    );
+    assert!(
+        spans
+            .iter()
+            .all(|s| span_attribute(s, "http.response.status_code") != Some(&0_i64.into()))
+    );
+    assert_eq!(
+        logs.iter()
+            .filter(|log| log.record.event_name() == Some("egress.exchange.rollup"))
+            .filter_map(|log| log_int(log, "egress.exchange.count"))
+            .sum::<i64>(),
+        1
+    );
+}
+#[tokio::test]
+async fn client_error_completes_and_emits_a_failure_log() {
+    let proxy = Proxy::new(RootCertStore::empty()).await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let peer = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        hyper::server::conn::http1::Builder::new()
+            .keep_alive(false)
+            .serve_connection(
+                TokioIo::new(stream),
+                service_fn(|_: Request<Incoming>| async {
+                    Ok::<_, Infallible>(
+                        Response::builder()
+                            .status(404)
+                            .body(Full::new(Bytes::new()))
+                            .unwrap(),
+                    )
+                }),
+            )
+            .await
+            .unwrap();
+    });
+    let stream = TcpStream::connect(proxy.addr).await.unwrap();
+    assert_eq!(exchange(stream, &format!("GET http://localhost:{port}/missing HTTP/1.1\r\nHost: localhost:{port}\r\nConnection: close\r\n\r\n")).await.0, 404);
+    peer.await.unwrap();
+    let (spans, logs) = proxy.finish_with_logs().await;
+    let request = spans
+        .iter()
+        .find(|s| attribute(s, "http.request.method", "GET"))
+        .unwrap();
+    assert!(attribute(request, "egress.exchange.outcome", "completed"));
+    assert_eq!(
+        span_attribute(request, "http.response.body.size"),
+        Some(&0_i64.into())
+    );
+    let failed = logs
+        .iter()
+        .find(|log| log.record.event_name() == Some("egress.exchange.failed"))
+        .unwrap();
+    assert_eq!(log_int(failed, "http.response.status_code"), Some(404));
+    assert!(
+        failed
+            .record
+            .attributes_iter()
+            .any(|(key, value)| key.as_str() == "egress.exchange.outcome"
+                && value == &opentelemetry::logs::AnyValue::from("completed"))
+    );
+}
+#[tokio::test]
+async fn sixty_fifth_exchange_key_folds_into_star_without_losing_counts() {
+    let proxy = Proxy::new(RootCertStore::empty()).await;
+    for n in 0..65 {
+        let host = format!("denied-{n}.invalid");
+        let stream = TcpStream::connect(proxy.addr).await.unwrap();
+        assert_eq!(
+            exchange(
+                stream,
+                &format!(
+                    "GET http://{host}/ HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
+                )
+            )
+            .await
+            .0,
+            403
+        );
+    }
+    let (spans, logs) = proxy.finish_with_logs().await;
+    assert_eq!(
+        spans.iter().filter(|s| s.name == "egress.request").count(),
+        65
+    );
+    let rows: Vec<_> = logs
+        .iter()
+        .filter(|log| log.record.event_name() == Some("egress.exchange.rollup"))
+        .collect();
+    assert_eq!(rows.len(), 64);
+    assert_eq!(
+        rows.iter()
+            .filter_map(|row| log_int(row, "egress.exchange.count"))
+            .sum::<i64>(),
+        65
+    );
+    assert!(rows.iter().any(|row| {
+        row.record.attributes_iter().any(|(key, value)| {
+            key.as_str() == "server.address" && value == &opentelemetry::logs::AnyValue::from("*")
+        })
+    }));
+}
+#[tokio::test]
+async fn omitted_and_credential_pairs_keep_parallel_arrays_aligned_without_secrets() {
+    let omit = serde_yaml_ng::from_str("headers: ['x-drop*']\nqueryKeys: ['drop*']").unwrap();
+    let proxy = Proxy::configured_with_omit(RootCertStore::empty(), local_egress(), omit).await;
+    let stream = TcpStream::connect(proxy.addr).await.unwrap();
+    assert_eq!(exchange(stream, "GET http://denied.invalid/a?drop-one=sentinel-omitted&access_token=sentinel-token&q=public HTTP/1.1\r\nHost: denied.invalid\r\nAuthorization: Bearer sentinel-secret\r\nCookie: sentinel-cookie\r\nX-Drop-One: sentinel-omitted\r\nConnection: close\r\n\r\n").await.0, 403);
+    let (spans, logs) = proxy.finish_with_logs().await;
+    let request = spans
+        .iter()
+        .find(|s| attribute(s, "url.path", "/a"))
+        .unwrap();
+    assert_eq!(
+        span_attribute(request, "url.query.keys")
+            .unwrap()
+            .to_string(),
+        r#"["access_token","q"]"#
+    );
+    assert_eq!(
+        span_attribute(request, "url.query.values")
+            .unwrap()
+            .to_string(),
+        r#"["[redacted]","public"]"#
+    );
+    let names = span_attribute(request, "http.request.header.names")
+        .unwrap()
+        .to_string();
+    let values = span_attribute(request, "http.request.header.values")
+        .unwrap()
+        .to_string();
+    assert!(names.contains("authorization") && names.contains("cookie"));
+    assert!(!names.contains("x-drop"));
+    assert!(values.contains("[redacted]"));
+    assert!(!format!("{spans:?}{logs:?}").contains("sentinel"));
+    assert!(
+        logs.iter()
+            .filter(|log| log.record.event_name() == Some("egress.exchange.noise"))
+            .all(|log| !format!("{log:?}").contains("drop"))
+    );
 }
 #[test]
 fn suffix_allowlist_respects_label_boundaries_and_attributes_are_byte_bounded() {

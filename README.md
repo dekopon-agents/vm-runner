@@ -156,8 +156,9 @@ A ping returns `{"ok":true}`. Other platforms print `linux only` and exit 2.
 
 Alongside the browser tools, the image includes Python 3, uv 0.12.21, jq,
 ripgrep (`rg`), zip/unzip and Poppler's `pdftotext`/`pdfinfo`. The exec-safe uv
-wrapper selects the baked system Python and disables automatic interpreter
-downloads; venvs and its default cache are writable under the jail home.
+wrapper uses system interpreters and disables automatic interpreter downloads,
+while allowing `uv pip` to discover nearby/activated venvs. Venvs and its default
+cache are writable under the jail home.
 No pip or `python3-venv` package is separately installed. Package/network access
 still follows the existing egress policy, with no new allowlisting.
 See [the guest image README](images/guest/README.md#small-offline-toolkit) for

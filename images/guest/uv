@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
-# Guest exec clears its environment. Always use the baked interpreter, never download one.
-export UV_PYTHON=/usr/bin/python3
+# Guest exec clears its environment. Use system interpreters, never download one.
+# Do not force UV_PYTHON: uv pip must still discover nearby/activated venvs.
 export UV_PYTHON_PREFERENCE=only-system
 export UV_PYTHON_DOWNLOADS=never
 export UV_CACHE_DIR="${UV_CACHE_DIR:-/home/jail/.cache/uv}"

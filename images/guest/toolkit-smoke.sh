@@ -10,7 +10,7 @@ mkdir -p "$UV_CACHE_DIR"
 printf writable > "$UV_CACHE_DIR/probe"
 cd "$work"
 python3 - <<'PY'
-import json, pathlib, sys
+import json, pathlib, sys, zipfile
 assert sys.executable == '/usr/bin/python3'
 pathlib.Path('fixture.json').write_text(json.dumps({'message': 'toolkit smoke'}))
 # A complete one-page PDF with an embedded text stream and byte-accurate xref.
@@ -33,14 +33,32 @@ for offset in offsets[1:]:
     data.extend(b'%010d 00000 n \n' % offset)
 data.extend(b'trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n' % xref)
 pathlib.Path('fixture.pdf').write_bytes(data)
+# A dependency-free wheel exercises uv pip without an index or build backend.
+dist = 'toolkit_smoke_package-1.0.dist-info'
+files = {
+    'toolkit_smoke_package.py': 'VALUE = "offline wheel smoke"\n',
+    f'{dist}/METADATA': 'Metadata-Version: 2.1\nName: toolkit-smoke-package\nVersion: 1.0\n',
+    f'{dist}/WHEEL': 'Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n',
+}
+files[f'{dist}/RECORD'] = ''.join(f'{name},,\n' for name in [*files, f'{dist}/RECORD'])
+with zipfile.ZipFile('toolkit_smoke_package-1.0-py3-none-any.whl', 'w') as wheel:
+    for name, content in files.items():
+        wheel.writestr(name, content)
 PY
-uv --offline venv "$work/venv"
-"$work/venv/bin/python" - <<'PY'
+uv --offline venv "$work/.venv"
+"$work/.venv/bin/python" - <<'PY'
 import importlib.util, pathlib, sys
 assert sys.prefix != sys.base_prefix
 assert pathlib.Path(sys._base_executable).resolve() == pathlib.Path('/usr/bin/python3').resolve()
 assert importlib.util.find_spec('pip') is None
 pathlib.Path(sys.prefix, 'writable').write_text('venv smoke')
+PY
+# No --python/system override: uv pip must discover .venv as its target.
+uv --offline pip install ./toolkit_smoke_package-1.0-py3-none-any.whl
+"$work/.venv/bin/python" - <<'PY'
+import importlib.util, toolkit_smoke_package
+assert toolkit_smoke_package.VALUE == 'offline wheel smoke'
+assert importlib.util.find_spec('pip') is None
 PY
 jq -er '.message == "toolkit smoke"' fixture.json
 rg --quiet 'toolkit smoke' fixture.json

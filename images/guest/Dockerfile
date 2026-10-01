@@ -28,7 +28,7 @@ RUN case "$TARGETARCH" in \
     && tar -xzf /tmp/uv.tar.gz -C /tmp "uv-$uv_arch-unknown-linux-gnu/uv" \
     && install -m 0755 "/tmp/uv-$uv_arch-unknown-linux-gnu/uv" /usr/local/bin/uv-native \
     && rm -rf /tmp/uv.tar.gz "/tmp/uv-$uv_arch-unknown-linux-gnu" \
-    && test "$(/usr/local/bin/uv-native --version)" = 'uv 0.12.21'
+    && /usr/local/bin/uv-native --version | grep -Ex 'uv 0\.12\.21( \([^)]*\))?'
 COPY --chmod=0755 uv /usr/local/bin/uv
 WORKDIR /opt/playwright
 RUN npm install --save-exact playwright@1.63.0 \

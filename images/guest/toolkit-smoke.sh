@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 [ "$(id -u)" = 1000 ]
-[ "$(uv --version)" = 'uv 0.12.21' ]
+uv --version | grep -Ex 'uv 0\.12\.21( \([^)]*\))?'
 [ "$(uv cache dir)" = /home/jail/.cache/uv ]
 work=$(mktemp -d /home/jail/toolkit-smoke.XXXXXX)
 trap 'rm -rf "$work"' EXIT HUP INT TERM

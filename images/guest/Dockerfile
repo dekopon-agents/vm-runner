@@ -26,8 +26,25 @@ RUN npm install --save-exact playwright@1.63.0 \
     && ln -s /opt/playwright/node_modules /home/jail/node_modules \
     && chown -R 1000:1000 /home/jail /artifacts \
     && npm cache clean --force && rm -rf /var/lib/apt/lists/* /root/.cache
+# v0.38.1 npm postinstall selects these same native release binaries. No AB browser install.
+RUN case "$TARGETARCH" in \
+      amd64) ab_arch=x64; sha=5100149a1903211c889de4e545bf36d90803740cea4f99aa22651649f9205ea1 ;; \
+      arm64) ab_arch=arm64; sha=937b315ee0761e8a62f7950ddcfef9b3d3d8e8d5eb9c9d2bf9e23e5725664511 ;; \
+      *) exit 2 ;; \
+    esac \
+    && curl -fSL "https://github.com/vercel-labs/agent-browser/releases/download/v0.38.1/agent-browser-linux-$ab_arch" -o /usr/local/bin/agent-browser-native \
+    && printf '%s  /usr/local/bin/agent-browser-native\n' "$sha" | sha256sum --check \
+    && chmod 0755 /usr/local/bin/agent-browser-native \
+    && test "$(/usr/local/bin/agent-browser-native --version)" = 'agent-browser 0.38.1'
+COPY --chmod=0755 agent-browser /usr/local/bin/agent-browser
 COPY --chmod=0755 vm-guest-agent /usr/local/bin/vm-guest-agent
 COPY --chmod=0755 vm-init /sbin/vm-init
 COPY --chmod=0755 browse /usr/local/bin/browse
+COPY browser-smoke.cjs /tmp/browser-smoke.cjs
+# Match the guest agent's cleared environment and identity, not Docker ENV defaults.
+RUN setpriv --reuid=1000 --regid=1000 --clear-groups \
+    env -i HOME=/home/jail PATH=/usr/local/bin:/usr/bin:/bin node /tmp/browser-smoke.cjs \
+    && rm /tmp/browser-smoke.cjs \
+    && rm -rf /home/jail/.agent-browser /home/jail/.agent-browser-profile
 WORKDIR /home/jail
 ENTRYPOINT ["/sbin/vm-init"]

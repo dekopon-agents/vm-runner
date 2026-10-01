@@ -4,6 +4,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 ARG TARGETARCH
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl ca-certificates openssl libnss3-tools iproute2 util-linux xz-utils tini \
+    python3 jq ripgrep zip unzip poppler-utils \
     && groupadd --gid 1000 jail && useradd --uid 1000 --gid 1000 --create-home jail
 RUN case "$TARGETARCH" in \
       amd64) node_arch=x64; sha=fd8e59d5a511510f6a298afb548f18c7d2b1be404d8b4a27d94fbe49f56cb2d6 ;; \
@@ -15,6 +16,20 @@ RUN case "$TARGETARCH" in \
     && tar -xJf /tmp/node.tar.xz --strip-components=1 -C /usr/local \
     && rm /tmp/node.tar.xz \
     && test "$(node --version)" = v24.21.0
+# Official uv GNU/Linux archives contain uv and uvx in one target-named directory.
+# Ship only uv, behind an exec-env-safe wrapper; no pip or python3-venv package.
+RUN case "$TARGETARCH" in \
+      amd64) uv_arch=x86_64; sha=23f02075b652bb1df64178cfae41b5caf160822e720e2663568f3f5d63bc52c0 ;; \
+      arm64) uv_arch=aarch64; sha=030b69227b40af8c1981b7301793dc66e71ed3c796ea8688209dd268bd91ec51 ;; \
+      *) exit 2 ;; \
+    esac \
+    && curl -fSL "https://github.com/astral-sh/uv/releases/download/0.12.21/uv-$uv_arch-unknown-linux-gnu.tar.gz" -o /tmp/uv.tar.gz \
+    && printf '%s  /tmp/uv.tar.gz\n' "$sha" | sha256sum --check \
+    && tar -xzf /tmp/uv.tar.gz -C /tmp "uv-$uv_arch-unknown-linux-gnu/uv" \
+    && install -m 0755 "/tmp/uv-$uv_arch-unknown-linux-gnu/uv" /usr/local/bin/uv-native \
+    && rm -rf /tmp/uv.tar.gz "/tmp/uv-$uv_arch-unknown-linux-gnu" \
+    && test "$(/usr/local/bin/uv-native --version)" = 'uv 0.12.21'
+COPY --chmod=0755 uv /usr/local/bin/uv
 WORKDIR /opt/playwright
 RUN npm install --save-exact playwright@1.63.0 \
     && PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright npx playwright install --with-deps chromium \
@@ -46,5 +61,9 @@ RUN setpriv --reuid=1000 --regid=1000 --clear-groups \
     env -i HOME=/home/jail PATH=/usr/local/bin:/usr/bin:/bin node /tmp/browser-smoke.cjs \
     && rm /tmp/browser-smoke.cjs \
     && rm -rf /home/jail/.agent-browser /home/jail/.agent-browser-profile
+COPY toolkit-smoke.sh /tmp/toolkit-smoke.sh
+RUN --network=none setpriv --reuid=1000 --regid=1000 --clear-groups \
+    env -i HOME=/home/jail PATH=/usr/local/bin:/usr/bin:/bin sh /tmp/toolkit-smoke.sh \
+    && rm /tmp/toolkit-smoke.sh
 WORKDIR /home/jail
 ENTRYPOINT ["/sbin/vm-init"]

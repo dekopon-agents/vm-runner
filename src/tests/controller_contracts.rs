@@ -57,6 +57,9 @@ async fn get_admission_remains_available_during_exec_boot() {
     let client = TestClient::new(endpoint(
         Arc::new(state),
         Arc::new(tokio::sync::Semaphore::new(1)),
+        Arc::new(std::sync::Mutex::new(RequestRollups::new(
+            Origin::Controller,
+        ))),
     ));
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         client

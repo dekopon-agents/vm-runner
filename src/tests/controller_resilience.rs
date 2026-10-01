@@ -9,8 +9,13 @@ async fn reaper_kube_error_or_timeout_leaves_api_serving_and_retries_next_tick()
     let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
         .with_simple_exporter(exporter.clone())
         .build();
+    let log_exporter = opentelemetry_sdk::logs::InMemoryLogExporter::default();
+    let logger = opentelemetry_sdk::logs::SdkLoggerProvider::builder()
+        .with_simple_exporter(log_exporter.clone())
+        .build();
     let subscriber = tracing_subscriber::registry()
-        .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("reaper-test")));
+        .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("reaper-test")))
+        .with(opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new(&logger));
     let timeouts = kube_timeouts(kube::Config::new("http://127.0.0.1:1".parse().unwrap()));
     assert_eq!(
         timeouts.connect_timeout,
@@ -41,10 +46,14 @@ async fn reaper_kube_error_or_timeout_leaves_api_serving_and_retries_next_tick()
     );
     let controller = Arc::new(controller.unwrap());
     let admission = Arc::new(tokio::sync::Semaphore::new(1));
+    let rollups = Arc::new(std::sync::Mutex::new(RequestRollups::new(
+        Origin::Controller,
+    )));
     let requests = Arc::new(Requests {
         admission: Arc::clone(&admission),
         reaper_drain: Arc::new(tokio::sync::Semaphore::new(1)),
         controller: Some(Arc::clone(&controller)),
+        rollups: Arc::clone(&rollups),
     });
     let client = TestClient::new(endpoint(
         Arc::new(State {
@@ -53,6 +62,7 @@ async fn reaper_kube_error_or_timeout_leaves_api_serving_and_retries_next_tick()
             controller: Some(controller),
         }),
         admission,
+        rollups,
     ));
     tokio::time::pause();
     let mut tasks = tokio::task::JoinSet::new();
@@ -86,12 +96,15 @@ async fn reaper_kube_error_or_timeout_leaves_api_serving_and_retries_next_tick()
         }
     }
     let spans = exporter.get_finished_spans().unwrap();
+    assert!(spans.iter().all(|span| span.name != "vm_runner.reap"));
+    let logs = log_exporter.get_emitted_logs().unwrap();
     for cause in ["retry-test", "read timeout test"] {
         assert!(
-            spans
-                .iter()
-                .any(|s| s.name == "vm_runner.reap" && format!("{:?}", s.events).contains(cause)),
-            "missing spanned cause {cause}"
+            logs.iter().any(
+                |log| log.record.event_name() == Some("vm_runner.reap.failed")
+                    && format!("{:?}", log.record).contains(cause)
+            ),
+            "missing reap failure {cause}"
         );
     }
     tasks.shutdown().await;
@@ -101,8 +114,9 @@ async fn reaper_kube_error_or_timeout_leaves_api_serving_and_retries_next_tick()
         .drain()
         .await
         .unwrap();
-    assert_eq!(exporter.get_finished_spans().unwrap().len(), 3);
+    assert!(exporter.get_finished_spans().unwrap().is_empty());
     fixture.tasks.shutdown().await;
+    logger.shutdown().unwrap();
     provider.shutdown().unwrap();
 }
 

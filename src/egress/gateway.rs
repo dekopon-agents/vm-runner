@@ -98,10 +98,12 @@ impl Listeners {
         }
     }
 }
-enum Decision {
+pub(super) enum Decision {
     Allowed,
     Host,
     Type,
+    Protocol,
+    Address,
 }
 impl Decision {
     fn as_str(&self) -> &'static str {
@@ -109,18 +111,27 @@ impl Decision {
             Self::Allowed => "allowed",
             Self::Host => "refused:host",
             Self::Type => "refused:type",
+            Self::Protocol => "refused:protocol",
+            Self::Address => "refused:address",
         }
     }
 }
-pub(super) fn refusal(decision: &'static str) {
-    let _span = tracing::info_span!(parent: None, "egress.dns",
-        dns.question.name = "", dns.question.type = "", egress.decision = decision);
+pub(super) fn refusal(engine: &Engine, decision: Decision, name: &str) {
+    if let Ok(mut rollups) = engine.rollups.lock() {
+        rollups.dns(name, true);
+    }
+    let _span = tracing::debug_span!(target: crate::config::Category::EgressDns.target(), parent: None, "egress.dns",
+        telemetry.detail = crate::telemetry::detail!(crate::config::Category::EgressDns), dns.question.name = %cut(name), dns.question.type = "", egress.decision = decision.as_str());
+    tracing::info!(name: "egress.refused", target: crate::config::Category::EgressDrop.target(), {
+        telemetry.detail = crate::telemetry::detail!(crate::config::Category::EgressDrop),
+        dns.question.name = %cut(name), egress.decision = decision.as_str(), egress.refused.count = 1_i64,
+    }, "egress.refused");
 }
 fn answer(engine: &Engine, packet: &[u8], gateway: Ipv4Addr) -> Result<Option<Vec<u8>>, Error> {
     let query = match Message::from_vec(packet) {
         Ok(query) => query,
         Err(error) => {
-            refusal("refused:protocol");
+            refusal(engine, Decision::Protocol, "");
             return Err(error.into());
         }
     };
@@ -130,7 +141,7 @@ fn answer(engine: &Engine, packet: &[u8], gateway: Ipv4Addr) -> Result<Option<Ve
         || query.op_code != OpCode::Query
         || query.queries.len() != 1
     {
-        refusal("refused:protocol");
+        refusal(engine, Decision::Protocol, "");
         if query.message_type != MessageType::Query {
             return Ok(None);
         }
@@ -149,8 +160,17 @@ fn answer(engine: &Engine, packet: &[u8], gateway: Ipv4Addr) -> Result<Option<Ve
         } else {
             Decision::Allowed
         };
-        let span = tracing::info_span!(parent: None, "egress.dns",
-            dns.question.name = %cut(&name), dns.question.type = %kind,
+        if let Ok(mut rollups) = engine.rollups.lock() {
+            rollups.dns(&name, !matches!(decision, Decision::Allowed));
+        }
+        if !matches!(decision, Decision::Allowed) {
+            tracing::info!(name: "egress.refused", target: crate::config::Category::EgressDrop.target(), {
+                telemetry.detail = crate::telemetry::detail!(crate::config::Category::EgressDrop),
+                dns.question.name = %cut(&name), egress.decision = decision.as_str(), egress.refused.count = 1_i64,
+            }, "egress.refused");
+        }
+        let span = tracing::debug_span!(target: crate::config::Category::EgressDns.target(), parent: None, "egress.dns",
+            telemetry.detail = crate::telemetry::detail!(crate::config::Category::EgressDns), dns.question.name = %cut(&name), dns.question.type = %kind,
             egress.decision = decision.as_str());
         reply.add_query(question.clone());
         if !matches!(decision, Decision::Allowed) {
@@ -205,8 +225,10 @@ pub(super) async fn udp(
         let (length, peer) = match received {
             Ok(received) => received,
             Err(error) => {
-                tracing::warn!(%error, "egress DNS receive failed");
-                refusal("refused:protocol");
+                tracing::warn!(name: "egress.dns.receive_failed", target: crate::config::Category::EgressDns.target(), {
+                    telemetry.detail = crate::telemetry::detail!(crate::config::Category::EgressDns), %error,
+                }, "egress DNS receive failed");
+                refusal(engine, Decision::Protocol, "");
                 // A broken socket must not spin; shutdown still interrupts retries.
                 tokio::select! {
                     _ = stop.changed() => return Ok(()),
@@ -216,41 +238,47 @@ pub(super) async fn udp(
             }
         };
         if peer.port() == 0 || !peers.contains(&peer.ip()) {
-            refusal("refused:address");
+            refusal(engine, Decision::Address, "");
             continue;
         }
         match udp_reply(engine, &packet[..length], gateway) {
             Ok(Some(response)) => {
                 // The query already emitted its one DNS span, including on send failure.
                 if let Err(error) = socket.send_to(&response, peer).await {
-                    tracing::warn!(%error, %peer, "egress DNS send failed");
+                    tracing::warn!(name: "egress.dns.send_failed", target: crate::config::Category::EgressDns.target(), {
+                        telemetry.detail = crate::telemetry::detail!(crate::config::Category::EgressDns), %error, %peer,
+                    }, "egress DNS send failed");
                 }
             }
             Ok(None) => (),
-            Err(error) => tracing::warn!(%error, "egress DNS datagram refused"),
+            Err(error) => {
+                tracing::warn!(name: "egress.dns.datagram_refused", target: crate::config::Category::EgressDns.target(), {
+                telemetry.detail = crate::telemetry::detail!(crate::config::Category::EgressDns), %error,
+            }, "egress DNS datagram refused")
+            }
         }
     }
 }
-struct PartialFrame(bool);
-impl Drop for PartialFrame {
+struct PartialFrame<'a>(bool, &'a Engine);
+impl Drop for PartialFrame<'_> {
     fn drop(&mut self) {
         if self.0 {
-            refusal("refused:protocol");
+            refusal(self.1, Decision::Protocol, "");
         }
     }
 }
-async fn read_frame(stream: &mut Stream) -> std::io::Result<Option<Vec<u8>>> {
+async fn read_frame(engine: &Engine, stream: &mut Stream) -> std::io::Result<Option<Vec<u8>>> {
     let mut prefix = [0; 2];
     match stream.read(&mut prefix[..1]).await {
         Ok(0) => return Ok(None),
         Ok(_) => (),
         Err(error) => {
-            refusal("refused:protocol");
+            refusal(engine, Decision::Protocol, "");
             return Err(error);
         }
     }
     // Partial frames are also refused once if the connection's idle/lifetime gate cancels us.
-    let mut partial = PartialFrame(true);
+    let mut partial = PartialFrame(true, engine);
     stream.read_exact(&mut prefix[1..]).await?;
     let mut packet = vec![0; usize::from(u16::from_be_bytes(prefix))];
     stream.read_exact(&mut packet).await?;
@@ -263,7 +291,7 @@ pub(super) async fn tcp(
     gateway: Ipv4Addr,
 ) -> Result<(), Error> {
     loop {
-        let Some(packet) = read_frame(&mut stream).await? else {
+        let Some(packet) = read_frame(engine, &mut stream).await? else {
             return Ok(());
         };
         if let Some(response) = answer(engine, &packet, gateway)? {

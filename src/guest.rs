@@ -343,7 +343,9 @@ impl ProcessGroup {
 impl Drop for ProcessGroup {
     fn drop(&mut self) {
         if let Err(error) = self.kill() {
-            tracing::error!(%error, "guest process-group cleanup failed");
+            tracing::error!(name: "vm_runner.exec.cleanup_failed", target: crate::config::Category::VmExec.target(), {
+                telemetry.detail = crate::telemetry::detail!(crate::config::Category::VmExec), %error,
+            }, "guest process-group cleanup failed");
         }
     }
 }

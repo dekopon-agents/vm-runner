@@ -141,6 +141,9 @@ async fn authenticated_oversized_session_id_is_exported_once_and_capped() {
     let client = TestClient::new(endpoint(
         Arc::new(state),
         Arc::new(tokio::sync::Semaphore::new(1)),
+        Arc::new(std::sync::Mutex::new(RequestRollups::new(
+            Origin::Controller,
+        ))),
     ));
     let exporter = opentelemetry_sdk::trace::InMemorySpanExporter::default();
     let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
@@ -211,6 +214,9 @@ async fn session_route_authenticates_and_returns_named_create_or_get_statuses() 
     let client = TestClient::new(endpoint(
         Arc::new(state),
         Arc::new(tokio::sync::Semaphore::new(1)),
+        Arc::new(std::sync::Mutex::new(RequestRollups::new(
+            Origin::Controller,
+        ))),
     ));
     client.get("/healthz").send().await.assert_status_is_ok();
     drop(busy);
@@ -303,6 +309,60 @@ fn config_reports_all_conflicts_together() {
         assert!(conflicts.contains(&expected), "{conflicts:?}");
     }
     assert!(serde_yaml_ng::from_str::<Config>(&format!("{yaml}\nunrecognized: true")).is_err());
+}
+#[test]
+fn telemetry_rejects_every_unknown_category() {
+    let error = serde_yaml_ng::from_str::<config::Telemetry>(
+        "detail:\n  categories:\n    vm.unknown: drip\n    egress.wrong: full\n",
+    )
+    .err()
+    .unwrap()
+    .to_string();
+    assert!(error.contains("vm.unknown"), "{error}");
+    assert!(error.contains("egress.wrong"), "{error}");
+}
+#[test]
+fn telemetry_defaults_and_mixed_filter_are_explicit() {
+    let empty: config::Telemetry = serde_yaml_ng::from_str("{}").unwrap();
+    assert!(empty.otlp.is_none());
+    assert_eq!(
+        empty.detail.level(config::Category::VmExec),
+        config::Detail::Standard
+    );
+    assert!(empty.omit.headers.is_empty() && empty.omit.query_keys.is_empty());
+    let mixed: config::Telemetry = serde_yaml_ng::from_str(
+        "detail:\n  default: drip\n  categories:\n    vm.exec: full\n    egress.dns: standard\n",
+    )
+    .unwrap();
+    assert_eq!(
+        mixed.detail.filter(),
+        "info,vm.lifecycle=info,vm.exec=trace,vm.resources=info,egress.exchange=info,egress.dns=debug,egress.connect=info,egress.drop=info,telemetry=info,hyper=off,tonic=off,h2=off,reqwest=off,opentelemetry=off"
+    );
+}
+#[test]
+fn omit_patterns_reject_empty_and_interior_wildcards() {
+    for yaml in [
+        "omit:\n  headers: ['']",
+        "omit:\n  queryKeys: [pre*fix]",
+        "omit:\n  headers: ['**']",
+        "omit:\n  queryKeys: [foo**]",
+        "omit:\n  headers: ['bad\u{0000}name']",
+    ] {
+        assert!(
+            serde_yaml_ng::from_str::<config::Telemetry>(yaml).is_err(),
+            "{yaml:?}"
+        );
+    }
+}
+#[tokio::test]
+async fn http_exporter_requires_a_traces_endpoint() {
+    let config: config::Telemetry =
+        serde_yaml_ng::from_str("otlp: { protocol: http, endpoint: 'http://127.0.0.1:9/other' }")
+            .unwrap();
+    assert!(matches!(
+        telemetry::provider(Some(&config)).await,
+        Err(telemetry::SetupError)
+    ));
 }
 #[test]
 fn egress_connection_ceiling_fits_the_default_blocking_pool() {
@@ -495,19 +555,21 @@ async fn cancelled_request_finishes_off_runtime_before_shutdown() {
 }
 #[tokio::test]
 async fn http_exporter_redacts_debug_but_delivers_headers() {
-    use opentelemetry::trace::{Tracer, TracerProvider};
+    use opentelemetry::trace::Tracer;
     use std::io::Write;
     let secret = "otlp-sentinel-secret";
     let mut headers = tempfile::NamedTempFile::new().unwrap();
     writeln!(headers, "authorization: {secret}").unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let config = config::Telemetry {
-        otlp: config::Otlp {
+        otlp: Some(config::Otlp {
             protocol: config::Protocol::Http,
             endpoint: format!("http://{}/v1/traces", listener.local_addr().unwrap()),
             ca_bundle_file: None,
             headers_file: Some(headers.path().into()),
-        },
+        }),
+        detail: Default::default(),
+        omit: Default::default(),
     };
     let provider = telemetry::provider(Some(&config)).await.unwrap();
     assert!(!format!("{provider:?}").contains(secret));
@@ -531,6 +593,7 @@ async fn http_exporter_redacts_debug_but_delivers_headers() {
     let export = tokio::task::spawn_blocking(move || {
         provider
             .tracer("header-test")
+            .unwrap()
             .in_span("test.export", |_| {});
         provider.shutdown().unwrap();
     });
@@ -561,6 +624,209 @@ pub(crate) fn trace_exporter() -> opentelemetry_sdk::trace::InMemorySpanExporter
         })
         .1
         .clone()
+}
+#[test]
+fn request_without_parent_is_debug_and_with_parent_is_info() {
+    use opentelemetry::trace::TracerProvider;
+    use tracing_subscriber::{Layer, layer::SubscriberExt};
+    let exporter = opentelemetry_sdk::trace::InMemorySpanExporter::default();
+    let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+        .with_simple_exporter(exporter.clone())
+        .build();
+    let dispatch = tracing::Dispatch::new(
+        tracing_subscriber::registry().with(
+            tracing_opentelemetry::layer()
+                .with_tracer(provider.tracer("request-level"))
+                .with_filter(tracing_subscriber::EnvFilter::new("info,vm.exec=info")),
+        ),
+    );
+    tracing::dispatcher::with_default(&dispatch, || {
+        request_span(
+            &poem::Request::builder()
+                .uri("/v1/sessions".parse().unwrap())
+                .finish(),
+        )
+        .in_scope(|| {});
+        request_span(
+            &poem::Request::builder()
+                .uri("/v1/sessions".parse().unwrap())
+                .header(
+                    "traceparent",
+                    "00-11111111111111111111111111111111-2222222222222222-01",
+                )
+                .finish(),
+        )
+        .in_scope(|| {});
+    });
+    let spans = exporter.get_finished_spans().unwrap();
+    assert_eq!(spans.len(), 1);
+    assert_eq!(spans[0].parent_span_id.to_string(), "2222222222222222");
+    provider.shutdown().unwrap();
+}
+#[cfg(unix)]
+#[tokio::test]
+async fn jail_healthz_has_no_span_even_with_a_parent() {
+    use opentelemetry::trace::TracerProvider;
+    use tracing::instrument::WithSubscriber;
+    use tracing_subscriber::layer::SubscriberExt;
+    let exporter = opentelemetry_sdk::trace::InMemorySpanExporter::default();
+    let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+        .with_simple_exporter(exporter.clone())
+        .build();
+    let dispatch = tracing_subscriber::registry()
+        .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("jail-health")));
+    let (endpoint, requests) = traced(
+        poem::Route::new().at(
+            "/healthz",
+            poem::get(poem::endpoint::make(|_| async {
+                Ok::<_, poem::Error>("ok")
+            })),
+        ),
+        1,
+    );
+    async {
+        TestClient::new(endpoint)
+            .get("/healthz")
+            .header(
+                "traceparent",
+                "00-11111111111111111111111111111111-2222222222222222-01",
+            )
+            .send()
+            .await
+            .assert_status_is_ok();
+        requests.drain().await.unwrap();
+    }
+    .with_subscriber(dispatch)
+    .await;
+    assert!(exporter.get_finished_spans().unwrap().is_empty());
+    provider.shutdown().unwrap();
+}
+#[cfg(unix)]
+#[tokio::test]
+async fn jail_request_records_only_the_matched_route_template() {
+    use opentelemetry::trace::TracerProvider;
+    use tracing::instrument::WithSubscriber;
+    use tracing_subscriber::layer::SubscriberExt;
+    let exporter = opentelemetry_sdk::trace::InMemorySpanExporter::default();
+    let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+        .with_simple_exporter(exporter.clone())
+        .build();
+    let log_exporter = opentelemetry_sdk::logs::InMemoryLogExporter::default();
+    let logger = opentelemetry_sdk::logs::SdkLoggerProvider::builder()
+        .with_simple_exporter(log_exporter.clone())
+        .build();
+    let dispatch = tracing_subscriber::registry()
+        .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("jail-route")))
+        .with(opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new(&logger));
+    let route = poem::Route::new().at(
+        "/v1/sessions/:id/exec",
+        poem::get(poem::endpoint::make(|_| async {
+            Ok::<_, poem::Error>("ok")
+        })),
+    );
+    let (endpoint, requests) = traced(route, 1);
+    async {
+        TestClient::new(endpoint)
+            .get("/v1/sessions/private-token/exec")
+            .header(
+                "traceparent",
+                "00-11111111111111111111111111111111-2222222222222222-01",
+            )
+            .send()
+            .await
+            .assert_status_is_ok();
+        requests.drain().await.unwrap();
+    }
+    .with_subscriber(dispatch)
+    .await;
+    let spans = exporter.get_finished_spans().unwrap();
+    assert_eq!(spans.len(), 1);
+    assert_eq!(
+        span_attribute(&spans[0], "http.route"),
+        Some(&"/v1/sessions/{id}/exec".into())
+    );
+    assert!(
+        spans[0]
+            .attributes
+            .iter()
+            .all(|kv| !kv.value.to_string().contains("private-token"))
+    );
+    let logs = log_exporter.get_emitted_logs().unwrap();
+    let rollup = logs
+        .iter()
+        .find(|log| log.record.event_name() == Some("vm_runner.request.rollup"))
+        .unwrap();
+    assert!(
+        rollup
+            .record
+            .attributes_iter()
+            .any(|(key, value)| key.as_str() == "http.route"
+                && value == &opentelemetry::logs::AnyValue::from("/v1/sessions/{id}/exec"))
+    );
+    assert!(
+        rollup
+            .record
+            .attributes_iter()
+            .any(|(key, value)| key.as_str() == "vm_runner.request.count"
+                && value == &opentelemetry::logs::AnyValue::Int(1))
+    );
+    assert!(
+        !rollup
+            .record
+            .attributes_iter()
+            .any(|(key, _)| key.as_str() == "vm_runner.session_id")
+    );
+    provider.shutdown().unwrap();
+    logger.shutdown().unwrap();
+}
+#[tokio::test]
+async fn controller_rollup_excludes_health_and_counts_unauthorized_requests() {
+    use tracing::instrument::WithSubscriber;
+    use tracing_subscriber::layer::SubscriberExt;
+    let mut fixture = Fixture::new().await;
+    let (endpoint, requests) = app(fixture.config).await.unwrap();
+    let exporter = opentelemetry_sdk::logs::InMemoryLogExporter::default();
+    let provider = opentelemetry_sdk::logs::SdkLoggerProvider::builder()
+        .with_simple_exporter(exporter.clone())
+        .build();
+    let dispatch = tracing_subscriber::registry()
+        .with(opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new(&provider));
+    async {
+        let client = TestClient::new(endpoint);
+        client.get("/healthz").send().await.assert_status_is_ok();
+        client
+            .get("/v1/whoami")
+            .send()
+            .await
+            .assert_status(StatusCode::UNAUTHORIZED);
+        requests.drain().await.unwrap();
+    }
+    .with_subscriber(dispatch)
+    .await;
+    let logs = exporter.get_emitted_logs().unwrap();
+    let rollups: Vec<_> = logs
+        .iter()
+        .filter(|log| log.record.event_name() == Some("vm_runner.request.rollup"))
+        .collect();
+    assert_eq!(rollups.len(), 1);
+    assert!(
+        rollups[0]
+            .record
+            .attributes_iter()
+            .any(|(key, value)| key.as_str() == "vm_runner.request.count"
+                && value == &opentelemetry::logs::AnyValue::Int(1))
+    );
+    assert!(
+        rollups[0]
+            .record
+            .attributes_iter()
+            .any(
+                |(key, value)| key.as_str() == "vm_runner.request.error.count"
+                    && value == &opentelemetry::logs::AnyValue::Int(1)
+            )
+    );
+    provider.shutdown().unwrap();
+    fixture.tasks.shutdown().await;
 }
 #[tokio::test]
 async fn refusal_span_has_reason_and_incoming_parent() {

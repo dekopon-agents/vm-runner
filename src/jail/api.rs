@@ -155,7 +155,8 @@ impl State {
         let guest = Arc::clone(&self.guest);
         let runtime = tokio::runtime::Handle::current();
         let dispatch = tracing::dispatcher::get_default(Clone::clone);
-        let span = tracing::info_span!("vm_runner.exec");
+        let span = tracing::info_span!(target: crate::config::Category::VmExec.target(), "vm_runner.exec",
+            telemetry.detail = crate::telemetry::detail!(crate::config::Category::VmExec));
         // The bounded table owns these workers until shutdown, even after HTTP cancellation.
         jobs.workers.spawn_blocking(move || {
             tracing::dispatcher::with_default(&dispatch, || {
@@ -174,7 +175,9 @@ impl State {
                         {
                             Ok(result) => Progress::Done(Arc::new(result.capped())),
                             Err(error) => {
-                                tracing::error!(%error, "guest exec outcome unknown");
+                                tracing::error!(name: "vm_runner.exec.outcome_unknown", target: crate::config::Category::VmExec.target(), {
+                                    telemetry.detail = crate::telemetry::detail!(crate::config::Category::VmExec), %error,
+                                }, "guest exec outcome unknown");
                                 Progress::Unknown
                             }
                         };
@@ -281,7 +284,8 @@ impl Api {
                 Progress::Unknown => JobResponse::Unknown(unknown(id)),
             })
         }
-        .instrument(tracing::info_span!("vm_runner.job.get"))
+        .instrument(tracing::info_span!(target: crate::config::Category::VmExec.target(), "vm_runner.job.get",
+            telemetry.detail = crate::telemetry::detail!(crate::config::Category::VmExec)))
         .await
     }
 }

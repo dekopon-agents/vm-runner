@@ -30,6 +30,17 @@ profiles:
       idleSeconds: 90
       maxConnectionSeconds: 1800
       maxConnections: 128
+telemetry:
+  detail:
+    default: standard
+    categories:
+      egress.exchange: drip
+      egress.dns: drip
+      egress.connect: drip
+      egress.drop: drip
+  omit:
+    headers: []
+    queryKeys: []
 quotas:
   default: { maxSessions: 1 }
   subjects:

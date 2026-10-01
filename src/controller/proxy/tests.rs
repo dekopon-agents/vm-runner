@@ -458,7 +458,7 @@ async fn invalid_token_never_dispatches_exec_but_keeps_the_reservation() {
         Err(Error::Token)
     ));
     assert_eq!(f.calls.load(Ordering::SeqCst), 0);
-    assert!(!f.controller.sessions.lock().unwrap()[&id].retiring);
+    assert!(!f.controller.sessions.lock().unwrap()[&id].is_retiring());
     f.tasks.shutdown().await;
 }
 #[tokio::test]
@@ -473,7 +473,7 @@ async fn reap_cannot_free_quota_or_orphan_a_pod_while_create_is_in_flight() {
         assert!(f.controller.reap(u64::MAX).now_or_never().is_some());
         let sessions = f.controller.sessions.lock().unwrap();
         assert_eq!(sessions.len(), 1);
-        assert!(sessions[&id].starting && sessions[&id].retiring);
+        assert!(sessions[&id].starting && sessions[&id].is_retiring());
         drop(hold);
     });
     assert!(matches!(

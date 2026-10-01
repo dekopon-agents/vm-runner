@@ -81,7 +81,10 @@ enum ResponseError {
 }
 impl From<Error> for ResponseError {
     fn from(error: Error) -> Self {
-        tracing::warn!(cause = %error, "controller operation failed");
+        tracing::warn!(name: "vm_runner.request.failed", target: crate::config::Category::VmExec.target(), {
+            telemetry.detail = crate::telemetry::detail!(crate::config::Category::VmExec),
+            cause = %error,
+        }, "controller operation failed");
         let body = PlainText(error.to_string());
         match error {
             Error::NotFound => Self::NotFound(body),
@@ -286,7 +289,10 @@ impl Controller {
             if !matches!(error, Error::Boot) {
                 return Err(error);
             }
-            tracing::warn!(cause = %error, "exec not started");
+            tracing::warn!(name: "vm_runner.exec.not_started", target: crate::config::Category::VmExec.target(), {
+                telemetry.detail = crate::telemetry::detail!(crate::config::Category::VmExec),
+                cause = %error,
+            }, "exec not started");
             return Ok(ExecResponse::Complete(Json(ExecResult::NotExecuted(
                 ExecRefused {
                     reason: "boot_failure".into(),
@@ -308,7 +314,7 @@ impl Controller {
             let sessions = self.sessions.lock().expect("session registry poisoned");
             sessions
                 .get(&key)
-                .filter(|s| !s.retiring)
+                .filter(|s| !s.is_retiring())
                 .ok_or(Error::NotFound)?;
             self.jobs.lock().expect("job registry poisoned").insert(
                 job_id.clone(),
@@ -390,7 +396,8 @@ impl Api {
         Ok(controller(&state)?
             .exec(&subject, &id, &body)
             .instrument(tracing::info_span!(
-                "vm_runner.exec",
+                target: crate::config::Category::VmExec.target(), "vm_runner.exec",
+                telemetry.detail = crate::telemetry::detail!(crate::config::Category::VmExec),
                 vm_runner.session_id = crate::egress::cut(&id.0)
             ))
             .await?)
@@ -408,7 +415,8 @@ impl Api {
         };
         Ok(controller(&state)?
             .job(&subject, &job_id)
-            .instrument(tracing::info_span!("vm_runner.job.get"))
+            .instrument(tracing::info_span!(target: crate::config::Category::VmExec.target(), "vm_runner.job.get",
+                telemetry.detail = crate::telemetry::detail!(crate::config::Category::VmExec)))
             .await?)
     }
 }

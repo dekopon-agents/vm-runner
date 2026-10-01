@@ -21,6 +21,7 @@ use tracing::Instrument;
 
 pub(crate) mod api;
 mod client;
+mod firewall;
 pub mod image;
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 #[derive(Debug, thiserror::Error)]
@@ -77,7 +78,8 @@ async fn phase<T>(
         result
     }
     .instrument(tracing::info_span!(
-        "vm_runner.boot",
+        target: crate::config::Category::VmLifecycle.target(), "vm_runner.boot",
+        telemetry.detail = telemetry::detail!(crate::config::Category::VmLifecycle),
         boot.phase = name,
         error.message = tracing::field::Empty
     ))
@@ -315,6 +317,10 @@ pub async fn run(config: Config, profile: &str, session: &str) -> Result<()> {
         .find(|(name, _)| name == &selected.shape)
         .ok_or(Error::Profile)?
         .1;
+    let omit = config
+        .telemetry
+        .as_ref()
+        .map_or_else(Default::default, |telemetry| telemetry.omit.clone());
     let provider = telemetry::init_jail(
         config.telemetry.as_ref(),
         profile,
@@ -364,11 +370,17 @@ pub async fn run(config: Config, profile: &str, session: &str) -> Result<()> {
             })
         });
         let mut vm = None;
+        let mut firewall = None;
         let result = async {
             let (ca, pem) = phase("ca", async { crate::egress::Ca::new() }).await?;
             network(&work).await?;
+            firewall = Some(firewall::Firewall::new());
+            let mut ticker = tokio::time::interval_at(
+                tokio::time::Instant::now() + crate::ROLLUP_INTERVAL,
+                crate::ROLLUP_INTERVAL,
+            );
             let gateway =
-                phase("gateway", crate::egress::Gateway::bind(selected.egress, ca)).await?;
+                phase("gateway", crate::egress::Gateway::bind(selected.egress, ca, omit)).await?;
             let handle = tokio::runtime::Handle::current();
             let dispatch = tracing::dispatcher::get_default(Clone::clone);
             workers.spawn_blocking(move || {
@@ -386,11 +398,19 @@ pub async fn run(config: Config, profile: &str, session: &str) -> Result<()> {
             vm = Some(child);
             let child = vm.as_mut().ok_or(Error::WorkerStopped)?;
             let ready = phase("ready", async {
-                tokio::select! {
-                    result = guest.ready() => { result?; Ok(true) },
-                    _ = &mut shutdown => Ok(false),
-                    status = child.wait() => Err(firecracker_exit(status?, &work).await.into()),
-                    worker = workers.join_next() => Err(worker_error(worker)),
+                let ready = guest.ready();
+                tokio::pin!(ready);
+                loop {
+                    tokio::select! {
+                        _ = ticker.tick() => {
+                            requests.tick();
+                            if let Some(firewall) = firewall.as_mut() { firewall.sample(firewall::Interval::Regular).await; }
+                        }
+                        result = &mut ready => break { result?; Ok(true) },
+                        _ = &mut shutdown => break Ok(false),
+                        status = child.wait() => break Err(firecracker_exit(status?, &work).await.into()),
+                        worker = workers.join_next() => break Err(worker_error(worker)),
+                    }
                 }
             })
             .await?;
@@ -398,11 +418,21 @@ pub async fn run(config: Config, profile: &str, session: &str) -> Result<()> {
                 return Ok(());
             }
             state.mark_ready();
-            tracing::info!(pid, "jail ready");
-            tokio::select! {
-                _ = &mut shutdown => Ok(()),
-                status = child.wait() => Err(firecracker_exit(status?, &work).await.into()),
-                worker = workers.join_next() => Err(worker_error(worker)),
+            let depth = telemetry::detail!(crate::config::Category::VmLifecycle);
+            tracing::info!(name: "vm_runner.boot.ready", target: crate::config::Category::VmLifecycle.target(), {
+                telemetry.detail = depth,
+                process.pid = pid.map(i64::from),
+            }, "jail ready");
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        requests.tick();
+                        if let Some(firewall) = firewall.as_mut() { firewall.sample(firewall::Interval::Regular).await; }
+                    },
+                    _ = &mut shutdown => break Ok(()),
+                    status = child.wait() => break Err(firecracker_exit(status?, &work).await.into()),
+                    worker = workers.join_next() => break Err(worker_error(worker)),
+                }
             }
         }
         .await;
@@ -420,6 +450,9 @@ pub async fn run(config: Config, profile: &str, session: &str) -> Result<()> {
         }
         requests.drain().await?;
         state.drain().await?;
+        if let Some(firewall) = firewall.as_mut() {
+            firewall.sample(firewall::Interval::End).await;
+        }
         result.and(stopped_vm).and(drained)
     };
     let result = tokio::task::spawn_blocking(move || {

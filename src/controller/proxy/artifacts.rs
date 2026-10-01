@@ -133,7 +133,7 @@ impl Controller {
                         .lock()
                         .expect("session registry poisoned")
                         .get_mut(&key)
-                        .filter(|s| !s.retiring)
+                        .filter(|s| !s.is_retiring())
                 {
                     session.active = now();
                 }
@@ -180,7 +180,8 @@ impl Api {
         Ok(controller(&state)?
             .artifact(&subject, &id, &path, range.0.as_deref())
             .instrument(tracing::info_span!(
-                "vm_runner.artifact.read",
+                target: crate::config::Category::VmExec.target(), "vm_runner.artifact.read",
+                telemetry.detail = crate::telemetry::detail!(crate::config::Category::VmExec),
                 vm_runner.session_id = crate::egress::cut(&id.0)
             ))
             .await?)

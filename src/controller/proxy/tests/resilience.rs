@@ -25,7 +25,7 @@ async fn kube_and_nonretryable_health_errors_keep_session_and_return_502_not_exe
         assert_eq!(response.status(), poem::http::StatusCode::BAD_GATEWAY);
         let body: Value = response.into_body().into_json().await.unwrap();
         assert_eq!(body["outcome"], "not_executed");
-        assert!(!f.controller.sessions.lock().unwrap()[&id].retiring);
+        assert!(!f.controller.sessions.lock().unwrap()[&id].is_retiring());
         assert_eq!(f.calls.load(Ordering::SeqCst), 1);
     }
     f.tasks.shutdown().await;
@@ -112,7 +112,7 @@ async fn warm_pod_older_than_boot_window_executes_once_without_recreating_pod() 
         ExecResponse::Complete(Json(ExecResult::Executed(_)))
     ));
     let session = &f.controller.sessions.lock().unwrap()[&id];
-    assert!(!session.retiring);
+    assert!(!session.is_retiring());
     assert_eq!(session.pod, original_pod);
     assert_eq!(f.captured.lock().unwrap().len(), 2); // original pod and secret, no replacement
     assert_eq!(f.calls.load(Ordering::SeqCst), 2); // one exec per request
@@ -140,7 +140,7 @@ async fn recovered_pod_older_than_boot_window_executes_once_without_recreating_p
     ));
     let session = &f.controller.sessions.lock().unwrap()[&id];
     assert!(matches!(session.body.state, SessionState::Ready));
-    assert!(!session.retiring);
+    assert!(!session.is_retiring());
     assert_eq!(session.pod, original_pod);
     assert_eq!(f.captured.lock().unwrap().len(), 2);
     assert_eq!(f.calls.load(Ordering::SeqCst), 2);
@@ -148,6 +148,16 @@ async fn recovered_pod_older_than_boot_window_executes_once_without_recreating_p
 
 #[tokio::test]
 async fn failed_init_is_terminal_even_if_an_old_pod_answers_healthy() {
+    use tracing::instrument::WithSubscriber;
+    use tracing_subscriber::layer::SubscriberExt;
+    let exporter = opentelemetry_sdk::logs::InMemoryLogExporter::default();
+    let provider = opentelemetry_sdk::logs::SdkLoggerProvider::builder()
+        .with_simple_exporter(exporter.clone())
+        .build();
+    let dispatch =
+        tracing::Dispatch::new(tracing_subscriber::registry().with(
+            opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new(&provider),
+        ));
     let f = Fixture::new().await;
     let id = f.session();
     assert!(matches!(
@@ -155,12 +165,41 @@ async fn failed_init_is_terminal_even_if_an_old_pod_answers_healthy() {
         ExecResponse::Pending(_)
     ));
     *f.pod_status.lock().unwrap() = Some(old_healthy_pod_status(1));
-    let ExecResponse::Complete(Json(ExecResult::NotExecuted(result))) =
-        f.controller.exec(SUBJECT, &id, &exec()).await.unwrap()
+    let ExecResponse::Complete(Json(ExecResult::NotExecuted(result))) = f
+        .controller
+        .exec(SUBJECT, &id, &exec())
+        .with_subscriber(dispatch.clone())
+        .await
+        .unwrap()
     else {
         panic!("failed init must refuse");
     };
     assert_eq!(result.reason, "boot_failure");
+    f.controller.reap(now()).with_subscriber(dispatch).await;
+    let ended: Vec<_> = exporter
+        .get_emitted_logs()
+        .unwrap()
+        .into_iter()
+        .filter(|log| log.record.event_name() == Some("vm_runner.session.ended"))
+        .collect();
+    assert_eq!(ended.len(), 1);
+    assert!(
+        ended[0]
+            .record
+            .attributes_iter()
+            .any(
+                |(key, value)| key.as_str() == "vm_runner.session.end_reason"
+                    && value == &opentelemetry::logs::AnyValue::from("boot_failure")
+            )
+    );
+    assert!(
+        ended[0]
+            .record
+            .attributes_iter()
+            .any(|(key, value)| key.as_str() == "telemetry.detail"
+                && value == &opentelemetry::logs::AnyValue::from("full"))
+    );
+    provider.shutdown().unwrap();
     assert_eq!(f.calls.load(Ordering::SeqCst), 1);
     assert!(
         f.controller
@@ -168,7 +207,7 @@ async fn failed_init_is_terminal_even_if_an_old_pod_answers_healthy() {
             .lock()
             .unwrap()
             .get(&id)
-            .is_none_or(|s| s.retiring)
+            .is_none_or(|s| s.is_retiring())
     );
 }
 
@@ -195,7 +234,7 @@ async fn cold_jail_503_stops_at_boot_timeout_without_exec() {
             .lock()
             .unwrap()
             .get(&id)
-            .is_none_or(|s| s.retiring)
+            .is_none_or(|s| s.is_retiring())
     );
 }
 
@@ -265,7 +304,7 @@ async fn terminal_unknown_is_terminal_and_polling_does_not_count_as_activity() {
     assert_eq!(f.controller.sessions.lock().unwrap()[&id].active, active);
     assert_eq!(f.patches.load(Ordering::SeqCst), patches);
     f.controller.reap(now()).await;
-    assert!(f.controller.sessions.lock().unwrap()[&id].retiring);
+    assert!(f.controller.sessions.lock().unwrap()[&id].is_retiring());
     f.tasks.shutdown().await;
 }
 
@@ -284,7 +323,7 @@ async fn terminal_pod_evidence_retires_session_without_dispatch() {
         panic!("boot failure")
     };
     assert_eq!(result.reason, "boot_failure");
-    assert!(f.controller.sessions.lock().unwrap()[&id].retiring);
+    assert!(f.controller.sessions.lock().unwrap()[&id].is_retiring());
     assert_eq!(f.calls.load(Ordering::SeqCst), 1);
     f.controller.reap(now()).await;
     assert!(f.controller.sessions.lock().unwrap().is_empty());

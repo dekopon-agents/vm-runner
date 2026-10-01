@@ -169,10 +169,10 @@ impl Source {
                 cache.verified = Instant::now();
             }
             Err(reason) => {
-                tracing::warn!(
+                tracing::warn!(name: "vm_runner.auth.jwks_refresh_failed", target: crate::config::Category::VmExec.target(), {
+                    telemetry.detail = crate::telemetry::detail!(crate::config::Category::VmExec),
                     reason = reason.as_str(),
-                    "jwks refresh failed; serving cached keys"
-                );
+                }, "jwks refresh failed; serving cached keys");
                 // Cached keys outlive a failed refresh for a day, never for an unknown kid.
                 if cache.keys.find(kid).is_none()
                     || cache.verified.elapsed() >= Duration::from_secs(86_400)

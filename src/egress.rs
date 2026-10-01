@@ -38,15 +38,18 @@ use tokio_rustls::{
 use tracing::Instrument;
 
 mod gateway;
+mod observability;
+use observability::{
+    ConnectAttempt, ConnectOutcome, Exchange, HeaderSide, Outcome, Phase, Recorded, RequestMeasure,
+    Rollups,
+};
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
 type HttpBody = UnsyncBoxBody<Bytes, Error>;
 trait Io: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Io for T {}
 type Stream = Box<dyn Io>;
-type RequestBody =
-    http_body_util::combinators::MapFrame<Incoming, fn(Frame<Bytes>) -> Frame<Bytes>>;
-type Driver = hyper::client::conn::http1::Connection<TokioIo<Stream>, RequestBody>;
+type Driver = hyper::client::conn::http1::Connection<TokioIo<Stream>, MeasuredRequestBody>;
 
 pub(crate) struct Ca {
     issuer: Issuer<'static, KeyPair>,
@@ -103,6 +106,7 @@ enum Classified {
     Tls(Box<tokio_rustls::StartHandshake<BufReader<Stream>>>),
     Http(BufReader<Stream>),
     Refuse,
+    Closed,
 }
 async fn classify(stream: Stream) -> Result<Classified, Error> {
     let mut buffered = BufReader::new(stream);
@@ -111,13 +115,16 @@ async fn classify(stream: Stream) -> Result<Classified, Error> {
             LazyConfigAcceptor::new(rustls::server::Acceptor::default(), buffered).await?,
         ))),
         Some(b'A'..=b'Z') => Ok(Classified::Http(buffered)),
-        _ => Ok(Classified::Refuse),
+        None => Ok(Classified::Closed),
+        Some(_) => Ok(Classified::Refuse),
     }
 }
 struct Engine {
     ca: Ca,
     egress: Egress,
     tls: Arc<ClientConfig>,
+    omit: crate::config::Omit,
+    rollups: Arc<Mutex<Rollups>>,
 }
 #[derive(Clone)]
 struct Tunnel {
@@ -145,6 +152,9 @@ impl Refusal {
         }
     }
 }
+pub(crate) fn cut_error(value: &str) -> String {
+    observability::cut_text(value)
+}
 pub(crate) fn cut(value: &str) -> String {
     const MARKER: &str = "…[truncated]";
     if value.len() <= 4096 {
@@ -156,84 +166,9 @@ pub(crate) fn cut(value: &str) -> String {
     }
     format!("{}{MARKER}", &value[..end])
 }
-fn safe_url(value: &str) -> String {
-    let Ok(mut url) = url::Url::parse(value) else {
-        return String::new();
-    };
-    if !matches!(url.scheme(), "http" | "https") || !url.has_host() {
-        return String::new();
-    }
-    let _username = url.set_username("");
-    let _password = url.set_password(None);
-    let query: Vec<_> = url
-        .query_pairs()
-        .map(|(key, value)| {
-            let lower = key.to_ascii_lowercase().replace(['-', '_'], "");
-            let secret = ["token", "password", "secret", "signature", "credential"]
-                .iter()
-                .any(|part| lower.contains(part))
-                || matches!(
-                    lower.as_str(),
-                    "key" | "apikey" | "xapikey" | "auth" | "authorization" | "code" | "sig"
-                );
-            (
-                key.into_owned(),
-                if secret {
-                    "[redacted]".into()
-                } else {
-                    value.into_owned()
-                },
-            )
-        })
-        .collect();
-    if url.query().is_some() {
-        url.query_pairs_mut().clear().extend_pairs(query);
-    }
-    cut(url.as_str())
-}
-struct RequestSpan {
-    span: tracing::Span,
-    status: i64,
-    decision: &'static str,
-}
-impl Drop for RequestSpan {
-    fn drop(&mut self) {
-        // Finalize once even when the connection deadline cancels forwarding.
-        self.span.record("http.response.status_code", self.status);
-        self.span.record("egress.decision", self.decision);
-    }
-}
-fn span(method: &str, url: &str, host: &str) -> RequestSpan {
-    RequestSpan {
-        span: tracing::info_span!(parent: None, "egress.request", http.request.method = %cut(method), url.full = %safe_url(url), server.address = %cut(host), http.response.status_code = tracing::field::Empty, egress.decision = tracing::field::Empty, count = tracing::field::Empty),
-        status: 0,
-        decision: "allowed",
-    }
-}
-fn protocol_refusal(host: Option<&str>) {
-    let mut span = span("", "", host.unwrap_or(""));
-    span.decision = Refusal::Protocol.decision();
-}
-fn forward_response(
-    result: Result<Response<HttpBody>, Error>,
-    span: &mut RequestSpan,
-    host: &str,
-) -> Response<HttpBody> {
-    match result {
-        Ok(response) => response,
-        Err(error) if error.is::<AddressRefused>() || error.is::<DnsFailed>() => {
-            span.decision = if error.is::<DnsFailed>() {
-                Refusal::Dns.decision()
-            } else {
-                Refusal::Address.decision()
-            };
-            reply(StatusCode::FORBIDDEN, format!("egress refused: {host}"))
-        }
-        Err(error) => {
-            tracing::warn!(%error, "egress upstream failed");
-            reply(StatusCode::BAD_GATEWAY, String::new())
-        }
-    }
+fn protocol_refusal(host: Option<&str>, rollups: &Arc<Mutex<Rollups>>) {
+    let exchange = Exchange::new(host.unwrap_or(""), None, "", "", &[], Arc::clone(rollups));
+    let Recorded = exchange.finish(Outcome::ProtocolError, None);
 }
 fn reply(status: StatusCode, body: String) -> Response<HttpBody> {
     let mut response = Response::new(
@@ -367,6 +302,88 @@ fn strip_trailers(mut frame: Frame<Bytes>) -> Frame<Bytes> {
     }
     frame
 }
+struct MeasuredRequestBody {
+    incoming: Incoming,
+    measured: Arc<Mutex<RequestMeasure>>,
+}
+impl Body for MeasuredRequestBody {
+    type Data = Bytes;
+    type Error = hyper::Error;
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+        Pin::new(&mut self.incoming).poll_frame(cx).map(|frame| {
+            frame.map(|result| {
+                let frame = result?;
+                if let Some(data) = frame.data_ref()
+                    && let Ok(mut measured) = self.measured.lock()
+                {
+                    measured.append(data);
+                }
+                Ok(strip_trailers(frame))
+            })
+        })
+    }
+    fn is_end_stream(&self) -> bool {
+        self.incoming.is_end_stream()
+    }
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.incoming.size_hint()
+    }
+}
+struct ObservedBody {
+    body: HttpBody,
+    exchange: Option<Exchange>,
+    outcome: Outcome,
+    error: Option<String>,
+}
+impl Body for ObservedBody {
+    type Data = Bytes;
+    type Error = Error;
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, Error>>> {
+        match Pin::new(&mut self.body).poll_frame(cx) {
+            Poll::Ready(Some(Ok(frame))) => {
+                if let (Some(exchange), Some(data)) = (self.exchange.as_mut(), frame.data_ref()) {
+                    exchange.response_bytes(data);
+                }
+                if self.body.is_end_stream()
+                    && let Some(exchange) = self.exchange.take()
+                {
+                    let outcome = std::mem::replace(&mut self.outcome, Outcome::Completed);
+                    let Recorded = exchange.finish(outcome, self.error.as_deref());
+                }
+                Poll::Ready(Some(Ok(frame)))
+            }
+            Poll::Ready(Some(Err(error))) => {
+                if let Some(exchange) = self.exchange.take() {
+                    let Recorded = exchange.finish(
+                        Outcome::BodyError(Phase::ResponseBody),
+                        Some(&error.to_string()),
+                    );
+                }
+                Poll::Ready(Some(Err(error)))
+            }
+            Poll::Ready(None) => {
+                if let Some(exchange) = self.exchange.take() {
+                    let outcome = std::mem::replace(&mut self.outcome, Outcome::Completed);
+                    let Recorded = exchange.finish(outcome, self.error.as_deref());
+                }
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.body.size_hint()
+    }
+}
 struct ForwardBody {
     incoming: Incoming,
     driver: Driver,
@@ -405,33 +422,67 @@ impl Engine {
         let host = uri.host().ok_or(RefusalError)?;
         let tls = uri.scheme_str() == Some("https");
         let port = uri.port_u16().unwrap_or(if tls { 443 } else { 80 });
-        async {
+        let span = tracing::debug_span!(target: crate::config::Category::EgressConnect.target(), "egress.connect",
+            telemetry.detail = crate::telemetry::detail!(crate::config::Category::EgressConnect),
+            server.address = %cut(host), server.port = i64::from(port),
+            egress.connect.dns_ms = tracing::field::Empty,
+            egress.connect.tcp_ms = tracing::field::Empty,
+            egress.connect.tls_ms = tracing::field::Empty);
+        let mut attempt = ConnectAttempt::new(&self.rollups, host, port);
+        let result = async {
+            let standard = tracing::enabled!(target: "egress.connect", tracing::Level::DEBUG);
+            let started = Instant::now();
             let addresses = resolved_addresses(
                 tokio::net::lookup_host((host.trim_matches(['[', ']']), port)).await,
                 &self.egress.allow_private,
             )?;
+            if standard {
+                span.record(
+                    "egress.connect.dns_ms",
+                    i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX),
+                );
+            }
+            let started = Instant::now();
             let tcp = TcpStream::connect(addresses.as_slice()).await?;
+            if standard {
+                span.record(
+                    "egress.connect.tcp_ms",
+                    i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX),
+                );
+            }
             if tls {
-                Ok::<Stream, Error>(Box::new(
-                    TlsConnector::from(Arc::clone(&self.tls))
-                        .connect(ServerName::try_from(host.to_owned())?, tcp)
-                        .await?,
-                ))
+                let started = Instant::now();
+                let stream = TlsConnector::from(Arc::clone(&self.tls))
+                    .connect(ServerName::try_from(host.to_owned())?, tcp)
+                    .await?;
+                if standard {
+                    span.record(
+                        "egress.connect.tls_ms",
+                        i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX),
+                    );
+                }
+                Ok::<Stream, Error>(Box::new(stream))
             } else {
                 Ok::<Stream, Error>(Box::new(tcp))
             }
         }
-        .instrument(
-            tracing::info_span!("egress.connect", server.address = %cut(host), server.port = port),
-        )
-        .await
+        .instrument(span.clone())
+        .await;
+        attempt.complete(match &result {
+            Ok(_) => ConnectOutcome::Succeeded,
+            Err(_) => ConnectOutcome::Failed,
+        });
+        result
     }
     async fn forward(
         &self,
         mut req: Request<Incoming>,
         uri: Uri,
+        exchange: &mut Exchange,
     ) -> Result<Response<HttpBody>, Error> {
+        exchange.phase(Phase::Connect);
         let stream = self.connect(&uri).await?;
+        exchange.phase(Phase::Headers);
         let (mut sender, mut driver) =
             hyper::client::conn::http1::handshake(TokioIo::new(stream)).await?;
         // Preserve the validated wire value even if Connection nominates Host.
@@ -444,11 +495,11 @@ impl Engine {
         );
         *req.uri_mut() = uri.path_and_query().ok_or(RefusalError)?.as_str().parse()?;
         let mut done = false;
+        exchange.phase(Phase::RequestBody);
+        let measured = exchange.measure();
         let response = {
             let sent =
-                sender.send_request(req.map(|body| {
-                    body.map_frame(strip_trailers as fn(Frame<Bytes>) -> Frame<Bytes>)
-                }));
+                sender.send_request(req.map(|incoming| MeasuredRequestBody { incoming, measured }));
             tokio::pin!(sent);
             std::future::poll_fn(|cx| {
                 let progress = Pin::new(&mut driver).poll(cx);
@@ -464,6 +515,7 @@ impl Engine {
             })
             .await?
         };
+        exchange.phase(Phase::ResponseBody);
         let (mut parts, incoming) = response.into_parts();
         strip(&mut parts.headers);
         Ok(Response::from_parts(
@@ -512,36 +564,91 @@ impl Engine {
         } else {
             req.uri().to_string()
         };
-        let mut span = span(req.method().as_str(), &url, &host);
+        let port = url::Url::parse(&url)
+            .ok()
+            .and_then(|url| url.port_or_known_default());
+        let mut exchange = Exchange::new(
+            &host,
+            port,
+            req.method().as_str(),
+            &url,
+            &self.omit.query_keys,
+            Arc::clone(&self.rollups),
+        );
+        exchange.headers(req.headers(), HeaderSide::Request, &self.omit.headers);
         let decision = destination(&req, tunnel, &self.egress.allow);
-        let response = match decision {
-            Err(reason) => {
-                span.decision = reason.decision();
-                reply(StatusCode::FORBIDDEN, format!("egress refused: {host}"))
-            }
+        let (response, outcome, error) = match decision {
+            Err(reason) => (
+                reply(StatusCode::FORBIDDEN, format!("egress refused: {host}")),
+                Outcome::Refused(reason),
+                None,
+            ),
+            Ok(uri) if req.method() == hyper::Method::CONNECT => match upgrade.lock() {
+                Ok(mut slot) => {
+                    *slot = uri.authority().cloned().map(|authority| Tunnel {
+                        authority,
+                        sni: None,
+                    });
+                    (reply(StatusCode::OK, String::new()), Outcome::Tunnel, None)
+                }
+                Err(error) => {
+                    tracing::error!(name: "egress.exchange.lock_poisoned", target: crate::config::Category::EgressExchange.target(), {
+                            telemetry.detail = crate::telemetry::detail!(crate::config::Category::EgressExchange), %error,
+                        }, "egress upgrade lock poisoned");
+                    (
+                        reply(StatusCode::INTERNAL_SERVER_ERROR, String::new()),
+                        Outcome::ProtocolError,
+                        None,
+                    )
+                }
+            },
             Ok(uri) => {
-                if req.method() == hyper::Method::CONNECT {
-                    match upgrade.lock() {
-                        Ok(mut slot) => {
-                            *slot = uri.authority().cloned().map(|authority| Tunnel {
-                                authority,
-                                sni: None,
-                            });
-                            reply(StatusCode::OK, String::new())
-                        }
-                        Err(error) => {
-                            tracing::error!(%error, "egress upgrade lock poisoned");
-                            reply(StatusCode::INTERNAL_SERVER_ERROR, String::new())
-                        }
+                let current = exchange.span();
+                match self
+                    .forward(req, uri, &mut exchange)
+                    .instrument(current)
+                    .await
+                {
+                    Ok(response) => (response, Outcome::Completed, None),
+                    Err(error) if error.is::<AddressRefused>() || error.is::<DnsFailed>() => {
+                        let reason = if error.is::<DnsFailed>() {
+                            Refusal::Dns
+                        } else {
+                            Refusal::Address
+                        };
+                        (
+                            reply(StatusCode::FORBIDDEN, format!("egress refused: {host}")),
+                            Outcome::Refused(reason),
+                            None,
+                        )
                     }
-                } else {
-                    let result = self.forward(req, uri).instrument(span.span.clone()).await;
-                    forward_response(result, &mut span, &host)
+                    Err(error) => (
+                        reply(StatusCode::BAD_GATEWAY, String::new()),
+                        Outcome::UpstreamFailed,
+                        Some(error.to_string()),
+                    ),
                 }
             }
         };
-        span.status = i64::from(response.status().as_u16());
-        Ok(response)
+        exchange.status(response.status());
+        exchange.headers(response.headers(), HeaderSide::Response, &self.omit.headers);
+        exchange.phase(Phase::ResponseBody);
+        let (parts, body) = response.into_parts();
+        if body.is_end_stream() {
+            let Recorded = exchange.finish(outcome, error.as_deref());
+            Ok(Response::from_parts(parts, body))
+        } else {
+            Ok(Response::from_parts(
+                parts,
+                ObservedBody {
+                    body,
+                    exchange: Some(exchange),
+                    outcome,
+                    error,
+                }
+                .boxed_unsync(),
+            ))
+        }
     }
     async fn connection(
         &self,
@@ -567,13 +674,31 @@ impl Engine {
                             sni: Some(sni),
                         });
                     }
-                    Box::new(start.into_stream(server).await?)
+                    let tls = match start.into_stream(server).await {
+                        Ok(tls) => tls,
+                        Err(error) => {
+                            record.request.set(true);
+                            let exchange = Exchange::new(
+                                record.host.as_deref().unwrap_or(""),
+                                Some(443),
+                                "",
+                                "https://",
+                                &self.omit.query_keys,
+                                Arc::clone(&self.rollups),
+                            );
+                            let Recorded = exchange
+                                .finish(Outcome::CertificateRejected, Some(&error.to_string()));
+                            return Err(error.into());
+                        }
+                    };
+                    Box::new(tls)
                 }
                 Ok(Classified::Http(buffered)) => Box::new(buffered),
                 Ok(Classified::Refuse) => {
-                    protocol_refusal(record.host.as_deref());
+                    protocol_refusal(record.host.as_deref(), &self.rollups);
                     return Ok(());
                 }
+                Ok(Classified::Closed) => return Ok(()),
                 Err(error) => return Err(error),
             };
             let upgrade = Mutex::new(None);
@@ -644,7 +769,11 @@ impl Engine {
         stop: impl Future<Output = ()>,
     ) -> Result<(), Error> {
         if let Some(listener) = listeners.explicit.as_ref().or(listeners.http.as_ref()) {
-            tracing::info!(addr = %listener.local_addr()?, "listening");
+            let depth = crate::telemetry::detail!(crate::config::Category::VmLifecycle);
+            tracing::info!(name: "vm_runner.boot.egress_listening", target: crate::config::Category::VmLifecycle.target(), {
+                telemetry.detail = depth,
+                addr = %listener.local_addr()?,
+            }, "listening");
         }
         let (dns_stop, stopped) = watch::channel(false);
         let mut dns_worker = listeners.udp.take().map(|(socket, address)| {
@@ -670,10 +799,21 @@ impl Engine {
             });
         });
         tokio::pin!(stop);
+        let mut ticker = tokio::time::interval_at(
+            Instant::now() + crate::ROLLUP_INTERVAL,
+            crate::ROLLUP_INTERVAL,
+        );
         let outcome = loop {
             tokio::select! {
                 biased;
                 _ = &mut stop => break Ok(()),
+                _ = ticker.tick() => {
+                    if let Ok(mut rollups) = self.rollups.lock() {
+                        let batch = rollups.tick();
+                        drop(rollups);
+                        batch.emit();
+                    }
+                }
                 result = async {
                     match &mut dns_worker {
                         Some(worker) => worker.await,
@@ -691,14 +831,16 @@ impl Engine {
                     let (stream, peer, protocol) = match accepted {
                         Ok(accepted) => accepted,
                         Err(error) => {
-                            tracing::warn!(%error, "egress accept failed");
+                            tracing::warn!(name: "egress.connect.accept_failed", target: crate::config::Category::EgressConnect.target(), {
+                                telemetry.detail = crate::telemetry::detail!(crate::config::Category::EgressConnect), %error,
+                            }, "egress accept failed");
                             continue;
                         }
                     };
                     if matches!(protocol, gateway::Protocol::Dns(_))
                         && !listeners.dns_peers.contains(&peer.ip())
                     {
-                        gateway::refusal("refused:address");
+                        gateway::refusal(&self, gateway::Decision::Address, "");
                         continue;
                     }
                     let engine = Arc::clone(&self);
@@ -714,8 +856,10 @@ impl Engine {
                     workers.spawn_blocking(move || tracing::dispatcher::with_default(&dispatch, || {
                         let mut record = ConnectionRecord::default();
                         if let Err(error) = runtime.block_on(engine.bounded_connection(Box::new(stream), &mut record, started, protocol)) {
-                            if matches!(protocol, gateway::Protocol::Http) { record.failed(); }
-                            tracing::warn!(%error, "egress connection failed");
+                            if matches!(protocol, gateway::Protocol::Http) { record.failed(&engine.rollups); }
+                            tracing::warn!(name: "egress.connect.failed", target: crate::config::Category::EgressConnect.target(), {
+                                telemetry.detail = crate::telemetry::detail!(crate::config::Category::EgressConnect), %error,
+                            }, "egress connection failed");
                         }
                     }));
                 }
@@ -739,6 +883,11 @@ impl Engine {
         if let Err(error) = refusal_worker.await {
             outcome = Err(error.into());
         }
+        if let Ok(mut rollups) = self.rollups.lock() {
+            let batch = rollups.flush();
+            drop(rollups);
+            batch.emit();
+        }
         outcome
     }
 }
@@ -748,9 +897,11 @@ async fn connection_refusals(mut refused: watch::Receiver<i64>) {
         // At most one span per second; a slow exporter only grows the coalesced count.
         tokio::time::sleep(Duration::from_secs(1)).await;
         let total = *refused.borrow_and_update();
-        let mut span = span("", "", "");
-        span.decision = Refusal::Connections.decision();
-        span.span.record("count", total - exported);
+        tracing::info!(name: "egress.refused", target: "egress.drop", {
+            telemetry.detail = crate::telemetry::detail!(crate::config::Category::EgressDrop),
+            egress.decision = Refusal::Connections.decision(),
+            egress.refused.count = total - exported,
+        }, "egress.refused");
         exported = total;
     }
 }
@@ -886,9 +1037,9 @@ struct ConnectionRecord {
     request: Cell<bool>,
 }
 impl ConnectionRecord {
-    fn failed(&self) {
+    fn failed(&self, rollups: &Arc<Mutex<Rollups>>) {
         if !self.request.get() {
-            protocol_refusal(self.host.as_deref());
+            protocol_refusal(self.host.as_deref(), rollups);
         }
     }
 }
@@ -962,13 +1113,19 @@ pub(crate) struct Gateway {
     listeners: gateway::Listeners,
 }
 impl Gateway {
-    pub(crate) async fn bind(egress: Egress, ca: Ca) -> Result<Self, Error> {
+    pub(crate) async fn bind(
+        egress: Egress,
+        ca: Ca,
+        omit: crate::config::Omit,
+    ) -> Result<Self, Error> {
         let roots = RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         Ok(Self {
             engine: Arc::new(Engine {
                 ca,
                 egress,
                 tls: client_config(roots)?,
+                omit,
+                rollups: Arc::new(Mutex::new(Rollups::new())),
             }),
             listeners: gateway::Listeners::bind(None, Some(std::net::Ipv4Addr::new(10, 0, 2, 1)))
                 .await?,
@@ -1003,6 +1160,11 @@ pub async fn run(
             ca,
             egress: selected.1.egress.clone(),
             tls: client_config(roots)?,
+            omit: config
+                .telemetry
+                .as_ref()
+                .map_or_else(Default::default, |telemetry| telemetry.omit.clone()),
+            rollups: Arc::new(Mutex::new(Rollups::new())),
         });
         engine
             .serve(

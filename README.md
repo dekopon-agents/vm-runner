@@ -152,6 +152,18 @@ escape between the check and open. Large reads may return fewer bytes than reque
 its JSON envelope within the 1 MiB frame cap; continue at the returned byte count until `eof`.
 A ping returns `{"ok":true}`. Other platforms print `linux only` and exit 2.
 
+## Guest toolkit
+
+Alongside the browser tools, the image includes Python 3, uv 0.12.21, jq,
+ripgrep (`rg`), zip/unzip and Poppler's `pdftotext`/`pdfinfo`. The exec-safe uv
+wrapper uses system interpreters and disables automatic interpreter downloads,
+while allowing `uv pip` to discover nearby/activated venvs. Venvs and its default
+cache are writable under the jail home.
+No pip or `python3-venv` package is separately installed. Package/network access
+still follows the existing egress policy, with no new allowlisting.
+See [the guest image README](images/guest/README.md#small-offline-toolkit) for
+build-time offline smoke checks and image verification.
+
 ## Guest browser tools
 
 The guest keeps its existing Playwright-backed custom `browse` CLI as the default.

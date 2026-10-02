@@ -306,6 +306,20 @@ pub(crate) struct Jails {
     pub cpu_request_milli: Option<NonZeroU32>,
     #[serde(default = "fetch_timeout")]
     pub fetch_timeout_seconds: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub models: Option<Models>,
+}
+/// The guest route to dekopon-gatewayd's model proxy; absent means `models.vm.internal` is not served.
+#[derive(Clone, Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub(crate) struct Models {
+    /// dekopon-gatewayd's proxy listener, an `https://host[:port]` origin.
+    pub upstream: String,
+    /// cert-manager Secret in `jails.namespace` holding the jail client certificate.
+    pub client_cert_secret: String,
+    /// Written by the controller into each jail's config; ignored in the controller's own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
 }
 fn fetch_timeout() -> u64 {
     15 * 60
@@ -385,6 +399,29 @@ impl Config {
                 })
             {
                 errors.push(Conflict::Jails("cpuRequestMilli"));
+            }
+            if let Some(models) = &jails.models {
+                for (valid, field) in [
+                    (
+                        crate::egress::models::upstream(&models.upstream).is_ok(),
+                        "models.upstream",
+                    ),
+                    (
+                        !models.client_cert_secret.is_empty(),
+                        "models.clientCertSecret",
+                    ),
+                    (
+                        models
+                            .subject
+                            .as_deref()
+                            .is_none_or(|s| crate::egress::models::subject(s).is_ok()),
+                        "models.subject",
+                    ),
+                ] {
+                    if !valid {
+                        errors.push(Conflict::Jails(field));
+                    }
+                }
             }
             for (valid, field) in [
                 (!jails.namespace.is_empty(), "namespace"),

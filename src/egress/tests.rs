@@ -44,7 +44,7 @@ impl Proxy {
         exporter: InMemorySpanExporter,
         processor_exporter: impl opentelemetry_sdk::trace::SpanExporter + 'static,
     ) -> Self {
-        Self::with_listeners(roots, egress, exporter, processor_exporter, None).await
+        Self::with_listeners(roots, egress, exporter, processor_exporter, None, None).await
     }
     async fn with_listeners(
         roots: RootCertStore,
@@ -52,6 +52,7 @@ impl Proxy {
         exporter: InMemorySpanExporter,
         processor_exporter: impl opentelemetry_sdk::trace::SpanExporter + 'static,
         listeners: Option<gateway::Listeners>,
+        models: Option<models::Route>,
     ) -> Self {
         let (ca, pem) = Ca::new().unwrap();
         let mut trust = RootCertStore::empty();
@@ -86,6 +87,7 @@ impl Proxy {
             ca,
             egress,
             tls: client_config(roots).unwrap(),
+            models,
         });
         let task = tokio::spawn(
             engine
@@ -484,6 +486,7 @@ async fn cancelled_upstream_request_exports_exactly_one_zero_status_without_prot
             ca: Ca::new().unwrap().0,
             egress: local_egress(),
             tls: client_config(RootCertStore::empty()).unwrap(),
+            models: None,
         };
         let (mut client, stream) = tokio::io::duplex(4096);
         client.write_all(format!("GET http://localhost:{port}/ HTTP/1.1\r\nHost: localhost:{port}\r\n\r\n").as_bytes()).await.unwrap();
@@ -686,6 +689,7 @@ async fn idle_connection_closes_only_after_inactivity_and_reads_reset_the_deadli
         ca: Ca::new().unwrap().0,
         egress: local_egress(),
         tls: client_config(RootCertStore::empty()).unwrap(),
+        models: None,
     };
     let (mut client, stream) = tokio::io::duplex(4096);
     let mut record = ConnectionRecord::default();
@@ -717,6 +721,7 @@ async fn maximum_lifetime_closes_even_an_active_connection() {
         ca: Ca::new().unwrap().0,
         egress,
         tls: client_config(RootCertStore::empty()).unwrap(),
+        models: None,
     };
     let (mut client, stream) = tokio::io::duplex(4096);
     let mut record = ConnectionRecord::default();

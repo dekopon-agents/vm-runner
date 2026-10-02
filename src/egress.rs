@@ -38,6 +38,7 @@ use tokio_rustls::{
 use tracing::Instrument;
 
 mod gateway;
+pub(crate) mod models;
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
 type HttpBody = UnsyncBoxBody<Bytes, Error>;
@@ -118,6 +119,12 @@ struct Engine {
     ca: Ca,
     egress: Egress,
     tls: Arc<ClientConfig>,
+    models: Option<models::Route>,
+}
+impl Engine {
+    fn routes_models(&self, host: &str) -> bool {
+        self.models.is_some() && models::Route::addressed(host)
+    }
 }
 #[derive(Clone)]
 struct Tunnel {
@@ -279,7 +286,7 @@ fn port(authority: &hyper::http::uri::Authority, default: u16) -> Result<u16, Re
 fn destination(
     req: &Request<Incoming>,
     tunnel: Option<&Tunnel>,
-    allow: &[String],
+    allowed: impl Fn(&str) -> bool,
 ) -> Result<Uri, Refusal> {
     let connect = req.method() == hyper::Method::CONNECT;
     if connect && tunnel.is_some() {
@@ -325,7 +332,7 @@ fn destination(
     {
         return Err(Refusal::HostMismatch);
     }
-    if !allowed(authority.host(), allow) {
+    if !allowed(authority.host()) {
         return Err(Refusal::NotAllowed);
     }
     Uri::builder()
@@ -349,6 +356,7 @@ fn strip(headers: &mut hyper::HeaderMap) {
     for name in [
         "traceparent",
         "tracestate",
+        models::SUBJECT_HEADER,
         "connection",
         "proxy-connection",
         "proxy-authorization",
@@ -431,13 +439,28 @@ impl Engine {
         mut req: Request<Incoming>,
         uri: Uri,
     ) -> Result<Response<HttpBody>, Error> {
-        let stream = self.connect(&uri).await?;
+        let route = self
+            .models
+            .as_ref()
+            .filter(|_| uri.host().is_some_and(models::Route::addressed));
+        let stream = match route {
+            Some(route) => route.connect().await?,
+            None => self.connect(&uri).await?,
+        };
         let (mut sender, mut driver) =
             hyper::client::conn::http1::handshake(TokioIo::new(stream)).await?;
         // Preserve the validated wire value even if Connection nominates Host.
-        let host = req.headers().get(header::HOST).ok_or(RefusalError)?.clone();
+        let host = match route {
+            Some(route) => route.authority(),
+            None => req.headers().get(header::HOST).ok_or(RefusalError)?.clone(),
+        };
         strip(req.headers_mut());
         req.headers_mut().insert(header::HOST, host);
+        if let Some(route) = route {
+            // Only the jail asserts the subject; strip() already removed the guest's copies.
+            req.headers_mut()
+                .insert(models::SUBJECT_HEADER, route.subject());
+        }
         req.headers_mut().insert(
             header::CONNECTION,
             hyper::http::HeaderValue::from_static("close"),
@@ -513,7 +536,9 @@ impl Engine {
             req.uri().to_string()
         };
         let mut span = span(req.method().as_str(), &url, &host);
-        let decision = destination(&req, tunnel, &self.egress.allow);
+        let decision = destination(&req, tunnel, |host| {
+            allowed(host, &self.egress.allow) || self.routes_models(host)
+        });
         let response = match decision {
             Err(reason) => {
                 span.decision = reason.decision();
@@ -962,13 +987,18 @@ pub(crate) struct Gateway {
     listeners: gateway::Listeners,
 }
 impl Gateway {
-    pub(crate) async fn bind(egress: Egress, ca: Ca) -> Result<Self, Error> {
+    pub(crate) async fn bind(
+        egress: Egress,
+        ca: Ca,
+        models: Option<models::Route>,
+    ) -> Result<Self, Error> {
         let roots = RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         Ok(Self {
             engine: Arc::new(Engine {
                 ca,
                 egress,
                 tls: client_config(roots)?,
+                models,
             }),
             listeners: gateway::Listeners::bind(None, Some(std::net::Ipv4Addr::new(10, 0, 2, 1)))
                 .await?,
@@ -1003,6 +1033,8 @@ pub async fn run(
             ca,
             egress: selected.1.egress.clone(),
             tls: client_config(roots)?,
+            // The standalone egress proxy serves no VM, so it has no subject to assert.
+            models: None,
         });
         engine
             .serve(

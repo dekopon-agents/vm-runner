@@ -48,6 +48,8 @@ enum Error {
     Profile,
     #[error("jail requires jails.controllerSubject")]
     ControllerSubject,
+    #[error("jail requires jails.models.subject when jails.models is set")]
+    ModelsSubject,
     #[error("jail netns requires {path}={expected}; set the pod sysctl before startup")]
     Sysctl {
         path: &'static str,
@@ -297,10 +299,16 @@ pub async fn run(config: Config, profile: &str, session: &str) -> Result<()> {
     if uuid::Uuid::parse_str(session)?.get_version_num() != 7 {
         return Err(Error::Session.into());
     }
-    let controller_subject = config
-        .jails
-        .ok_or(Error::ControllerSubject)?
-        .controller_subject;
+    let jails = config.jails.ok_or(Error::ControllerSubject)?;
+    let controller_subject = jails.controller_subject;
+    let models = match jails.models {
+        Some(models) => Some(crate::egress::models::Route::new(
+            &models.upstream,
+            models.subject.as_deref().ok_or(Error::ModelsSubject)?,
+            crate::egress::models::TLS_DIR.into(),
+        )?),
+        None => None,
+    };
     let selected = config
         .profiles
         .0
@@ -367,8 +375,11 @@ pub async fn run(config: Config, profile: &str, session: &str) -> Result<()> {
         let result = async {
             let (ca, pem) = phase("ca", async { crate::egress::Ca::new() }).await?;
             network(&work).await?;
-            let gateway =
-                phase("gateway", crate::egress::Gateway::bind(selected.egress, ca)).await?;
+            let gateway = phase(
+                "gateway",
+                crate::egress::Gateway::bind(selected.egress, ca, models),
+            )
+            .await?;
             let handle = tokio::runtime::Handle::current();
             let dispatch = tracing::dispatcher::get_default(Clone::clone);
             workers.spawn_blocking(move || {

@@ -431,3 +431,31 @@ async fn terminating_pods_count_toward_quota_but_never_satisfy_create_or_get_unt
         Created::New(_)
     ));
 }
+#[test]
+fn models_route_reports_every_invalid_field_and_rejects_unknown_keys() {
+    let mut config = config();
+    let config = Arc::get_mut(&mut config).unwrap();
+    let jails = config.jails.as_mut().unwrap();
+    jails.image = format!("runner@sha256:{}", "a".repeat(64));
+    jails.models = Some(
+        serde_json::from_value(
+            json!({"upstream":"http://dekopon:9090/v1","clientCertSecret":"","subject":"system:serviceaccount:dekopon:x"}),
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        config.conflicts(),
+        [
+            "models.upstream",
+            "models.clientCertSecret",
+            "models.subject"
+        ]
+        .map(crate::config::Conflict::Jails)
+    );
+    assert!(
+        serde_json::from_value::<crate::config::Models>(
+            json!({"upstream":"https://dekopon:9090","clientCertSecret":"s","caFile":"/x"})
+        )
+        .is_err()
+    );
+}

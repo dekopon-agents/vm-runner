@@ -486,3 +486,55 @@ async fn reap_cannot_free_quota_or_orphan_a_pod_while_create_is_in_flight() {
     assert!(f.controller.sessions.lock().unwrap().is_empty());
     f.tasks.shutdown().await;
 }
+#[tokio::test]
+async fn models_route_mounts_the_client_cert_secret_0400_and_writes_the_caller_subject() {
+    let mut f = Fixture::new().await;
+    let config = Arc::get_mut(&mut Arc::get_mut(&mut f.controller).unwrap().config).unwrap();
+    config.jails.as_mut().unwrap().models = Some(
+        serde_json::from_value(json!({"upstream":"https://dekopon.dekopon.svc.cluster.local:9090","clientCertSecret":"vm-runner-jail-models-tls"}))
+            .unwrap(),
+    );
+    assert!(config.conflicts().is_empty());
+    let id = f.session();
+    assert!(matches!(
+        f.controller.exec(SUBJECT, &id, &exec()).await.unwrap(),
+        ExecResponse::Pending(_)
+    ));
+    let captured = f.captured.lock().unwrap();
+    let pod = &captured[0];
+    assert!(pod["spec"]["volumes"].as_array().unwrap().contains(&json!(
+        {"name":"models-tls","secret":{"secretName":"vm-runner-jail-models-tls","defaultMode":0o400}}
+    )));
+    assert!(
+        pod["spec"]["containers"][0]["volumeMounts"]
+            .as_array()
+            .unwrap()
+            .contains(&json!({"name":"models-tls","mountPath":"/models-tls","readOnly":true}))
+    );
+    let bytes = STANDARD
+        .decode(captured[1]["data"]["config.json"].as_str().unwrap())
+        .unwrap();
+    let guest: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        guest["jails"]["models"],
+        json!({"upstream":"https://dekopon.dekopon.svc.cluster.local:9090","clientCertSecret":"vm-runner-jail-models-tls","subject":"dekopon:default"})
+    );
+    let parsed: Config = serde_json::from_slice(&bytes).unwrap();
+    assert!(parsed.conflicts().is_empty());
+}
+#[tokio::test]
+async fn without_models_the_pod_and_jail_config_are_unchanged() {
+    let mut f = Fixture::new().await;
+    let id = f.session();
+    assert!(matches!(
+        f.controller.exec(SUBJECT, &id, &exec()).await.unwrap(),
+        ExecResponse::Pending(_)
+    ));
+    let captured = f.captured.lock().unwrap();
+    assert!(!captured[0].to_string().contains("models"));
+    let bytes = STANDARD
+        .decode(captured[1]["data"]["config.json"].as_str().unwrap())
+        .unwrap();
+    let guest: Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(guest["jails"].get("models").is_none());
+}

@@ -283,6 +283,34 @@ peer set); port-zero datagrams are dropped. Unspecified, broadcast, multicast an
 idle timeout and shares the connection cap and maximum lifetime with HTTP/TLS. Both gateway HTTP ports use the same fail-closed classifier and upstream address
 policy as the explicit proxy; origin-form HTTP uses Host, and TLS uses SNI checked against Host.
 
+## Model route (`jails.models`)
+
+Optional, and additive: without it nothing below applies.
+
+```yaml
+jails:
+  models:
+    upstream: https://dekopon.dekopon.svc.cluster.local:9090 # dekopond's proxy listener
+    clientCertSecret: vm-runner-jail-models-tls # cert-manager Secret in jails.namespace
+```
+
+The controller mounts `clientCertSecret` into each jail pod at `/models-tls` (mode 0400, like
+the other jail credentials). The Secret must hold `tls.crt`, `tls.key` and `ca.crt`, and
+`ca.crt` must also anchor dekopond's server certificate. The controller also writes
+`jails.models.subject` into the jail config: the caller's service account as
+`namespace:name` (for example `dekopon:gylmar-vm`). A `subject` in the controller's own config
+is ignored.
+
+In the jail, the DNS stub answers `models.vm.internal`. Requests addressed to it by SNI,
+origin-form Host or CONNECT skip the allowlist and the address policy. They go to `upstream`
+over mTLS, and the jail rereads the Secret files on every connection, so rotation needs no
+restart. Host is rewritten to the upstream authority and the path is unchanged. The jail sets
+`x-dekopon-vm-subject` to the subject. It strips that header from all guest egress (requests,
+trailers and responses), so a guest can never set it. Guests use
+`https://models.vm.internal` (Anthropic) or `https://models.vm.internal/v1` (OpenAI); the
+paths dekopond serves are `/v1/messages`, `/v1/messages/count_tokens`, `/v1/responses` and
+`/v1/chat/completions`. `Jails` denies unknown fields, so ship the image before this key.
+
 ## Jail runtime and image cache
 
 `vm-runnerd fetch-image --digest <ref@sha256:…> --cache <dir>` anonymously selects the native

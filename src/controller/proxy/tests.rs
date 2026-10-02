@@ -524,7 +524,7 @@ async fn models_route_mounts_the_client_cert_secret_0400_and_writes_the_caller_s
 }
 #[tokio::test]
 async fn without_models_the_pod_and_jail_config_are_unchanged() {
-    let mut f = Fixture::new().await;
+    let f = Fixture::new().await;
     let id = f.session();
     assert!(matches!(
         f.controller.exec(SUBJECT, &id, &exec()).await.unwrap(),

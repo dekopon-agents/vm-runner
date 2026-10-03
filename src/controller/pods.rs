@@ -303,6 +303,14 @@ impl Controller {
         }
         let mut jail_config = serde_json::to_value(jails)?;
         jail_config["tokenFile"] = json!("/kube/token");
+        if jails.models.is_some() {
+            // The guest subject is the caller's service account as `namespace:name`.
+            let subject = session
+                .subject
+                .strip_prefix("system:serviceaccount:")
+                .ok_or(Error::Protocol)?;
+            jail_config["models"]["subject"] = json!(subject);
+        }
         let config = json!({"listen":"0.0.0.0:8080", "jails":jail_config, "auth":{"audience":jails.controller_audience, "subjects":[jails.controller_subject],
             "issuers":[{"issuer":claims.iss,"caFile":"/kube/ca.crt","tokenFile":"/kube/token"}]},
             "profiles":{&session.body.profile:profile}, "shapes":{&profile.shape:shape},
@@ -323,8 +331,7 @@ impl Controller {
             resources["smarter-devices/kvm"] = json!("1");
             resources["smarter-devices/net_tun"] = json!("1");
         }
-        let pod = serde_json::from_value(
-            json!({"apiVersion":"v1", "kind":"Pod", "metadata":{"name":name,
+        let mut pod = json!({"apiVersion":"v1", "kind":"Pod", "metadata":{"name":name,
             "labels":{SESSION:session.body.session_id, PROFILE:session.body.profile,SUBJECT_HASH:hash},
             "annotations":{SUBJECT:session.subject, NAME:session.body.name, CREATED:session.created.to_string(), ACTIVE:now().to_string()}},
             "spec":{"restartPolicy":"Never", "terminationGracePeriodSeconds":60, "serviceAccountName":"vm-runner-jail", "automountServiceAccountToken":false,
@@ -342,8 +349,20 @@ impl Controller {
                     {"name":"runtime","emptyDir":{"sizeLimit":format!("{}Mi",u64::from(shape.disk.get())+64)}},
                     {"name":"console","emptyDir":{"sizeLimit":"16Mi"}},
                     {"name":"config","secret":{"secretName":name,"defaultMode":256}},
-                    {"name":"api","projected":{"defaultMode":256,"sources":[{"serviceAccountToken":{"path":"token","expirationSeconds":3600}},{"configMap":{"name":"kube-root-ca.crt","items":[{"key":"ca.crt","path":"ca.crt"}]}}]}}]}}),
-        )?;
+                    {"name":"api","projected":{"defaultMode":256,"sources":[{"serviceAccountToken":{"path":"token","expirationSeconds":3600}},{"configMap":{"name":"kube-root-ca.crt","items":[{"key":"ca.crt","path":"ca.crt"}]}}]}}]}});
+        if let Some(models) = &jails.models {
+            // 0440 root:1000 under the pod's fsGroup, like `/kube/token`; the jail rereads it per
+            // connection, so cert-manager's rotation reaches running jails without a restart.
+            let spec = &mut pod["spec"];
+            spec["volumes"].as_array_mut().ok_or(Error::Protocol)?.push(json!(
+                {"name":"models-tls","secret":{"secretName":models.client_cert_secret,"defaultMode":256}}));
+            spec["containers"][0]["volumeMounts"]
+                .as_array_mut()
+                .ok_or(Error::Protocol)?
+                .push(json!(
+                {"name":"models-tls","mountPath":crate::egress::models::TLS_DIR,"readOnly":true}));
+        }
+        let pod = serde_json::from_value(pod)?;
         Ok((
             pod,
             Secret {

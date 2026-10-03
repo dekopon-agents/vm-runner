@@ -17,6 +17,13 @@ impl Gateway {
         Self::with_peers(egress, [IpAddr::V4(Ipv4Addr::LOCALHOST)].into()).await
     }
     async fn with_peers(egress: Egress, dns_peers: std::collections::HashSet<IpAddr>) -> Self {
+        Self::with_models(egress, dns_peers, None).await
+    }
+    async fn with_models(
+        egress: Egress,
+        dns_peers: std::collections::HashSet<IpAddr>,
+        models: Option<models::Route>,
+    ) -> Self {
         let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let https = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let https_addr = https.local_addr().unwrap();
@@ -39,6 +46,7 @@ impl Gateway {
             exporter.clone(),
             exporter,
             Some(listeners),
+            models,
         )
         .await;
         Self {
@@ -343,6 +351,7 @@ async fn datagram_fault_keeps_serving(port_zero: bool, receive_error: bool) {
         ca: Ca::new().unwrap().0,
         egress: local_egress(),
         tls: client_config(RootCertStore::empty()).unwrap(),
+        models: None,
     };
     let exporter = InMemorySpanExporter::default();
     let provider = SdkTracerProvider::builder()
@@ -583,6 +592,7 @@ async fn tcp_dns_idle_closes_at_ten_seconds_and_activity_resets_the_deadline() {
         ca: Ca::new().unwrap().0,
         egress: local_egress(),
         tls: client_config(RootCertStore::empty()).unwrap(),
+        models: None,
     };
     let exporter = InMemorySpanExporter::default();
     let provider = SdkTracerProvider::builder()
@@ -623,4 +633,335 @@ async fn tcp_dns_idle_closes_at_ten_seconds_and_activity_resets_the_deadline() {
     }
     assert_protocol_span(&exporter.get_finished_spans().unwrap());
     provider.shutdown().unwrap();
+}
+
+struct ModelPki {
+    issuer: rcgen::Issuer<'static, KeyPair>,
+    ca: String,
+}
+impl ModelPki {
+    fn new() -> Self {
+        let mut params = rcgen::CertificateParams::default();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "test homelab-ca");
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let key = KeyPair::generate().unwrap();
+        let ca = params.self_signed(&key).unwrap().pem();
+        Self {
+            issuer: rcgen::Issuer::new(params, key),
+            ca,
+        }
+    }
+    fn leaf(&self, san: rcgen::SanType, usage: rcgen::ExtendedKeyUsagePurpose) -> (String, String) {
+        let mut params = rcgen::CertificateParams::default();
+        params.subject_alt_names = vec![san];
+        params.extended_key_usages = vec![usage];
+        let key = KeyPair::generate().unwrap();
+        let cert = params.signed_by(&key, &self.issuer).unwrap();
+        (cert.pem(), key.serialize_pem())
+    }
+    fn client(&self, dir: &std::path::Path) -> Vec<u8> {
+        let (cert, key) = self.leaf(
+            rcgen::SanType::URI(
+                "spiffe://homelab/ns/vm-runner/sa/vm-runner-jail"
+                    .try_into()
+                    .unwrap(),
+            ),
+            rcgen::ExtendedKeyUsagePurpose::ClientAuth,
+        );
+        std::fs::write(dir.join("tls.crt"), &cert).unwrap();
+        std::fs::write(dir.join("tls.key"), key).unwrap();
+        std::fs::write(dir.join("ca.crt"), &self.ca).unwrap();
+        CertificateDer::from_pem_slice(cert.as_bytes())
+            .unwrap()
+            .to_vec()
+    }
+    /// dekopond's side of the contract: a client certificate chained to the CA is required.
+    fn server(&self) -> Arc<ServerConfig> {
+        let (cert, key) = self.leaf(
+            rcgen::SanType::DnsName("localhost".try_into().unwrap()),
+            rcgen::ExtendedKeyUsagePurpose::ServerAuth,
+        );
+        let mut roots = RootCertStore::empty();
+        roots
+            .add(CertificateDer::from_pem_slice(self.ca.as_bytes()).unwrap())
+            .unwrap();
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+            Arc::new(roots),
+            Arc::clone(&provider),
+        )
+        .build()
+        .unwrap();
+        Arc::new(
+            ServerConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_client_cert_verifier(verifier)
+                .with_single_cert(
+                    vec![CertificateDer::from_pem_slice(cert.as_bytes()).unwrap()],
+                    rustls::pki_types::PrivateKeyDer::from_pem_slice(key.as_bytes()).unwrap(),
+                )
+                .unwrap(),
+        )
+    }
+}
+struct ModelRequest {
+    path: String,
+    headers: hyper::HeaderMap,
+    client_cert: Vec<u8>,
+}
+async fn model_upstream(
+    listener: TcpListener,
+    server: Arc<ServerConfig>,
+    count: usize,
+) -> Vec<ModelRequest> {
+    let mut received = Vec::new();
+    for _ in 0..count {
+        let (stream, _) = listener.accept().await.unwrap();
+        let tls = tokio_rustls::TlsAcceptor::from(Arc::clone(&server))
+            .accept(stream)
+            .await
+            .unwrap();
+        let client_cert = tls.get_ref().1.peer_certificates().unwrap()[0].to_vec();
+        let seen = Arc::new(Mutex::new(None));
+        let record = Arc::clone(&seen);
+        hyper::server::conn::http1::Builder::new()
+            .keep_alive(false)
+            .serve_connection(
+                TokioIo::new(tls),
+                service_fn(move |req: Request<Incoming>| {
+                    *record.lock().unwrap() = Some((req.uri().to_string(), req.headers().clone()));
+                    async {
+                        Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(b"model"))))
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+        let (path, headers) = seen.lock().unwrap().take().unwrap();
+        received.push(ModelRequest {
+            path,
+            headers,
+            client_cert,
+        });
+    }
+    received
+}
+const FORGED: &str =
+    "x-dekopon-vm-subject: dekopon:forged\r\nX-Dekopon-VM-Subject: dekopon:forged-too\r\n";
+#[tokio::test]
+async fn models_route_answers_dns_and_forwards_sni_host_and_connect_over_mtls_with_one_subject() {
+    let pki = ModelPki::new();
+    let dir = tempfile::tempdir().unwrap();
+    let first = pki.client(dir.path());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    // The fourth request runs after the client certificate rotates on disk.
+    let peer = tokio::spawn(model_upstream(listener, pki.server(), 4));
+    let route = models::Route::new(
+        &format!("https://localhost:{port}"),
+        "dekopon:gylmar-vm",
+        dir.path().to_owned(),
+    )
+    .unwrap();
+    let mut egress = local_egress();
+    // The route must not depend on the allowlist or on the private-address exception.
+    egress.allow_private.clear();
+    let gateway = Gateway::with_models(
+        egress,
+        [IpAddr::V4(Ipv4Addr::LOCALHOST)].into(),
+        Some(route),
+    )
+    .await;
+
+    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    socket
+        .send_to(&query("Models.VM.Internal.", RecordType::A), gateway.udp)
+        .await
+        .unwrap();
+    let mut received = [0; 512];
+    let (length, _) = socket.recv_from(&mut received).await.unwrap();
+    let answer = Message::from_vec(&received[..length]).unwrap();
+    assert_eq!(answer.response_code, ResponseCode::NoError);
+    assert_eq!(answer.answers[0].data, RData::A(A(Ipv4Addr::LOCALHOST)));
+
+    let request = |path: &str| {
+        format!(
+            "POST {path} HTTP/1.1\r\nHost: models.vm.internal\r\n{FORGED}authorization: Bearer vm\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+        )
+    };
+    // SNI on the gateway's :443.
+    let stream = TcpStream::connect(gateway.https).await.unwrap();
+    let tls = TlsConnector::from(Arc::clone(&gateway.proxy.tls))
+        .connect(ServerName::try_from(models::HOST).unwrap(), stream)
+        .await
+        .unwrap();
+    assert_eq!(
+        exchange(tls, &request("/v1/messages")).await,
+        (200, "model".into())
+    );
+    // Origin-form Host on :80.
+    let stream = TcpStream::connect(gateway.proxy.addr).await.unwrap();
+    assert_eq!(
+        exchange(stream, &request("/v1/responses")).await,
+        (200, "model".into())
+    );
+    // CONNECT, then TLS inside the tunnel.
+    let mut stream = TcpStream::connect(gateway.proxy.addr).await.unwrap();
+    stream
+        .write_all(
+            b"CONNECT models.vm.internal:443 HTTP/1.1\r\nHost: models.vm.internal:443\r\n\r\n",
+        )
+        .await
+        .unwrap();
+    let mut head = Vec::new();
+    while !head.ends_with(b"\r\n\r\n") {
+        head.push(stream.read_u8().await.unwrap());
+    }
+    assert!(head.starts_with(b"HTTP/1.1 200 "));
+    let tls = TlsConnector::from(Arc::clone(&gateway.proxy.tls))
+        .connect(ServerName::try_from(models::HOST).unwrap(), stream)
+        .await
+        .unwrap();
+    assert_eq!(
+        exchange(tls, &request("/v1/chat/completions")).await,
+        (200, "model".into())
+    );
+    // cert-manager rotates the Secret; the next connection presents the new pair.
+    let second = pki.client(dir.path());
+    let stream = TcpStream::connect(gateway.proxy.addr).await.unwrap();
+    assert_eq!(
+        exchange(stream, &request("/v1/messages/count_tokens")).await,
+        (200, "model".into())
+    );
+
+    let received = peer.await.unwrap();
+    let paths: Vec<_> = received.iter().map(|r| r.path.as_str()).collect();
+    assert_eq!(
+        paths,
+        [
+            "/v1/messages",
+            "/v1/responses",
+            "/v1/chat/completions",
+            "/v1/messages/count_tokens"
+        ]
+    );
+    for request in &received {
+        let subjects: Vec<_> = request
+            .headers
+            .get_all(models::SUBJECT_HEADER)
+            .iter()
+            .collect();
+        assert_eq!(subjects, ["dekopon:gylmar-vm"]);
+        assert_eq!(request.headers[header::HOST], format!("localhost:{port}"));
+        // The guest's token is left for dekopond to drop; the jail adds no credential.
+        assert_eq!(request.headers[header::AUTHORIZATION], "Bearer vm");
+    }
+    assert!(received[..3].iter().all(|r| r.client_cert == first));
+    assert_eq!(received[3].client_cert, second);
+    assert_ne!(first, second);
+
+    let spans = gateway.proxy.finish().await;
+    // Four forwarded requests plus the CONNECT envelope.
+    assert_eq!(
+        spans
+            .iter()
+            .filter(|s| s.name == "egress.request" && attribute(s, "egress.decision", "allowed"))
+            .count(),
+        5
+    );
+    assert_eq!(
+        spans.iter().filter(|s| s.name == "egress.connect").count(),
+        4
+    );
+}
+#[tokio::test]
+async fn models_name_is_refused_without_a_route_and_its_header_never_leaves_for_other_hosts() {
+    let gateway = Gateway::new(local_egress()).await;
+    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    socket
+        .send_to(&query("models.vm.internal.", RecordType::A), gateway.udp)
+        .await
+        .unwrap();
+    let mut received = [0; 512];
+    let (length, _) = socket.recv_from(&mut received).await.unwrap();
+    assert_eq!(
+        Message::from_vec(&received[..length])
+            .unwrap()
+            .response_code,
+        ResponseCode::NXDomain
+    );
+    let stream = TcpStream::connect(gateway.proxy.addr).await.unwrap();
+    assert_eq!(
+        exchange(
+            stream,
+            "GET / HTTP/1.1\r\nHost: models.vm.internal\r\nConnection: close\r\n\r\n"
+        )
+        .await,
+        (403, "egress refused: models.vm.internal".into())
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let peer = tokio::spawn(upstream(listener, None));
+    let stream = TcpStream::connect(gateway.proxy.addr).await.unwrap();
+    assert_eq!(
+        exchange(
+            stream,
+            &format!(
+                "GET / HTTP/1.1\r\nHost: localhost:{port}\r\n{FORGED}Connection: close\r\n\r\n"
+            )
+        )
+        .await
+        .0,
+        200
+    );
+    assert!(!peer.await.unwrap().contains_key(models::SUBJECT_HEADER));
+    let spans = gateway.proxy.finish().await;
+    assert!(
+        spans
+            .iter()
+            .any(|s| attribute(s, "egress.decision", "refused:not_allowed"))
+    );
+}
+#[test]
+fn models_upstream_is_an_https_origin_and_subject_is_namespace_name() {
+    assert_eq!(
+        models::upstream("https://dekopon.dekopon.svc.cluster.local:9090").unwrap(),
+        (
+            "dekopon.dekopon.svc.cluster.local".into(),
+            ServerName::try_from("dekopon.dekopon.svc.cluster.local").unwrap(),
+            9090
+        )
+    );
+    assert_eq!(models::upstream("https://dekopon").unwrap().2, 443);
+    // An IPv6 literal keeps its brackets in the authority but not in the TLS server name.
+    assert_eq!(
+        models::upstream("https://[::1]:9090").unwrap(),
+        (
+            "[::1]".into(),
+            ServerName::IpAddress(std::net::Ipv6Addr::LOCALHOST.into()),
+            9090
+        )
+    );
+    assert!(models::Route::new("https://[::1]:9090", "dekopon:gylmar-vm", "/".into()).is_ok());
+    for invalid in [
+        "http://dekopon:9090",
+        "https://dekopon:9090/v1",
+        "https://user@dekopon:9090",
+        "https://dekopon:9090/?q",
+        "dekopon:9090",
+    ] {
+        assert!(models::upstream(invalid).is_err(), "{invalid}");
+    }
+    assert!(models::subject("dekopon:gylmar-vm").is_ok());
+    for invalid in [
+        "system:serviceaccount:dekopon:gylmar-vm",
+        "dekopon:",
+        "*:x",
+        "x",
+    ] {
+        assert!(models::subject(invalid).is_err(), "{invalid}");
+    }
 }

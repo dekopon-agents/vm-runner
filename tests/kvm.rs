@@ -59,10 +59,13 @@ async fn jail_vmm_has_no_new_privileges_and_confined_identity_and_egress() {
     value["profiles"]["travel"]["image"] = std::env::var("KVM_GUEST_IMAGE").unwrap().into();
     value["profiles"]["travel"]["egress"]["allow"] = json!(["example.com"]);
     value["auth"]["issuers"] = json!([{"issuer":issuer}]);
+    let (models, received_models) = model_upstream().await;
+    peers.spawn(models);
     value["jails"] = json!({
         "namespace":"test", "image":format!("vm-runner@sha256:{}", "a".repeat(64)), "imageCacheHostPath":"/images",
         "controllerAudience":"vm-runner-jail", "controllerSubject":"system:serviceaccount:test:controller",
-        "tokenFile":"/unused"
+        "tokenFile":"/unused",
+        "models":{"upstream":format!("https://localhost:{}", received_models.port), "clientCertSecret":"unused", "subject":"test:kvm-vm"}
     });
     tokio::fs::write(config.path(), serde_yaml_ng::to_string(&value).unwrap())
         .await
@@ -125,6 +128,12 @@ async fn jail_vmm_has_no_new_privileges_and_confined_identity_and_egress() {
         let result = exec(&api, &token, "node -e \"require('node:dns').resolve4('example.com',(e,a)=>{if(e||JSON.stringify(a)!=='[\\\"10.0.2.1\\\"]')process.exit(1)})\" && curl --fail --http1.1 --max-time 15 https://example.com").await;
         assert!(result["stdout"].as_str().unwrap().contains("Example Domain"));
         assert!(!tokio::fs::try_exists("/usr/bin/curl").await.unwrap());
+        // The guest's forged subject is replaced by the jail's, over mTLS, outside the allowlist.
+        let result = exec(&api, &token, "curl --fail --silent --show-error --http1.1 --max-time 15 -H 'x-dekopon-vm-subject: test:forged' -H 'content-type: application/json' -d '{}' https://models.vm.internal/v1/messages").await;
+        assert_eq!(result["stdout"], "model");
+        let (path, subjects) = received_models.requests.lock().await.recv().await.unwrap();
+        assert_eq!(path, "/v1/messages");
+        assert_eq!(subjects, ["test:kvm-vm"]);
         exec(&api, &token, "mkdir -p /artifacts/nested; printf hello > /artifacts/nested/test.txt").await;
         let files: Value = api.get("http://127.0.0.1:8080/artifacts").bearer_auth(&token).send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
         assert_eq!(files[0]["path"], "nested/test.txt");
@@ -209,4 +218,112 @@ async fn dropped() -> u64 {
         .flat_map(|expr| expr.iter())
         .filter_map(|expr| expr["counter"]["packets"].as_u64())
         .sum()
+}
+struct ModelUpstream {
+    port: u16,
+    requests: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<(String, Vec<String>)>>,
+}
+/// dekopond's side of the contract: TLS that requires a client certificate from the test CA,
+/// which the jail reads from `/models-tls` like the controller-mounted Secret.
+async fn model_upstream() -> (
+    impl std::future::Future<Output = ()> + Send + 'static,
+    ModelUpstream,
+) {
+    use tokio_rustls::rustls::{
+        self, RootCertStore, ServerConfig,
+        pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject},
+    };
+    let mut ca = rcgen::CertificateParams::default();
+    ca.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let ca_key = rcgen::KeyPair::generate().unwrap();
+    let ca_pem = ca.self_signed(&ca_key).unwrap().pem();
+    let issuer = rcgen::Issuer::new(ca, ca_key);
+    let leaf = |name: &str, usage| {
+        let mut params = rcgen::CertificateParams::new(vec![name.to_owned()]).unwrap();
+        params.extended_key_usages = vec![usage];
+        let key = rcgen::KeyPair::generate().unwrap();
+        (
+            params.signed_by(&key, &issuer).unwrap().pem(),
+            key.serialize_pem(),
+        )
+    };
+    let (client_cert, client_key) =
+        leaf("vm-runner-jail", rcgen::ExtendedKeyUsagePurpose::ClientAuth);
+    tokio::fs::create_dir_all("/models-tls").await.unwrap();
+    for (name, contents) in [
+        ("tls.crt", &client_cert),
+        ("tls.key", &client_key),
+        ("ca.crt", &ca_pem),
+    ] {
+        let path = std::path::Path::new("/models-tls").join(name);
+        tokio::fs::write(&path, contents).await.unwrap();
+        tokio::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o400))
+            .await
+            .unwrap();
+    }
+    let (server_cert, server_key) = leaf("localhost", rcgen::ExtendedKeyUsagePurpose::ServerAuth);
+    let mut roots = RootCertStore::empty();
+    roots
+        .add(CertificateDer::from_pem_slice(ca_pem.as_bytes()).unwrap())
+        .unwrap();
+    let provider = std::sync::Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+        std::sync::Arc::new(roots),
+        std::sync::Arc::clone(&provider),
+    )
+    .build()
+    .unwrap();
+    let config = std::sync::Arc::new(
+        ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(
+                vec![CertificateDer::from_pem_slice(server_cert.as_bytes()).unwrap()],
+                PrivateKeyDer::from_pem_slice(server_key.as_bytes()).unwrap(),
+            )
+            .unwrap(),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (sender, requests) = tokio::sync::mpsc::channel(4);
+    let serve = async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let Ok(tls) = tokio_rustls::TlsAcceptor::from(std::sync::Arc::clone(&config))
+                .accept(stream)
+                .await
+            else {
+                continue;
+            };
+            let sender = sender.clone();
+            let service =
+                hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+                    let subjects = req
+                        .headers()
+                        .get_all("x-dekopon-vm-subject")
+                        .iter()
+                        .map(|v| v.to_str().unwrap().to_owned())
+                        .collect();
+                    let sent = sender.try_send((req.uri().to_string(), subjects));
+                    async move {
+                        sent.unwrap();
+                        Ok::<_, std::convert::Infallible>(hyper::Response::new(
+                            http_body_util::Full::new(hyper::body::Bytes::from_static(b"model")),
+                        ))
+                    }
+                });
+            let _closed = hyper::server::conn::http1::Builder::new()
+                .keep_alive(false)
+                .serve_connection(hyper_util::rt::TokioIo::new(tls), service)
+                .await;
+        }
+    };
+    (
+        serve,
+        ModelUpstream {
+            port,
+            requests: tokio::sync::Mutex::new(requests),
+        },
+    )
 }

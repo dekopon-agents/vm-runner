@@ -18,7 +18,7 @@ pub(crate) const HOST: &str = "models.vm.internal";
 /// Set by the jail on every routed request; any copy the guest sent is stripped first.
 pub(crate) const SUBJECT_HEADER: &str = "x-dekopon-vm-subject";
 /// Where the controller mounts the jail client-certificate Secret (`tls.crt`, `tls.key`,
-/// `ca.crt`), 0400 so the VMM's uid cannot read it.
+/// `ca.crt`): 0440 root:1000 under the pod's fsGroup, like `/kube/token`.
 pub(crate) const TLS_DIR: &str = "/models-tls";
 
 #[derive(Debug, thiserror::Error)]

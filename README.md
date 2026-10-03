@@ -309,7 +309,10 @@ restart. Host is rewritten to the upstream authority and the path is unchanged. 
 trailers and responses), so a guest can never set it. Guests use
 `https://models.vm.internal` (Anthropic) or `https://models.vm.internal/v1` (OpenAI); the
 paths dekopond serves are `/v1/messages`, `/v1/messages/count_tokens`, `/v1/responses` and
-`/v1/chat/completions`. `Jails` denies unknown fields, so ship the image before this key.
+`/v1/chat/completions`. `Jails` denies unknown fields and the jail parses the config the
+controller writes, so ship both pins first, the controller Deployment image and `jails.image`
+in `vm-runner.yaml`, then `jails.models`. A jail on a pre-route image exits at config parse with
+`unknown field models`.
 
 ## Jail runtime and image cache
 

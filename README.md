@@ -310,9 +310,9 @@ jails:
     clientCertSecret: vm-runner-jail-models-tls # cert-manager Secret in jails.namespace
 ```
 
-The controller mounts `clientCertSecret` into each jail pod at `/models-tls` (mode 0400, like
-the other jail credentials). The Secret must hold `tls.crt`, `tls.key` and `ca.crt`, and
-`ca.crt` must also anchor dekopon-gatewayd's server certificate. The controller also writes
+The controller mounts `clientCertSecret` into each jail pod at `/models-tls` (0440 root:1000
+under the pod's fsGroup, like `/kube/token`). The Secret must hold `tls.crt`, `tls.key` and
+`ca.crt`, and `ca.crt` must also anchor dekopon-gatewayd's server certificate. The controller also writes
 `jails.models.subject` into the jail config: the caller's service account as
 `namespace:name` (for example `dekopon:gylmar-vm`). A `subject` in the controller's own config
 is ignored.

@@ -391,8 +391,8 @@ impl Controller {
                     {"name":"config","secret":{"secretName":name,"defaultMode":256}},
                     {"name":"api","projected":{"defaultMode":256,"sources":[{"serviceAccountToken":{"path":"token","expirationSeconds":3600}},{"configMap":{"name":"kube-root-ca.crt","items":[{"key":"ca.crt","path":"ca.crt"}]}}]}}]}});
         if let Some(models) = &jails.models {
-            // 0400 root-owned like the other credentials; the jail rereads it per connection,
-            // so cert-manager's rotation reaches running jails without a restart.
+            // 0440 root:1000 under the pod's fsGroup, like `/kube/token`; the jail rereads it per
+            // connection, so cert-manager's rotation reaches running jails without a restart.
             let spec = &mut pod["spec"];
             spec["volumes"].as_array_mut().ok_or(Error::Protocol)?.push(json!(
                 {"name":"models-tls","secret":{"secretName":models.client_cert_secret,"defaultMode":256}}));

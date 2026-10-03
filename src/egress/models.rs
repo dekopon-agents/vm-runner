@@ -30,14 +30,15 @@ pub(crate) enum InvalidRoute {
 }
 
 pub(crate) struct Route {
-    host: String,
+    server: ServerName<'static>,
     port: u16,
     authority: hyper::header::HeaderValue,
     subject: hyper::header::HeaderValue,
     dir: PathBuf,
 }
-/// `https://host[:port]` with nothing else; the guest's path is forwarded unchanged.
-pub(crate) fn upstream(value: &str) -> Result<(String, u16), InvalidRoute> {
+/// `https://host[:port]` with nothing else; the guest's path is forwarded unchanged. Returns the
+/// host as written (IPv6 bracketed, for the authority), its TLS server name and the port.
+pub(crate) fn upstream(value: &str) -> Result<(String, ServerName<'static>, u16), InvalidRoute> {
     let url = url::Url::parse(value).map_err(|_invalid| InvalidRoute::Upstream)?;
     match (url.scheme(), url.host_str(), url.port_or_known_default()) {
         ("https", Some(host), Some(port))
@@ -47,7 +48,9 @@ pub(crate) fn upstream(value: &str) -> Result<(String, u16), InvalidRoute> {
                 && url.query().is_none()
                 && url.fragment().is_none() =>
         {
-            Ok((host.to_owned(), port))
+            let server = ServerName::try_from(host.trim_matches(['[', ']']).to_owned())
+                .map_err(|_invalid| InvalidRoute::Upstream)?;
+            Ok((host.to_owned(), server, port))
         }
         _ => Err(InvalidRoute::Upstream),
     }
@@ -62,11 +65,11 @@ pub(crate) fn subject(value: &str) -> Result<&str, InvalidRoute> {
 }
 impl Route {
     pub(crate) fn new(upstream: &str, subject: &str, dir: PathBuf) -> Result<Self, Error> {
-        let (host, port) = self::upstream(upstream)?;
+        let (host, server, port) = self::upstream(upstream)?;
         Ok(Self {
             authority: format!("{host}:{port}").parse()?,
             subject: self::subject(subject)?.parse()?,
-            host,
+            server,
             port,
             dir,
         })
@@ -103,14 +106,14 @@ impl Route {
     pub(super) async fn connect(&self) -> Result<Stream, Error> {
         async {
             let config = self.client_config().await?;
-            let tcp = TcpStream::connect((self.host.trim_matches(['[', ']']), self.port)).await?;
+            let tcp = TcpStream::connect((&*self.server.to_str(), self.port)).await?;
             let tls = TlsConnector::from(config)
-                .connect(ServerName::try_from(self.host.clone())?, tcp)
+                .connect(self.server.clone(), tcp)
                 .await?;
             Ok::<Stream, Error>(Box::new(tls))
         }
         .instrument(tracing::info_span!("egress.connect",
-            server.address = %super::cut(&self.host), server.port = self.port))
+            server.address = %super::cut(&self.server.to_str()), server.port = self.port))
         .await
     }
 }

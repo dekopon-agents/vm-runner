@@ -952,9 +952,23 @@ async fn models_name_is_refused_without_a_route_and_its_header_never_leaves_for_
 fn models_upstream_is_an_https_origin_and_subject_is_namespace_name() {
     assert_eq!(
         models::upstream("https://dekopon.dekopon.svc.cluster.local:9090").unwrap(),
-        ("dekopon.dekopon.svc.cluster.local".into(), 9090)
+        (
+            "dekopon.dekopon.svc.cluster.local".into(),
+            ServerName::try_from("dekopon.dekopon.svc.cluster.local").unwrap(),
+            9090
+        )
     );
-    assert_eq!(models::upstream("https://dekopon").unwrap().1, 443);
+    assert_eq!(models::upstream("https://dekopon").unwrap().2, 443);
+    // An IPv6 literal keeps its brackets in the authority but not in the TLS server name.
+    assert_eq!(
+        models::upstream("https://[::1]:9090").unwrap(),
+        (
+            "[::1]".into(),
+            ServerName::IpAddress(std::net::Ipv6Addr::LOCALHOST.into()),
+            9090
+        )
+    );
+    assert!(models::Route::new("https://[::1]:9090", "dekopon:gylmar-vm", "/".into()).is_ok());
     for invalid in [
         "http://dekopon:9090",
         "https://dekopon:9090/v1",

@@ -102,6 +102,9 @@ struct Session {
     active: u64,
     pod: Option<String>,
     retiring: Option<EndReason>,
+    boot_cause: Option<&'static str>,
+    pod_end: PodEnd,
+    pod_read: bool,
     starting: bool,
 }
 #[derive(Clone, Copy)]
@@ -111,6 +114,30 @@ enum EndReason {
     BootFailure,
     Duplicate,
     Terminal,
+}
+#[derive(Clone, Default)]
+struct PodEnd {
+    uid: Option<String>,
+    phase: Option<String>,
+    terminated_reason: Option<String>,
+    exit_code: Option<i32>,
+}
+impl PodEnd {
+    fn from_pod(pod: &Pod) -> Self {
+        let terminated = pod
+            .status
+            .as_ref()
+            .and_then(|s| s.container_statuses.as_ref())
+            .and_then(|statuses| statuses.iter().find(|s| s.name == "jail"))
+            .and_then(|s| s.state.as_ref())
+            .and_then(|s| s.terminated.as_ref());
+        Self {
+            uid: pod.metadata.uid.clone(),
+            phase: pod.status.as_ref().and_then(|s| s.phase.clone()),
+            terminated_reason: terminated.and_then(|s| s.reason.clone()),
+            exit_code: terminated.map(|s| s.exit_code),
+        }
+    }
 }
 enum ReapAttempt {
     First,
@@ -166,6 +193,11 @@ impl EndRecord {
             vm_runner.session.end_reason = self.reason.label(),
             duration_ms = duration,
             k8s.pod.name = session.pod.as_deref(),
+            k8s.pod.uid = session.pod_end.uid.as_deref(),
+            k8s.pod.phase = session.pod_end.phase.as_deref(),
+            vm_runner.jail.terminated_reason = session.pod_end.terminated_reason.as_deref(),
+            vm_runner.jail.exit_code = session.pod_end.exit_code.map(i64::from),
+            error = session.boot_cause,
         }, "session ended");
     }
 }
@@ -267,6 +299,9 @@ impl Controller {
                     active: active.min(now()),
                     pod: Some(pod.metadata.name.clone()?),
                     starting: false,
+                    boot_cause: None,
+                    pod_end: PodEnd::default(),
+                    pod_read: false,
                     retiring: (pod.metadata.deletion_timestamp.is_some()
                         || matches!(pod.status.as_ref().and_then(|s| s.phase.as_deref()),
                             Some("Failed" | "Succeeded"))).then_some(EndReason::Terminal),
@@ -287,6 +322,9 @@ impl Controller {
                 .retiring
                 .filter(|_| pod.metadata.deletion_timestamp.is_none())
             {
+                // The listed pod is already a read of its status; no extra GET is needed.
+                session.pod_end = PodEnd::from_pod(&pod);
+                session.pod_read = true;
                 match delete_pod(&pods, name).await {
                     Ok(true) => {
                         EndRecord {
@@ -387,6 +425,9 @@ impl Controller {
                 active: now(),
                 pod: None,
                 retiring: None,
+                boot_cause: None,
+                pod_end: PodEnd::default(),
+                pod_read: false,
                 starting: false,
             },
         );
@@ -465,16 +506,31 @@ impl Controller {
         {
             let result = async {
                 let Some(pod) = pod else { return Ok(true) };
-                match attempt {
-                    ReapAttempt::First => {}
-                    ReapAttempt::Retry => {
-                        let Some(current) = self.pods.get_opt(&pod).await? else {
-                            return Ok(true);
-                        };
-                        if current.metadata.deletion_timestamp.is_some() {
-                            return Ok(false);
-                        }
+                // A failed status read must not prevent cleanup. Retry retains its
+                // existing error/recheck semantics for an already-issued delete.
+                let current = match self.pods.get_opt(&pod).await {
+                    Ok(current) => current,
+                    Err(_) if matches!(attempt, ReapAttempt::First) => None,
+                    Err(error) => return Err(error),
+                };
+                if let Some(current) = current {
+                    if let Some(stored) = self
+                        .sessions
+                        .lock()
+                        .expect("session registry poisoned")
+                        .get_mut(&key)
+                        .filter(|s| !s.pod_read)
+                    {
+                        stored.pod_end = PodEnd::from_pod(&current);
+                        stored.pod_read = true;
                     }
+                    if matches!(attempt, ReapAttempt::Retry)
+                        && current.metadata.deletion_timestamp.is_some()
+                    {
+                        return Ok(false);
+                    }
+                } else if matches!(attempt, ReapAttempt::Retry) {
+                    return Ok(true);
                 }
                 delete_pod(&self.pods, &pod).await
             }

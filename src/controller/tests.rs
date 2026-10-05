@@ -153,16 +153,29 @@ async fn stuck_delete_ends_the_session_only_when_the_pod_is_gone() {
         tracing::Dispatch::new(tracing_subscriber::registry().with(
             opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new(&provider),
         ));
+    let mut observed = pod();
+    observed["metadata"]["uid"] = json!("pod-uid-1");
+    observed["status"]["phase"] = json!("Failed");
+    observed["status"]["containerStatuses"] = json!([{
+        "name":"jail", "ready":false, "restartCount":0,
+        "state":{"terminated":{"exitCode":42, "reason":"OOMKilled"}}
+    }]);
     tokio::join!(
         controller.reap(1901).with_subscriber(dispatch.clone()),
-        reply(&mut mock, "DELETE", POD_PATH, pod())
-    );
-    tokio::join!(
-        controller.reap(1902).with_subscriber(dispatch.clone()),
         async {
-            reply(&mut mock, "GET", POD_PATH, pod()).await;
+            reply(&mut mock, "GET", POD_PATH, observed).await;
             reply(&mut mock, "DELETE", POD_PATH, pod()).await;
         }
+    );
+    let mut terminating = pod();
+    terminating["metadata"]["deletionTimestamp"] = json!("2026-09-26T00:00:00Z");
+    tokio::join!(
+        controller.reap(1902).with_subscriber(dispatch.clone()),
+        reply(&mut mock, "GET", POD_PATH, terminating)
+    );
+    assert!(
+        mock.poll_request().is_pending(),
+        "retry must not delete an already terminating pod"
     );
     assert!(
         exporter
@@ -176,14 +189,144 @@ async fn stuck_delete_ends_the_session_only_when_the_pod_is_gone() {
         gone(&mut mock, "GET", POD_PATH)
     );
     let logs = exporter.get_emitted_logs().unwrap();
-    assert_eq!(
-        logs.iter()
-            .filter(|log| log.record.event_name() == Some("vm_runner.session.ended"))
-            .count(),
-        1
-    );
+    let ended: Vec<_> = logs
+        .iter()
+        .filter(|log| log.record.event_name() == Some("vm_runner.session.ended"))
+        .collect();
+    assert_eq!(ended.len(), 1);
+    for (key, value) in [
+        (
+            "k8s.pod.name",
+            opentelemetry::logs::AnyValue::from("jail-rebuilt"),
+        ),
+        (
+            "k8s.pod.uid",
+            opentelemetry::logs::AnyValue::from("pod-uid-1"),
+        ),
+        (
+            "k8s.pod.phase",
+            opentelemetry::logs::AnyValue::from("Failed"),
+        ),
+        (
+            "vm_runner.jail.terminated_reason",
+            opentelemetry::logs::AnyValue::from("OOMKilled"),
+        ),
+        (
+            "vm_runner.jail.exit_code",
+            opentelemetry::logs::AnyValue::Int(42),
+        ),
+    ] {
+        assert!(
+            ended[0]
+                .record
+                .attributes_iter()
+                .any(|(k, v)| k.as_str() == key && v == &value),
+            "missing {key}"
+        );
+    }
     provider.shutdown().unwrap();
 }
+#[tokio::test]
+async fn warm_boot_failure_carries_cause_and_pod_status_to_once_only_end() {
+    use opentelemetry::trace::TracerProvider;
+    use tracing::instrument::WithSubscriber;
+    use tracing_subscriber::layer::SubscriberExt;
+    let (controller, mut mock) = setup(vec![pod()]).await;
+    let logs = opentelemetry_sdk::logs::InMemoryLogExporter::default();
+    let log_provider = opentelemetry_sdk::logs::SdkLoggerProvider::builder()
+        .with_simple_exporter(logs.clone())
+        .build();
+    let spans = opentelemetry_sdk::trace::InMemorySpanExporter::default();
+    let span_provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+        .with_simple_exporter(spans.clone())
+        .build();
+    let dispatch = tracing::Dispatch::new(
+        tracing_subscriber::registry()
+            .with(tracing_opentelemetry::layer().with_tracer(span_provider.tracer("boot-test")))
+            .with(
+                opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new(
+                    &log_provider,
+                ),
+            ),
+    );
+    let session = controller.sessions.lock().unwrap()["jail-rebuilt"].clone();
+    let mut failed = pod();
+    failed["metadata"]["uid"] = json!("failed-uid");
+    failed["status"]["phase"] = json!("Failed");
+    failed["status"]["initContainerStatuses"] = json!([{
+        "name":"fetch", "image":"guest", "imageID":"guest", "ready":false, "restartCount":0,
+        "state":{"terminated":{"exitCode":7, "reason":"Error"}}
+    }]);
+    failed["status"]["containerStatuses"] = json!([{
+        "name":"jail", "ready":false, "restartCount":0,
+        "state":{"terminated":{"exitCode":42, "reason":"OOMKilled"}}
+    }]);
+    let result = tokio::join!(
+        controller
+            .boot("jail-rebuilt", &session)
+            .with_subscriber(dispatch.clone()),
+        async {
+            reply(&mut mock, "GET", POD_PATH, failed.clone()).await;
+            reply(&mut mock, "GET", POD_PATH, failed).await;
+            gone(&mut mock, "DELETE", POD_PATH).await;
+        }
+    )
+    .0;
+    assert!(matches!(
+        result,
+        Err(super::proxy::Error::Boot("fetch failed"))
+    ));
+    controller.reap(1901).with_subscriber(dispatch).await;
+    let ended: Vec<_> = logs
+        .get_emitted_logs()
+        .unwrap()
+        .into_iter()
+        .filter(|log| log.record.event_name() == Some("vm_runner.session.ended"))
+        .collect();
+    assert_eq!(ended.len(), 1);
+    for (key, value) in [
+        ("error", opentelemetry::logs::AnyValue::from("fetch failed")),
+        (
+            "k8s.pod.uid",
+            opentelemetry::logs::AnyValue::from("failed-uid"),
+        ),
+        (
+            "k8s.pod.phase",
+            opentelemetry::logs::AnyValue::from("Failed"),
+        ),
+        (
+            "vm_runner.jail.exit_code",
+            opentelemetry::logs::AnyValue::Int(42),
+        ),
+    ] {
+        assert!(
+            ended[0]
+                .record
+                .attributes_iter()
+                .any(|(k, v)| k.as_str() == key && v == &value),
+            "missing {key}"
+        );
+    }
+    let boot = spans.get_finished_spans().unwrap();
+    let boot = boot
+        .iter()
+        .find(|span| span.name == "vm_runner.boot")
+        .unwrap();
+    for (key, value) in [
+        ("vm_runner.boot.kind", "warm"),
+        ("k8s.pod.uid", "failed-uid"),
+    ] {
+        assert!(
+            boot.attributes
+                .iter()
+                .any(|kv| kv.key.as_str() == key && kv.value.as_str() == value),
+            "missing {key}"
+        );
+    }
+    log_provider.shutdown().unwrap();
+    span_provider.shutdown().unwrap();
+}
+
 #[tokio::test]
 async fn session_lifecycle_and_health_are_typed_logs_with_detail() {
     use tracing::instrument::WithSubscriber;
@@ -376,10 +519,10 @@ async fn rebuild_recovers_named_sessions_and_reaper_deletes_expired_pods() {
     assert_eq!(body.session_id, "019591f2-439b-7000-8000-000000000001");
     controller.reap(499).await;
     assert_eq!(controller.sessions.lock().unwrap().len(), 1);
-    tokio::join!(
-        controller.reap(500),
-        reply(&mut mock, "DELETE", POD_PATH, pod())
-    );
+    tokio::join!(controller.reap(500), async {
+        reply(&mut mock, "GET", POD_PATH, pod()).await;
+        reply(&mut mock, "DELETE", POD_PATH, pod()).await;
+    });
     assert!(
         controller
             .sessions
@@ -580,10 +723,10 @@ async fn maximum_lifetime_reaps_even_an_active_session() {
     let mut active = pod();
     active["metadata"]["annotations"]["vm-runner/active"] = json!("1899");
     let (controller, mut mock) = setup(vec![active]).await;
-    tokio::join!(
-        controller.reap(1900),
-        reply(&mut mock, "DELETE", POD_PATH, pod())
-    );
+    tokio::join!(controller.reap(1900), async {
+        reply(&mut mock, "GET", POD_PATH, pod()).await;
+        reply(&mut mock, "DELETE", POD_PATH, pod()).await;
+    });
     assert!(
         controller
             .sessions

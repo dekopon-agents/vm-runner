@@ -8,8 +8,8 @@ pub(crate) mod artifacts;
 pub(super) enum Error {
     #[error("session or job not found")]
     NotFound,
-    #[error("jail boot failed")]
-    Boot,
+    #[error("jail boot failed: {0}")]
+    Boot(&'static str),
     #[error("artifact path refused")]
     Forbidden,
     #[error("artifact service unavailable")]
@@ -231,7 +231,11 @@ impl Controller {
         method: reqwest::Method,
         url: url::Url,
     ) -> Result<reqwest::RequestBuilder, Error> {
-        let jails = self.config.jails.as_ref().ok_or(Error::Boot)?;
+        let jails = self
+            .config
+            .jails
+            .as_ref()
+            .ok_or(Error::Boot("jail unavailable"))?;
         let bytes = super::pods::read(&jails.token_file).await?;
         let token = std::str::from_utf8(&bytes)?.trim();
         let client = reqwest::Client::builder()
@@ -286,7 +290,7 @@ impl Controller {
             ))));
         }
         if let Err(error) = self.boot(&key, &session).await {
-            if !matches!(error, Error::Boot) {
+            if !matches!(error, Error::Boot(_)) {
                 return Err(error);
             }
             tracing::warn!(name: "vm_runner.exec.not_started", target: crate::config::Category::VmExec.target(), {
@@ -346,7 +350,7 @@ impl Controller {
             .pods
             .get(session.pod.as_ref().ok_or(Error::NotFound)?)
             .await?;
-        let mut url = self.address(&pod)?.ok_or(Error::Boot)?;
+        let mut url = self.address(&pod)?.ok_or(Error::Boot("jail not ready"))?;
         url.path_segments_mut()
             .map_err(|()| Error::Protocol)?
             .extend(["jobs", &job.jail_id]);

@@ -238,6 +238,97 @@ mod tests {
         provider.shutdown().unwrap();
     }
 
+    #[tokio::test]
+    async fn stalled_counter_child_warns_and_next_sample_resumes_with_missed_interval() {
+        let mut command = Command::new("sleep");
+        command.arg("30");
+        let read = tokio::time::timeout(
+            Duration::from_secs(5),
+            NftOutput::run(command, Duration::from_millis(200)),
+        )
+        .await
+        .expect("stalled child must be killed and reaped within safety bound");
+        assert!(
+            matches!(read, Err(ReadError::TimedOut { bound }) if bound == Duration::from_millis(200))
+        );
+
+        let exporter = InMemoryLogExporter::default();
+        let provider = SdkLoggerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(
+            opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new(&provider),
+        ));
+        tracing::dispatcher::with_default(&dispatch, || {
+            let mut firewall = Firewall::new();
+            firewall.observe(read, Interval::Regular);
+            // Set a known interval so the missed-sample branch differs from a regular tick.
+            firewall.since = Instant::now() - ROLLUP_INTERVAL * 2;
+            firewall.record(
+                Counters {
+                    input: 7,
+                    forward: 3,
+                },
+                Interval::Regular,
+            );
+            firewall.record(
+                Counters {
+                    input: 8,
+                    forward: 3,
+                },
+                Interval::Regular,
+            );
+        });
+        let logs = exporter.get_emitted_logs().unwrap();
+        let failures: Vec<_> = logs
+            .iter()
+            .filter(|log| log.record.event_name() == Some("egress.refused.firewall_read_failed"))
+            .collect();
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert_eq!(
+            failures[0].record.severity_number(),
+            Some(opentelemetry::logs::Severity::Warn)
+        );
+        assert!(failures[0].record.attributes_iter().any(|(key, value)| key.as_str() == "error" && matches!(value, AnyValue::String(text) if text.as_str().contains("timed out"))), "{failures:?}");
+        let counters: Vec<_> = logs
+            .iter()
+            .filter(|log| log.record.event_name() == Some("egress.refused.firewall"))
+            .collect();
+        assert_eq!(counters.len(), 2, "{counters:?}");
+        let intervals: Vec<_> = counters
+            .iter()
+            .map(|log| {
+                log.record
+                    .attributes_iter()
+                    .find_map(|(key, value)| match (key.as_str(), value) {
+                        ("rollup.interval_ms", AnyValue::Int(ms)) => Some(*ms),
+                        _ => None,
+                    })
+            })
+            .collect();
+        assert!(matches!(intervals[0], Some(ms) if ms >= 120_000));
+        assert_eq!(intervals[1], Some(60_000));
+        assert!(
+            counters[0]
+                .record
+                .attributes_iter()
+                .any(
+                    |(key, value)| key.as_str() == "egress.firewall.input_drop.count"
+                        && value == &AnyValue::Int(7)
+                )
+        );
+        assert!(
+            counters[1]
+                .record
+                .attributes_iter()
+                .any(
+                    |(key, value)| key.as_str() == "egress.firewall.input_drop.count"
+                        && value == &AnyValue::Int(1)
+                )
+        );
+        provider.shutdown().unwrap();
+    }
+
     #[test]
     fn missing_counter_refuses_to_report_a_partial_delta() {
         let output = NftOutput(

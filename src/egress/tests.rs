@@ -597,6 +597,57 @@ async fn truncated_upstream_body_is_body_error_after_the_streamed_bytes() {
     );
 }
 #[tokio::test]
+async fn truncated_guest_post_is_request_body_error_with_one_failure_log() {
+    let proxy = Proxy::new(RootCertStore::empty()).await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let peer = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        hyper::server::conn::http1::Builder::new()
+            .keep_alive(false)
+            .serve_connection(
+                TokioIo::new(stream),
+                service_fn(|req: Request<Incoming>| async move {
+                    // Do not answer until the forwarded body is read to completion.
+                    let _body = req.into_body().collect().await;
+                    Ok::<_, Infallible>(Response::new(Full::new(Bytes::new())))
+                }),
+            )
+            .await
+            .unwrap();
+    });
+    let mut guest = TcpStream::connect(proxy.addr).await.unwrap();
+    guest.write_all(format!("POST http://localhost:{port}/ HTTP/1.1\r\nHost: localhost:{port}\r\nContent-Length: 20\r\nConnection: close\r\n\r\npartial").as_bytes()).await.unwrap();
+    guest.shutdown().await.unwrap();
+    let mut response = Vec::new();
+    guest.read_to_end(&mut response).await.unwrap();
+    peer.await.unwrap();
+    let (_spans, logs) = proxy.finish_with_logs().await;
+    let failures: Vec<_> = logs
+        .iter()
+        .filter(|log| log.record.event_name() == Some("egress.exchange.failed"))
+        .collect();
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    let failure = failures[0];
+    assert!(
+        failure
+            .record
+            .attributes_iter()
+            .any(|(key, value)| key.as_str() == "egress.exchange.outcome"
+                && value == &opentelemetry::logs::AnyValue::from("body-error")),
+        "{failure:?}"
+    );
+    assert!(
+        failure
+            .record
+            .attributes_iter()
+            .any(|(key, value)| key.as_str() == "egress.exchange.phase"
+                && value == &opentelemetry::logs::AnyValue::from("request-body")),
+        "{failure:?}"
+    );
+    assert!(failure.record.attributes_iter().any(|(key, value)| key.as_str() == "error" && matches!(value, opentelemetry::logs::AnyValue::String(text) if !text.as_str().is_empty())), "{failure:?}");
+}
+#[tokio::test]
 async fn client_cancellation_after_response_bytes_records_abandoned_response_body() {
     let proxy = Proxy::new(RootCertStore::empty()).await;
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

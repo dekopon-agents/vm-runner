@@ -580,13 +580,17 @@ impl Engine {
             Arc::clone(&self.rollups),
         );
         exchange.headers(req.headers(), HeaderSide::Request, &self.omit.headers);
+        let head = req.method() == hyper::Method::HEAD;
         let decision = destination(&req, tunnel, &self.egress.allow);
         let (response, outcome, error) = match decision {
-            Err(reason) => (
-                reply(StatusCode::FORBIDDEN, format!("egress refused: {host}")),
-                Outcome::Refused(reason),
-                None,
-            ),
+            Err(reason) => {
+                exchange.refuse(reason);
+                (
+                    reply(StatusCode::FORBIDDEN, format!("egress refused: {host}")),
+                    Outcome::Refused(reason),
+                    None,
+                )
+            }
             Ok(uri) if req.method() == hyper::Method::CONNECT => match upgrade.lock() {
                 Ok(mut slot) => {
                     *slot = uri.authority().cloned().map(|authority| Tunnel {
@@ -620,6 +624,7 @@ impl Engine {
                         } else {
                             Refusal::Address
                         };
+                        exchange.refuse(reason);
                         (
                             reply(StatusCode::FORBIDDEN, format!("egress refused: {host}")),
                             Outcome::Refused(reason),
@@ -642,7 +647,7 @@ impl Engine {
         exchange.headers(response.headers(), HeaderSide::Response, &self.omit.headers);
         exchange.phase(Phase::ResponseBody);
         let (parts, body) = response.into_parts();
-        if body.is_end_stream() {
+        if head || body.is_end_stream() {
             let Recorded = exchange.finish(outcome, error.as_deref());
             Ok(Response::from_parts(parts, body))
         } else {

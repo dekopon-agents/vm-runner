@@ -92,6 +92,7 @@ struct ExchangeData {
     response_head: BodyHead,
     request_text: bool,
     response_text: bool,
+    refused: Option<Refusal>,
     rollups: Arc<Mutex<Rollups>>,
 }
 #[derive(Clone, Copy)]
@@ -238,6 +239,7 @@ impl Exchange {
                 response_head: BodyHead::new(),
                 request_text: false,
                 response_text: false,
+                refused: None,
                 rollups,
             }),
         }
@@ -345,7 +347,22 @@ impl Exchange {
             }
         }
     }
+    pub(super) fn refuse(&mut self, reason: Refusal) {
+        if let Some(data) = self.data.as_mut()
+            && data.refused.is_none()
+        {
+            data.refused = Some(reason);
+            tracing::info!(name: "egress.refused", target: "egress.drop", {
+                telemetry.detail = crate::telemetry::detail!(crate::config::Category::EgressDrop),
+                server.address = %data.host, egress.decision = reason.decision(),
+                egress.refused.count = 1_i64,
+            }, "egress.refused");
+        }
+    }
     pub(super) fn finish(mut self, outcome: Outcome, error: Option<&str>) -> Recorded {
+        if let Outcome::Refused(reason) = outcome {
+            self.refuse(reason);
+        }
         if let Some(data) = self.data.take() {
             record(data, outcome, error);
         }
@@ -355,8 +372,10 @@ impl Exchange {
 impl Drop for Exchange {
     fn drop(&mut self) {
         if let Some(data) = self.data.take() {
-            let phase = data.phase;
-            record(data, Outcome::Abandoned(phase), None);
+            let outcome = data
+                .refused
+                .map_or(Outcome::Abandoned(data.phase), Outcome::Refused);
+            record(data, outcome, None);
         }
     }
 }
@@ -404,13 +423,6 @@ fn record(data: ExchangeData, outcome: Outcome, error: Option<&str>) {
     );
     if let Ok(mut rollups) = data.rollups.lock() {
         rollups.exchange(&data, &outcome);
-    }
-    if let Outcome::Refused(reason) = outcome {
-        tracing::info!(name: "egress.refused", target: "egress.drop", {
-            telemetry.detail = crate::telemetry::detail!(crate::config::Category::EgressDrop),
-            server.address = %data.host, egress.decision = reason.decision(),
-            egress.refused.count = 1_i64,
-        }, "egress.refused");
     }
     let failed = match outcome {
         Outcome::Completed => status.is_some_and(|status| status >= 400),

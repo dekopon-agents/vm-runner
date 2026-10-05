@@ -295,7 +295,9 @@ impl Controller {
             jobs.len() >= 1024 || jobs.values().filter(|job| job.session == id).count() >= 64
         };
         if full {
-            tracing::Span::current().record("vm_runner.exec.outcome", "not-executed");
+            let span = tracing::Span::current();
+            span.record("vm_runner.exec.outcome", "not-executed");
+            span.record("vm_runner.exec.truncated", false);
             return Ok(ExecResponse::Complete(Json(ExecResult::NotExecuted(
                 ExecRefused {
                     reason: "job_capacity".into(),
@@ -318,7 +320,9 @@ impl Controller {
             if !matches!(error, Error::Boot(_)) {
                 return Err(error);
             }
-            tracing::Span::current().record("vm_runner.exec.outcome", "not-executed");
+            let span = tracing::Span::current();
+            span.record("vm_runner.exec.outcome", "not-executed");
+            span.record("vm_runner.exec.truncated", false);
             tracing::warn!(name: "vm_runner.exec.not_started", target: crate::config::Category::VmExec.target(), {
                 telemetry.detail = crate::telemetry::detail!(crate::config::Category::VmExec),
                 cause = %error,

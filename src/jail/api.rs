@@ -56,7 +56,6 @@ impl GuestExecuted {
     fn into_response(self) -> Terminal {
         let current = tracing::Span::current();
         current.record("vm_runner.exec.outcome", "completed");
-        current.record("vm_runner.exec.truncated", self.truncated);
         current.record("vm_runner.guest.exit_code", i64::from(self.exit_code));
         if let Some(ms) = self.duration_ms {
             current.record(
@@ -76,13 +75,17 @@ impl GuestExecuted {
                 peak.min(i64::MAX as u64) as i64,
             );
         }
-        Terminal::Executed(Executed {
+        let response = Terminal::Executed(Executed {
             exit_code: self.exit_code,
             stdout: self.stdout,
             stderr: self.stderr,
             truncated: self.truncated,
         })
-        .capped()
+        .capped();
+        if let Terminal::Executed(result) = &response {
+            current.record("vm_runner.exec.truncated", result.truncated);
+        }
+        response
     }
 }
 #[derive(Deserialize)]
@@ -239,8 +242,13 @@ impl State {
                                 Progress::Done(Arc::new(value.into_response()))
                             }
                             Ok(GuestTerminal::NotExecuted(value)) => {
-                                tracing::Span::current().record("vm_runner.exec.outcome", "failed");
-                                Progress::Done(Arc::new(Terminal::NotExecuted(value).capped()))
+                                let response = Terminal::NotExecuted(value).capped();
+                                let span = tracing::Span::current();
+                                span.record("vm_runner.exec.outcome", "failed");
+                                if let Terminal::NotExecuted(result) = &response {
+                                    span.record("vm_runner.exec.truncated", result.truncated);
+                                }
+                                Progress::Done(Arc::new(response))
                             }
                             Err(error) => {
                                 tracing::Span::current().record("vm_runner.exec.outcome", "unknown");

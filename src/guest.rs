@@ -419,7 +419,7 @@ impl ExecCgroup {
 }
 impl Drop for ExecCgroup {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir(&self.0);
+        drop(std::fs::remove_dir(&self.0));
     }
 }
 

@@ -513,17 +513,20 @@ impl Controller {
                     Err(_) if matches!(attempt, ReapAttempt::First) => None,
                     Err(error) => return Err(error),
                 };
-                if let Some(current) = current {
-                    if let Some(stored) = self
+                if matches!(attempt, ReapAttempt::First)
+                    && let Some(stored) = self
                         .sessions
                         .lock()
                         .expect("session registry poisoned")
                         .get_mut(&key)
                         .filter(|s| !s.pod_read)
-                    {
-                        stored.pod_end = PodEnd::from_pod(&current);
-                        stored.pod_read = true;
+                {
+                    if let Some(current) = &current {
+                        stored.pod_end = PodEnd::from_pod(current);
                     }
+                    stored.pod_read = true;
+                }
+                if let Some(current) = current {
                     if matches!(attempt, ReapAttempt::Retry)
                         && current.metadata.deletion_timestamp.is_some()
                     {

@@ -145,8 +145,17 @@ impl Controller {
             .clone()
             .unwrap_or_else(|| format!("vm-runner-{}", session.body.session_id));
         let result = async {
+            let record = |kind: &'static str, pod: &Pod| {
+                let span = tracing::Span::current();
+                span.record("vm_runner.boot.kind", kind);
+                if let Some(uid) = pod.metadata.uid.as_deref() {
+                    span.record("k8s.pod.uid", uid);
+                }
+            };
             let mut pod = if session.pod.is_some() {
-                self.pods.get(&name).await?
+                let pod = self.pods.get(&name).await?;
+                record("warm", &pod);
+                pod
             } else {
                 let (pod, mut secret) = self.manifests(session, &name).await?;
                 // Record before create so a lost create response still leaves a reapable pod name.
@@ -162,22 +171,12 @@ impl Controller {
                     return Err(Error::Boot("session retiring"));
                 }
                 let pod = self.pods.create(&PostParams::default(), &pod).await?;
+                record("cold", &pod);
                 secret.metadata.owner_references =
                     Some(vec![pod.controller_owner_ref(&()).ok_or(Error::Protocol)?]);
                 self.secrets.create(&PostParams::default(), &secret).await?;
                 pod
             };
-            tracing::Span::current().record(
-                "vm_runner.boot.kind",
-                if session.pod.is_some() {
-                    "warm"
-                } else {
-                    "cold"
-                },
-            );
-            if let Some(uid) = pod.metadata.uid.as_deref() {
-                tracing::Span::current().record("k8s.pod.uid", uid);
-            }
             let mut tick = tokio::time::interval(Duration::from_secs(1));
             let address = loop {
                 if self

@@ -154,6 +154,98 @@ escape between the check and open. Large reads may return fewer bytes than reque
 its JSON envelope within the 1 MiB frame cap; continue at the returned byte count until `eof`.
 A ping returns `{"ok":true}`. Other platforms print `linux only` and exit 2.
 
+## Guest toolkit
+
+Alongside the browser tools, the image includes Python 3, uv 0.12.21, jq,
+ripgrep (`rg`), zip/unzip and Poppler's `pdftotext`/`pdfinfo`. The exec-safe uv
+wrapper uses system interpreters and disables automatic interpreter downloads,
+while allowing `uv pip` to discover nearby/activated venvs. Venvs and its default
+cache are writable under the jail home.
+No pip or `python3-venv` package is separately installed. Package/network access
+still follows the existing egress policy, with no new allowlisting.
+See [the guest image README](images/guest/README.md#small-offline-toolkit) for
+build-time offline smoke checks and image verification.
+
+## Guest browser tools
+
+The guest keeps its existing Playwright-backed custom `browse` CLI as the default.
+It does **not** install Microsoft's `playwright-cli`. Alongside it, `agent-browser`
+0.38.1 uses the checksum-pinned upstream Linux native binary (the same release asset
+selected by that npm version's postinstall), on both amd64 and arm64. Both tools use
+`/usr/local/bin/chromium`, the baked Playwright Chromium; no `agent-browser install`
+or runtime browser download is needed.
+
+```sh
+browse open 'data:text/html,<h1>Local page</h1>'
+browse snapshot
+browse reset
+agent-browser open 'data:text/html,<h1>Local page</h1>'
+agent-browser snapshot
+agent-browser close
+```
+
+The AB wrapper supplies the executable, launch args, socket directory and `guest`
+session on every invocation because guest exec clears its environment. uid 1000
+writes AB sockets/state under `/home/jail/.agent-browser` and its separate persistent
+profile under `/home/jail/.agent-browser-profile`; it never attaches to browse's
+port 9222 or `.browse-profile`. `close` stops AB but retains that profile until the
+jail expires. Do not select browse's profile or CDP endpoint for AB. Upstream AB's
+Unix daemon calls `setsid`, like browse's detached Chromium, so exec process-group
+cleanup does not kill it; the VM lifetime still bounds both. No guest-agent or
+isolation policy changes are required, and TLS verification remains enabled.
+
+The image build runs a uid-1000, cleared-environment smoke test using only static
+data URLs. It checks open/snapshot/close across separate exec groups, kills each
+client group on exit, and verifies browse and AB coexist without sharing pages.
+`verify.sh` checks the exported ext4 contains both CLIs, AB's native binary and the
+Chromium target. Dual-arch guest PR CI is the full image gate. **An image build is
+not Firecracker/KVM proof**: guest boot, trusted-CA egress and real execs still need
+separate authorized KVM validation before deployment.
+
+### Paired evaluation (instructions only)
+
+Do not compare inside an existing jail or run this as part of an image build.
+Use two newly named sessions per task/repetition, on an explicitly approved image,
+with the same profile/shape, model/version, model settings, task text, starting URL,
+egress policy and browser binary. Example setup against an authorized controller
+(`TOKEN`, `CONTROLLER`, `PROFILE`, `TASK_URL` supplied by the operator):
+
+```sh
+pair=$(date +%s)-$RANDOM
+fresh() {
+  curl --fail-with-body -sS "$CONTROLLER/v1/sessions" \
+    -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+    -d "$(jq -nc --arg profile "$PROFILE" --arg name "$1" '{profile:$profile,name:$name}')" | jq -er .sessionId
+}
+exec_in() {
+  local session=$1; shift
+  curl --fail-with-body -sS "$CONTROLLER/v1/sessions/$session/exec" \
+    -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+    -d "$(jq -nc --args '{argv:$ARGS.positional,deadlineMs:25000}' -- "$@")"
+}
+browse_jail=$(fresh "eval-browse-$pair")
+ab_jail=$(fresh "eval-ab-$pair")
+exec_in "$browse_jail" browse open "$TASK_URL"
+exec_in "$ab_jail" agent-browser open "$TASK_URL"
+exec_in "$ab_jail" agent-browser set viewport 1280 900
+# Give the model the same task separately, routed ONLY to the corresponding jail.
+# Browse arm: "Use only browse for browser interaction; no agent-browser or direct CDP/Playwright."
+# AB arm: "Use only agent-browser for browser interaction; no browse or direct CDP/Playwright."
+# Keep all other instructions and budgets identical; alternate arm order between repetitions.
+exec_in "$browse_jail" browse reset
+exec_in "$ab_jail" agent-browser close
+```
+
+Inspect exec responses; if HTTP 202, await the returned controller job via
+`GET /v1/jobs/{jobId}` before continuing. Record each arm's total model input/output
+tokens (including retries/tool output), task correctness against the same predefined
+answer rubric, end-to-end wall time, failures, and peak CPU/RSS/scratch usage from
+available resource measurements (mark unavailable values, do not infer them from
+image size). Include model, image digest, Chromium version, shape and repetitions.
+Do not reuse either session for another arm/task: close tools and let these isolated
+jails expire under their configured lifetime (there is no session DELETE API).
+No evaluation campaign, deployment or release is performed by this change.
+
 ## Release builds
 
 CI builds every package binary for native x86_64 and aarch64 Linux musl, then builds and

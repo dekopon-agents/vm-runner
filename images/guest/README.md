@@ -1,4 +1,4 @@
-# Browser guest
+# Browser and toolkit guest
 
 Build on native Linux amd64 or arm64 with Docker/buildx, sudo, e2fsprogs,
 zstd and curl. Compile `vm-guest-agent` for the matching musl target first:
@@ -35,5 +35,30 @@ An owner-pushed annotated `guest-v*` tag on main additionally publishes
 `ghcr.io/dekopon-agents/vm-runner-guest:v*`. Each platform manifest has two
 annotated layers (zstd ext4 and kernel); the OCI index advertises both platforms
 and is provenance-attested. Profiles must use its digest, not its tag.
+
+## Small offline toolkit
+
+The image also includes distro `python3`, `jq`, `ripgrep` (`rg`), `zip`, `unzip`
+and `poppler-utils` (`pdftotext`, `pdfinfo`), plus uv 0.12.21. uv's official
+GNU/Linux amd64 and arm64 archives are SHA-256 pinned; only the `uv` binary is
+installed, not `uvx`. There is no separately installed pip or `python3-venv`,
+compiler, OCR or scientific stack.
+
+The `uv` wrapper sets `UV_PYTHON_PREFERENCE=only-system` and
+`UV_PYTHON_DOWNLOADS=never` on every exec, including cleared environments.
+It does not force `UV_PYTHON`, so `uv pip` can target a nearby `.venv` or an
+activated environment while venv creation uses the baked system interpreter. Its default cache is `/home/jail/.cache/uv`;
+`UV_CACHE_DIR` can select another writable location. The jail home is writable
+through the scratch-backed overlay, so a normal `uv venv ~/venv` works without
+pip or interpreter downloads. Package installation/network access still requires
+the existing egress policy; no additional hosts are allowed by this image.
+
+An offline build-time smoke runs as uid 1000 with cleared environment and no
+network. It executes Python, creates/writes a uv venv using the baked interpreter
+without pip, installs/imports a tiny local wheel via `uv --offline pip install`
+into the discovered `.venv`, checks jq/rg and a zip/unzip roundtrip, and extracts
+text/metadata from a tiny generated PDF. Fixtures, the venv and its cache are removed.
+`verify.sh` checks these shipped executables in ext4, including Python's symlink
+target. Dual-arch guest CI is the full image gate.
 
 The PR proof reads ext4 using debugfs; it is not a VM boot or a KVM proof.

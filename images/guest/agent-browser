@@ -1,0 +1,11 @@
+#!/bin/sh
+set -eu
+# vm-guest-agent clears the environment; image ENV alone would not reach execs.
+# Keep AB's socket/session and persistent profile independent of browse's CDP browser.
+export AGENT_BROWSER_EXECUTABLE_PATH=/usr/local/bin/chromium
+export AGENT_BROWSER_SOCKET_DIR=/home/jail/.agent-browser
+export AGENT_BROWSER_SESSION=guest
+export AGENT_BROWSER_PROFILE=/home/jail/.agent-browser-profile
+# Same VM-level sandbox policy as browse; do not bypass TLS verification.
+export AGENT_BROWSER_ARGS='--no-sandbox,--disable-dev-shm-usage,--lang=en-US'
+exec /usr/local/bin/agent-browser-native "$@"

@@ -28,7 +28,9 @@ cleanup() {
 }
 trap cleanup EXIT
 mkdir "$work/context" "$work/root"
-cp "$source_dir/Dockerfile" "$source_dir/vm-init" "$source_dir/browse" "$work/context/"
+cp "$source_dir/Dockerfile" "$source_dir/vm-init" "$source_dir/browse" \
+    "$source_dir/agent-browser" "$source_dir/browser-smoke.cjs" \
+    "$source_dir/uv" "$source_dir/toolkit-smoke.sh" "$work/context/"
 cp "$1" "$work/context/vm-guest-agent"
 docker buildx build --platform "linux/$arch" --load --tag "$image" "$work/context"
 container=$(docker create "$image")

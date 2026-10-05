@@ -25,6 +25,22 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets --all-features --locked -- -D warnings
       - run: cargo test --all-features --locked
+      # A normal hosted runner cannot write its cgroup tree. Exercise the actual guest
+      # attach/measure/move/rmdir path at the kernel cgroup root, not a tempdir fake.
+      # A namespace-relative root is NOT exempt from v2's no-internal-process rule;
+      # this job uses the disposable runner's actual root, like the Firecracker guest.
+      - name: Exercise guest cgroup v2 descendant persistence
+        if: matrix.runner == 'ubuntu-24.04'
+        run: |
+          set -euo pipefail
+          cargo test --all-features --locked --lib --no-run --message-format=json > "$RUNNER_TEMP/guest-test-build.jsonl"
+          guest_test=$(python3 -c 'import json,sys; print(next(x["executable"] for x in map(json.loads,open(sys.argv[1])) if x.get("target",{}).get("name")=="vm_runner" and "lib" in x.get("target",{}).get("kind",[]) and x.get("executable")))' "$RUNNER_TEMP/guest-test-build.jsonl")
+          docker run --rm --privileged --cgroupns=host --init \
+            -v "$PWD:$PWD:ro" -w "$PWD" ubuntu:24.04 /bin/sh -ec '
+              test -f /sys/fs/cgroup/cgroup.controllers
+              printf "+cpu +memory\n" > /sys/fs/cgroup/cgroup.subtree_control
+              exec "$1" --exact guest::tests::detached_descendants_survive_and_exec_cgroups_are_reaped --ignored --nocapture
+            ' sh "$guest_test"
       - run: cargo run --locked --bin vm-runnerd -- check --config examples/vm-runner.yaml
       - uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2
         with:

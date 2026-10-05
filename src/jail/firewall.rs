@@ -1,0 +1,347 @@
+use crate::{ROLLUP_INTERVAL, config::Category};
+use serde::Deserialize;
+use std::{io, process::Stdio, time::Duration};
+use tokio::{io::AsyncReadExt, process::Command, time::Instant};
+
+const READ_BOUND: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Copy, Default)]
+struct Counters {
+    input: u64,
+    forward: u64,
+}
+
+#[derive(Deserialize)]
+struct NftListing {
+    nftables: Vec<NftObject>,
+}
+#[derive(Deserialize)]
+struct NftObject {
+    counter: Option<NftCounter>,
+}
+#[derive(Deserialize)]
+struct NftCounter {
+    name: String,
+    packets: u64,
+}
+
+#[derive(Debug, thiserror::Error)]
+enum ReadError {
+    #[error("nft counter read failed: {kind:?}")]
+    Io { kind: io::ErrorKind },
+    #[error("nft returned {status}")]
+    Status { status: std::process::ExitStatus },
+    #[error("nft counter output exceeds limit")]
+    TooLarge,
+    #[error("invalid nft counter JSON: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("missing nft counter {name}")]
+    Missing { name: &'static str },
+    #[error("nft counter read timed out after {bound:?}")]
+    TimedOut { bound: Duration },
+}
+
+struct NftOutput(Vec<u8>);
+impl NftOutput {
+    async fn read() -> Result<Self, ReadError> {
+        let mut command = Command::new("nft");
+        command.args(["-j", "list", "counters", "table", "inet", "vm_runner"]);
+        Self::run(command, READ_BOUND).await
+    }
+
+    async fn run(mut command: Command, bound: Duration) -> Result<Self, ReadError> {
+        let mut child = command
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|error| ReadError::Io { kind: error.kind() })?;
+        let stdout = child.stdout.take().ok_or(ReadError::Io {
+            kind: io::ErrorKind::BrokenPipe,
+        })?;
+        let read = async {
+            let mut bytes = Vec::with_capacity(4096);
+            stdout
+                .take(65_537)
+                .read_to_end(&mut bytes)
+                .await
+                .map_err(|error| ReadError::Io { kind: error.kind() })?;
+            if bytes.len() > 65_536 {
+                return Err(ReadError::TooLarge);
+            }
+            let status = child
+                .wait()
+                .await
+                .map_err(|error| ReadError::Io { kind: error.kind() })?;
+            if !status.success() {
+                return Err(ReadError::Status { status });
+            }
+            Ok(Self(bytes))
+        };
+        match tokio::time::timeout(bound, read).await {
+            Ok(result) => result,
+            Err(_elapsed) => {
+                let _reaped = child.kill().await;
+                Err(ReadError::TimedOut { bound })
+            }
+        }
+    }
+
+    fn counters(&self) -> Result<Counters, ReadError> {
+        let listing: NftListing = serde_json::from_slice(&self.0)?;
+        let mut input = None;
+        let mut forward = None;
+        for entry in listing.nftables {
+            if let Some(counter) = entry.counter {
+                match counter.name.as_str() {
+                    "input_drop" => input = Some(counter.packets),
+                    "forward_drop" => forward = Some(counter.packets),
+                    _ => (),
+                }
+            }
+        }
+        Ok(Counters {
+            input: input.ok_or(ReadError::Missing { name: "input_drop" })?,
+            forward: forward.ok_or(ReadError::Missing {
+                name: "forward_drop",
+            })?,
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum Interval {
+    Regular,
+    End,
+}
+
+pub(super) struct Firewall {
+    since: Instant,
+    previous: Counters,
+    missed: bool,
+}
+impl Firewall {
+    pub(super) fn new() -> Self {
+        Self {
+            since: Instant::now(),
+            previous: Counters::default(),
+            missed: false,
+        }
+    }
+
+    pub(super) async fn sample(&mut self, interval: Interval) {
+        self.observe(NftOutput::read().await, interval);
+    }
+
+    fn observe(&mut self, read: Result<NftOutput, ReadError>, interval: Interval) {
+        match read.and_then(|output| output.counters()) {
+            Ok(counters) => self.record(counters, interval),
+            Err(error) => {
+                self.missed = true;
+                tracing::warn!(name: "egress.refused.firewall_read_failed", target: "egress.drop", {
+                    telemetry.detail = crate::telemetry::detail!(Category::EgressDrop),
+                    error = %crate::egress::cut_error(&error.to_string()),
+                }, "egress firewall counter read failed");
+            }
+        }
+    }
+
+    fn record(&mut self, counters: Counters, interval: Interval) {
+        let input = counters.input.saturating_sub(self.previous.input);
+        let forward = counters.forward.saturating_sub(self.previous.forward);
+        let interval_ms = match (interval, self.missed) {
+            (Interval::Regular, false) => {
+                i64::try_from(ROLLUP_INTERVAL.as_millis()).unwrap_or(i64::MAX)
+            }
+            (Interval::Regular, true) | (Interval::End, _) => {
+                i64::try_from(self.since.elapsed().as_millis()).unwrap_or(i64::MAX)
+            }
+        };
+        self.previous = counters;
+        self.since = Instant::now();
+        self.missed = false;
+        if input > 0 || forward > 0 || matches!(interval, Interval::End) {
+            tracing::info!(name: "egress.refused.firewall", target: "egress.drop", {
+                telemetry.detail = crate::telemetry::detail!(Category::EgressDrop),
+                egress.firewall.input_drop.count = i64::try_from(input).unwrap_or(i64::MAX),
+                egress.firewall.forward_drop.count = i64::try_from(forward).unwrap_or(i64::MAX),
+                rollup.interval_ms = interval_ms,
+            }, "egress.refused.firewall");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use opentelemetry::logs::AnyValue;
+    use opentelemetry_sdk::logs::{InMemoryLogExporter, SdkLoggerProvider};
+    use tracing_subscriber::layer::SubscriberExt;
+
+    #[test]
+    fn named_firewall_counters_emit_only_moved_deltas_and_a_final_record() {
+        let output = NftOutput(
+            serde_json::to_vec(&serde_json::json!({"nftables": [
+                {"metainfo": {}},
+                {"counter": {"name": "input_drop", "packets": 7}},
+                {"counter": {"name": "forward_drop", "packets": 3}},
+            ]}))
+            .unwrap(),
+        );
+        let current = output.counters().unwrap();
+        let exporter = InMemoryLogExporter::default();
+        let provider = SdkLoggerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(
+            opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new(&provider),
+        ));
+        tracing::dispatcher::with_default(&dispatch, || {
+            let mut firewall = Firewall::new();
+            firewall.record(current, Interval::Regular);
+            firewall.record(current, Interval::Regular);
+            firewall.record(current, Interval::End);
+        });
+        let logs = exporter.get_emitted_logs().unwrap();
+        let records: Vec<_> = logs
+            .iter()
+            .filter(|log| log.record.event_name() == Some("egress.refused.firewall"))
+            .collect();
+        assert_eq!(records.len(), 2);
+        assert!(
+            records[0]
+                .record
+                .attributes_iter()
+                .any(
+                    |(key, value)| key.as_str() == "egress.firewall.input_drop.count"
+                        && value == &AnyValue::Int(7)
+                )
+        );
+        assert!(
+            records[0]
+                .record
+                .attributes_iter()
+                .any(
+                    |(key, value)| key.as_str() == "egress.firewall.forward_drop.count"
+                        && value == &AnyValue::Int(3)
+                )
+        );
+        assert!(
+            records[1]
+                .record
+                .attributes_iter()
+                .any(
+                    |(key, value)| key.as_str() == "egress.firewall.input_drop.count"
+                        && value == &AnyValue::Int(0)
+                )
+        );
+        provider.shutdown().unwrap();
+    }
+
+    #[tokio::test]
+    async fn stalled_counter_child_warns_and_next_sample_resumes_with_missed_interval() {
+        let mut command = Command::new("sleep");
+        command.arg("30");
+        let read = tokio::time::timeout(
+            Duration::from_secs(5),
+            NftOutput::run(command, Duration::from_millis(200)),
+        )
+        .await
+        .expect("stalled child must be killed and reaped within safety bound");
+        assert!(
+            matches!(read, Err(ReadError::TimedOut { bound }) if bound == Duration::from_millis(200))
+        );
+
+        let exporter = InMemoryLogExporter::default();
+        let provider = SdkLoggerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(
+            opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new(&provider),
+        ));
+        tracing::dispatcher::with_default(&dispatch, || {
+            let mut firewall = Firewall::new();
+            firewall.observe(read, Interval::Regular);
+            // Set a known interval so the missed-sample branch differs from a regular tick.
+            firewall.since = Instant::now() - ROLLUP_INTERVAL * 2;
+            firewall.record(
+                Counters {
+                    input: 7,
+                    forward: 3,
+                },
+                Interval::Regular,
+            );
+            firewall.record(
+                Counters {
+                    input: 8,
+                    forward: 3,
+                },
+                Interval::Regular,
+            );
+        });
+        let logs = exporter.get_emitted_logs().unwrap();
+        let failures: Vec<_> = logs
+            .iter()
+            .filter(|log| log.record.event_name() == Some("egress.refused.firewall_read_failed"))
+            .collect();
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert_eq!(
+            failures[0].record.severity_number(),
+            Some(opentelemetry::logs::Severity::Warn)
+        );
+        assert!(failures[0].record.attributes_iter().any(|(key, value)| key.as_str() == "error" && matches!(value, AnyValue::String(text) if text.as_str().contains("timed out"))), "{failures:?}");
+        let counters: Vec<_> = logs
+            .iter()
+            .filter(|log| log.record.event_name() == Some("egress.refused.firewall"))
+            .collect();
+        assert_eq!(counters.len(), 2, "{counters:?}");
+        let intervals: Vec<_> = counters
+            .iter()
+            .map(|log| {
+                log.record
+                    .attributes_iter()
+                    .find_map(|(key, value)| match (key.as_str(), value) {
+                        ("rollup.interval_ms", AnyValue::Int(ms)) => Some(*ms),
+                        _ => None,
+                    })
+            })
+            .collect();
+        assert!(matches!(intervals[0], Some(ms) if ms >= 120_000));
+        assert_eq!(intervals[1], Some(60_000));
+        assert!(
+            counters[0]
+                .record
+                .attributes_iter()
+                .any(
+                    |(key, value)| key.as_str() == "egress.firewall.input_drop.count"
+                        && value == &AnyValue::Int(7)
+                )
+        );
+        assert!(
+            counters[1]
+                .record
+                .attributes_iter()
+                .any(
+                    |(key, value)| key.as_str() == "egress.firewall.input_drop.count"
+                        && value == &AnyValue::Int(1)
+                )
+        );
+        provider.shutdown().unwrap();
+    }
+
+    #[test]
+    fn missing_counter_refuses_to_report_a_partial_delta() {
+        let output = NftOutput(
+            serde_json::to_vec(&serde_json::json!({"nftables": [
+                {"counter": {"name": "input_drop", "packets": 2}},
+            ]}))
+            .unwrap(),
+        );
+        assert!(matches!(
+            output.counters(),
+            Err(ReadError::Missing {
+                name: "forward_drop"
+            })
+        ));
+    }
+}

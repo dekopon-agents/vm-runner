@@ -36,7 +36,7 @@ fn fetch_finished(pod: &Pod) -> Option<&k8s_openapi::api::core::v1::ContainerSta
 fn boot_window(pod: &Pod, fetch_seconds: u64, now: u64) -> Result<(), Error> {
     let (start, limit) = if let Some(finished) = fetch_finished(pod) {
         if finished.exit_code != 0 {
-            return Err(Error::Boot);
+            return Err(Error::Boot("fetch failed"));
         }
         (finished.finished_at.as_ref(), 60)
     } else {
@@ -44,7 +44,11 @@ fn boot_window(pod: &Pod, fetch_seconds: u64, now: u64) -> Result<(), Error> {
     };
     let start = start.ok_or(Error::Protocol)?.0.as_second();
     if now.saturating_sub(u64::try_from(start)?) >= limit {
-        return Err(Error::Boot);
+        return Err(Error::Boot(if fetch_finished(pod).is_some() {
+            "startup timed out"
+        } else {
+            "fetch timed out"
+        }));
     }
     Ok(())
 }
@@ -68,7 +72,7 @@ impl Controller {
             .lock()
             .expect("session registry poisoned")
             .iter()
-            .find(|(_, s)| !s.retiring && s.subject == subject && s.body.session_id == id)
+            .find(|(_, s)| !s.is_retiring() && s.subject == subject && s.body.session_id == id)
             .map(|(key, session)| (key.clone(), session.clone()))
             .ok_or(Error::NotFound)
     }
@@ -79,7 +83,7 @@ impl Controller {
                 Some("Failed" | "Succeeded")
             )
         {
-            return Err(Error::Boot);
+            return Err(Error::Boot("pod terminated"));
         }
         let Some(status) = &pod.status else {
             return Ok(None);
@@ -118,20 +122,20 @@ impl Controller {
             .lock()
             .expect("session registry poisoned")
             .get_mut(key)
-            .filter(|s| !s.retiring)
+            .filter(|s| !s.is_retiring())
         {
             stored.active = active;
         } else {
             return Err(Error::NotFound);
         }
-        self.address(&pod)?.ok_or(Error::Boot)
+        self.address(&pod)?.ok_or(Error::Boot("jail not ready"))
     }
     pub(super) async fn boot(&self, key: &str, session: &Session) -> Result<url::Url, Error> {
         self.sessions
             .lock()
             .expect("session registry poisoned")
             .get_mut(key)
-            .filter(|s| !s.retiring)
+            .filter(|s| !s.is_retiring())
             .ok_or(Error::NotFound)?
             .starting = true;
         // A reap may retire this entry, but cannot free it while pod creation is in flight.
@@ -141,8 +145,17 @@ impl Controller {
             .clone()
             .unwrap_or_else(|| format!("vm-runner-{}", session.body.session_id));
         let result = async {
+            let record = |kind: &'static str, pod: &Pod| {
+                let span = tracing::Span::current();
+                span.record("vm_runner.boot.kind", kind);
+                if let Some(uid) = pod.metadata.uid.as_deref() {
+                    span.record("k8s.pod.uid", uid);
+                }
+            };
             let mut pod = if session.pod.is_some() {
-                self.pods.get(&name).await?
+                let pod = self.pods.get(&name).await?;
+                record("warm", &pod);
+                pod
             } else {
                 let (pod, mut secret) = self.manifests(session, &name).await?;
                 // Record before create so a lost create response still leaves a reapable pod name.
@@ -151,13 +164,14 @@ impl Controller {
                     .lock()
                     .expect("session registry poisoned")
                     .get_mut(key)
-                    .filter(|s| !s.retiring)
+                    .filter(|s| !s.is_retiring())
                 {
                     stored.pod = Some(name.clone());
                 } else {
-                    return Err(Error::Boot);
+                    return Err(Error::Boot("session retiring"));
                 }
                 let pod = self.pods.create(&PostParams::default(), &pod).await?;
+                record("cold", &pod);
                 secret.metadata.owner_references =
                     Some(vec![pod.controller_owner_ref(&()).ok_or(Error::Protocol)?]);
                 self.secrets.create(&PostParams::default(), &secret).await?;
@@ -170,19 +184,19 @@ impl Controller {
                     .lock()
                     .expect("session registry poisoned")
                     .get(key)
-                    .is_none_or(|s| s.retiring)
+                    .is_none_or(|s| s.is_retiring())
                 {
-                    return Err(Error::Boot);
+                    return Err(Error::Boot("session retiring"));
                 }
                 let fetch_seconds = self
                     .config
                     .jails
                     .as_ref()
-                    .ok_or(Error::Boot)?
+                    .ok_or(Error::Boot("jail unavailable"))?
                     .fetch_timeout_seconds;
                 // A failed init is terminal even if a stale listener answers health.
                 if fetch_finished(&pod).is_some_and(|finished| finished.exit_code != 0) {
-                    return Err(Error::Boot);
+                    return Err(Error::Boot("fetch failed"));
                 }
                 if let Some(address) = self.address(&pod)? {
                     // A Ready pod can precede the jail listener or the guest's ping. Only
@@ -211,51 +225,77 @@ impl Controller {
                 .lock()
                 .expect("session registry poisoned")
                 .get_mut(key)
-                .filter(|s| !s.retiring)
+                .filter(|s| !s.is_retiring())
             {
                 stored.body.state = SessionState::Ready;
             } else {
-                return Err(Error::Boot);
+                return Err(Error::Boot("session retiring"));
             }
             Ok(address)
         }
         .instrument(tracing::info_span!(
-            "vm_runner.boot",
-            vm_runner.session_id = session.body.session_id
+            target: crate::config::Category::VmLifecycle.target(), "vm_runner.boot",
+            telemetry.detail = crate::telemetry::detail!(crate::config::Category::VmLifecycle),
+            vm_runner.session_id = session.body.session_id,
+            vm_runner.boot.kind = tracing::field::Empty,
+            k8s.pod.uid = tracing::field::Empty
         ))
         .await;
         match result {
-            Err(Error::Boot) => {
+            Err(Error::Boot(cause)) => {
                 let registered = {
                     let mut sessions = self.sessions.lock().expect("session registry poisoned");
                     let stored = sessions.get_mut(key).ok_or(Error::NotFound)?;
-                    stored.retiring = true;
+                    stored.retiring.get_or_insert(EndReason::BootFailure);
+                    stored.boot_cause = Some(cause);
                     stored.pod.is_some()
                 };
-                if !registered || delete_pod(&self.pods, &name).await? {
-                    self.sessions
+                if registered
+                    && let Ok(Some(pod)) = self.pods.get_opt(&name).await
+                    && let Some(stored) = self
+                        .sessions
                         .lock()
                         .expect("session registry poisoned")
-                        .remove(key);
+                        .get_mut(key)
+                {
+                    stored.pod_end = PodEnd::from_pod(&pod);
+                    stored.pod_read = true;
+                }
+                if !registered || delete_pod(&self.pods, &name).await? {
+                    let ended = {
+                        let mut sessions = self.sessions.lock().expect("session registry poisoned");
+                        remove_retired(&mut sessions, key, now())
+                    };
+                    if let Some(ended) = ended {
+                        ended.emit();
+                    }
                     self.jobs
                         .lock()
                         .expect("job registry poisoned")
                         .retain(|_, job| job.session != session.body.session_id);
                 }
-                Err(Error::Boot)
+                Err(Error::Boot(cause))
             }
             other => other,
         }
     }
-    async fn manifests(&self, session: &Session, name: &str) -> Result<(Pod, Secret), Error> {
-        let jails = self.config.jails.as_ref().ok_or(Error::Boot)?;
+    pub(super) async fn manifests(
+        &self,
+        session: &Session,
+        name: &str,
+    ) -> Result<(Pod, Secret), Error> {
+        let jails = self
+            .config
+            .jails
+            .as_ref()
+            .ok_or(Error::Boot("jail unavailable"))?;
         let profile = &self
             .config
             .profiles
             .0
             .iter()
             .find(|(n, _)| n == &session.body.profile)
-            .ok_or(Error::Boot)?
+            .ok_or(Error::Boot("profile unavailable"))?
             .1;
         let shape = &self
             .config
@@ -263,7 +303,7 @@ impl Controller {
             .0
             .iter()
             .find(|(n, _)| n == &profile.shape)
-            .ok_or(Error::Boot)?
+            .ok_or(Error::Boot("shape unavailable"))?
             .1;
         #[derive(Deserialize)]
         struct Claims {
@@ -287,10 +327,10 @@ impl Controller {
         }
         let mut files = BTreeMap::new();
         let mut telemetry = serde_json::to_value(&self.config.telemetry)?;
-        if let Some(t) = &self.config.telemetry {
+        if let Some(t) = self.config.telemetry.as_ref().and_then(|t| t.otlp.as_ref()) {
             for (key, filename, path) in [
-                ("caBundleFile", "otlp-ca", &t.otlp.ca_bundle_file),
-                ("headersFile", "otlp-headers", &t.otlp.headers_file),
+                ("caBundleFile", "otlp-ca", &t.ca_bundle_file),
+                ("headersFile", "otlp-headers", &t.headers_file),
             ] {
                 if let Some(path) = path {
                     files.insert(

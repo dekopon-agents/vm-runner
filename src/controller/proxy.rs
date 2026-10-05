@@ -8,8 +8,8 @@ pub(crate) mod artifacts;
 pub(super) enum Error {
     #[error("session or job not found")]
     NotFound,
-    #[error("jail boot failed")]
-    Boot,
+    #[error("jail boot failed: {0}")]
+    Boot(&'static str),
     #[error("artifact path refused")]
     Forbidden,
     #[error("artifact service unavailable")]
@@ -81,7 +81,10 @@ enum ResponseError {
 }
 impl From<Error> for ResponseError {
     fn from(error: Error) -> Self {
-        tracing::warn!(cause = %error, "controller operation failed");
+        tracing::warn!(name: "vm_runner.request.failed", target: crate::config::Category::VmExec.target(), {
+            telemetry.detail = crate::telemetry::detail!(crate::config::Category::VmExec),
+            cause = %error,
+        }, "controller operation failed");
         let body = PlainText(error.to_string());
         match error {
             Error::NotFound => Self::NotFound(body),
@@ -122,6 +125,19 @@ struct ExecRefused {
 enum ExecResult {
     Executed(Executed),
     NotExecuted(ExecRefused),
+}
+fn record_exec_result(result: &ExecResult) {
+    let span = tracing::Span::current();
+    match result {
+        ExecResult::Executed(value) => {
+            span.record("vm_runner.exec.outcome", "completed");
+            span.record("vm_runner.exec.truncated", value.truncated);
+        }
+        ExecResult::NotExecuted(value) => {
+            span.record("vm_runner.exec.outcome", "not-executed");
+            span.record("vm_runner.exec.truncated", value.truncated);
+        }
+    }
 }
 #[derive(Object, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -228,7 +244,11 @@ impl Controller {
         method: reqwest::Method,
         url: url::Url,
     ) -> Result<reqwest::RequestBuilder, Error> {
-        let jails = self.config.jails.as_ref().ok_or(Error::Boot)?;
+        let jails = self
+            .config
+            .jails
+            .as_ref()
+            .ok_or(Error::Boot("jail unavailable"))?;
         let bytes = super::pods::read(&jails.token_file).await?;
         let token = std::str::from_utf8(&bytes)?.trim();
         let client = reqwest::Client::builder()
@@ -275,6 +295,9 @@ impl Controller {
             jobs.len() >= 1024 || jobs.values().filter(|job| job.session == id).count() >= 64
         };
         if full {
+            let span = tracing::Span::current();
+            span.record("vm_runner.exec.outcome", "not-executed");
+            span.record("vm_runner.exec.truncated", false);
             return Ok(ExecResponse::Complete(Json(ExecResult::NotExecuted(
                 ExecRefused {
                     reason: "job_capacity".into(),
@@ -282,11 +305,28 @@ impl Controller {
                 },
             ))));
         }
-        if let Err(error) = self.boot(&key, &session).await {
-            if !matches!(error, Error::Boot) {
+        let cold = session.pod.is_none();
+        let boot_start = std::time::Instant::now();
+        let boot_result = self.boot(&key, &session).await;
+        tracing::Span::current().record(
+            "vm_runner.exec.boot_wait_ms",
+            if cold {
+                boot_start.elapsed().as_millis().min(i64::MAX as u128) as i64
+            } else {
+                0
+            },
+        );
+        if let Err(error) = boot_result {
+            if !matches!(error, Error::Boot(_)) {
                 return Err(error);
             }
-            tracing::warn!(cause = %error, "exec not started");
+            let span = tracing::Span::current();
+            span.record("vm_runner.exec.outcome", "not-executed");
+            span.record("vm_runner.exec.truncated", false);
+            tracing::warn!(name: "vm_runner.exec.not_started", target: crate::config::Category::VmExec.target(), {
+                telemetry.detail = crate::telemetry::detail!(crate::config::Category::VmExec),
+                cause = %error,
+            }, "exec not started");
             return Ok(ExecResponse::Complete(Json(ExecResult::NotExecuted(
                 ExecRefused {
                     reason: "boot_failure".into(),
@@ -308,7 +348,7 @@ impl Controller {
             let sessions = self.sessions.lock().expect("session registry poisoned");
             sessions
                 .get(&key)
-                .filter(|s| !s.retiring)
+                .filter(|s| !s.is_retiring())
                 .ok_or(Error::NotFound)?;
             self.jobs.lock().expect("job registry poisoned").insert(
                 job_id.clone(),
@@ -317,6 +357,7 @@ impl Controller {
                     jail_id: pending.job_id,
                 },
             );
+            tracing::Span::current().record("vm_runner.exec.outcome", "pending");
             Ok(ExecResponse::Pending(Json(Pending {
                 outcome: Unknown::Unknown,
                 job_id,
@@ -324,6 +365,7 @@ impl Controller {
         } else {
             let mut result = json(checked(response, 200)?).await?;
             cap(&mut result);
+            record_exec_result(&result);
             Ok(ExecResponse::Complete(Json(result)))
         }
     }
@@ -340,7 +382,7 @@ impl Controller {
             .pods
             .get(session.pod.as_ref().ok_or(Error::NotFound)?)
             .await?;
-        let mut url = self.address(&pod)?.ok_or(Error::Boot)?;
+        let mut url = self.address(&pod)?.ok_or(Error::Boot("jail not ready"))?;
         url.path_segments_mut()
             .map_err(|()| Error::Protocol)?
             .extend(["jobs", &job.jail_id]);
@@ -387,13 +429,22 @@ impl Api {
         if body.argv.first().is_none_or(String::is_empty) {
             return Ok(ExecResponse::Invalid(Json(refused("invalid exec request"))));
         }
-        Ok(controller(&state)?
+        let span = tracing::info_span!(
+            target: crate::config::Category::VmExec.target(), "vm_runner.exec",
+            telemetry.detail = crate::telemetry::detail!(crate::config::Category::VmExec),
+            vm_runner.session_id = crate::egress::cut(&id.0),
+            vm_runner.exec.boot_wait_ms = tracing::field::Empty,
+            vm_runner.exec.outcome = tracing::field::Empty,
+            vm_runner.exec.truncated = tracing::field::Empty
+        );
+        let result = controller(&state)?
             .exec(&subject, &id, &body)
-            .instrument(tracing::info_span!(
-                "vm_runner.exec",
-                vm_runner.session_id = crate::egress::cut(&id.0)
-            ))
-            .await?)
+            .instrument(span.clone())
+            .await;
+        if result.is_err() {
+            span.record("vm_runner.exec.outcome", "failed");
+        }
+        Ok(result?)
     }
     #[oai(path = "/v1/jobs/:jobId", method = "get")]
     async fn job(
@@ -408,7 +459,8 @@ impl Api {
         };
         Ok(controller(&state)?
             .job(&subject, &job_id)
-            .instrument(tracing::info_span!("vm_runner.job.get"))
+            .instrument(tracing::info_span!(target: crate::config::Category::VmExec.target(), "vm_runner.job.get",
+                telemetry.detail = crate::telemetry::detail!(crate::config::Category::VmExec)))
             .await?)
     }
 }

@@ -14,7 +14,21 @@ Before serving, configure the issuer URL, optional CA/token files and exact serv
 subjects in the example config. `/healthz` is public; `/v1/whoami` requires a bearer JWT and
 returns its subject and session quota. Optional `telemetry.otlp` selects `grpc` or `http`
 with an endpoint and optional `caBundleFile` and `headersFile` (`key: value` per line).
+For `protocol: http`, the endpoint must end in `/v1/traces`.
 Without telemetry configuration, tracing goes only to stdout JSON logs.
+
+## Telemetry
+
+`telemetry.detail.default` and `telemetry.detail.categories` choose `drip` (INFO),
+`standard` (DEBUG), or `full` (TRACE) for each category: `vm.lifecycle`, `vm.exec`,
+`egress.exchange`, `egress.dns`, `egress.connect`, `egress.drop`, and `telemetry`.
+`telemetry.omit.headers` and `telemetry.omit.queryKeys` suppress named values from
+recorded exchanges. At `drip`, session start/end, exchange/request/DNS/connect rollups,
+refusals, failures, firewall drops, and telemetry health remain; per-operation spans
+without a trace parent require `standard`. Guest exec exit code, duration, timeout,
+CPU microseconds and peak memory bytes are **guest-reported** on jail exec spans, not
+controller API fields. CPU and memory are absent for older guests or when per-command
+cgroup v2 measurement is unavailable; execution still succeeds.
 
 ## Controller TLS (C3 config / C4 API)
 
@@ -136,9 +150,11 @@ to 128. `maxConnections` must be 1–255: one blocking worker and one DNS lookup
 plus the refusal-export and gateway UDP workers, fit Tokio's default 512-thread blocking pool.
 Successful client reads or writes reset the idle timeout, not the maximum lifetime.
 Excess connections close immediately. One background worker coalesces their `refused:connections`
-spans to at most one per second, with `count` giving the number refused since the previous span;
-export never blocks the accept loop. Shutdown stops accepting and drains the bounded workers
-and final refusal count before shutting down telemetry.
+`egress.refused` logs to at most one per second, with `egress.refused.count` giving the sockets
+refused since the previous log; export never blocks the accept loop. Egress exchanges finish when
+the response body ends; destination, DNS, connection and header/query noise totals are logged every
+60 seconds and at shutdown. The jail also reports named nftables drop-counter deltas. Shutdown stops
+accepting and drains the bounded workers and final counts before shutting down telemetry.
 
 ## Guest agent
 

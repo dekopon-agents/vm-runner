@@ -75,6 +75,45 @@ async fn exec_delivers_stdin_environment_and_default_home() {
     );
 }
 
+#[test]
+fn per_command_cgroup_measurements_are_optional_on_failure() {
+    let root = tempfile::tempdir().unwrap();
+    assert!(ExecCgroup::attach(&root.path().join("missing"), 123).is_none());
+    let group = ExecCgroup::attach(root.path(), 123).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(group.0.join("cgroup.procs")).unwrap(),
+        "123"
+    );
+    assert_eq!(group.measurements(), None);
+    std::fs::write(group.0.join("cpu.stat"), "usage_usec 42\nuser_usec 40\n").unwrap();
+    std::fs::write(group.0.join("memory.peak"), "8192\n").unwrap();
+    assert_eq!(group.measurements(), Some((42, 8192)));
+    let path = group.0.clone();
+    std::fs::remove_file(path.join("cgroup.procs")).unwrap();
+    std::fs::remove_file(path.join("cpu.stat")).unwrap();
+    std::fs::remove_file(path.join("memory.peak")).unwrap();
+    drop(group);
+    assert!(!path.exists());
+}
+
+#[tokio::test(start_paused = true)]
+async fn cgroup_release_timeout_keeps_measurements_and_stops_at_deadline() {
+    let root = tempfile::tempdir().unwrap();
+    let group = ExecCgroup::attach(root.path(), 123).unwrap();
+    let path = group.0.clone();
+    std::fs::write(path.join("cpu.stat"), "usage_usec 42\n").unwrap();
+    std::fs::write(path.join("memory.peak"), "8192\n").unwrap();
+    std::fs::write(path.join("cgroup.events"), "populated 1\n").unwrap();
+    let start = tokio::time::Instant::now();
+    assert_eq!(group.finish().await, Some((42, 8192)));
+    assert_eq!(start.elapsed(), Duration::from_secs(2));
+    // A real cgroup moves remaining tasks on release; the tempdir's synthetic
+    // files cannot be rmdir'd by Drop, so remove only this test's fixtures.
+    for file in ["cpu.stat", "memory.peak", "cgroup.events", "cgroup.procs"] {
+        std::fs::remove_file(path.join(file)).unwrap();
+    }
+    std::fs::remove_dir(path).unwrap();
+}
 #[tokio::test]
 async fn exec_reports_nonzero_exit_and_spawn_refusals() {
     let (_dir, guest) = guest();
@@ -338,6 +377,120 @@ async fn ping_closes_after_one_response_and_malformed_json_is_refused() {
         call(&guest, json!({"op":"no-such-op"})).await,
         json!({"outcome":"not_executed", "reason":"invalid_request"})
     );
+}
+
+// Run by CI in a privileged container at the kernel cgroup root. Never silently skip this witness:
+// the job explicitly invokes the ignored test, and missing cgroup support fails it.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "requires writable cgroup v2; CI runs this in an isolated privileged container"]
+async fn detached_descendants_survive_and_exec_cgroups_are_reaped() {
+    struct Survivors(Vec<PathBuf>);
+    impl Drop for Survivors {
+        fn drop(&mut self) {
+            // The daemon records its pid before the exec completes. This also cleans up
+            // after an assertion or a timeout before the response returns its pid.
+            for file in &self.0 {
+                if let Ok(pid) = std::fs::read_to_string(file)
+                    && let Ok(pid) = pid.parse::<i32>()
+                    && let Err(error) = kill(Pid::from_raw(pid), Signal::SIGKILL)
+                    && error != nix::errno::Errno::ESRCH
+                {
+                    eprintln!("failed to clean up test daemon {pid}: {error}");
+                }
+            }
+        }
+    }
+    let root = Path::new("/sys/fs/cgroup");
+    assert!(
+        root.join("cgroup.controllers").exists(),
+        "cgroup v2 required"
+    );
+    for controller in ["cpu", "memory"] {
+        assert!(
+            std::fs::read_to_string(root.join("cgroup.subtree_control"))
+                .unwrap()
+                .split_whitespace()
+                .any(|name| name == controller),
+            "{controller} controller must be enabled"
+        );
+    }
+    let (_dir, guest) = guest();
+    let mut survivors = Survivors(Vec::new());
+    for index in 0..4 {
+        let pid_file = format!("daemon-{index}.pid");
+        survivors.0.push(guest.home.join(&pid_file));
+        let start = Instant::now();
+        let response = timeout(
+            Duration::from_secs(5),
+            call(
+                &guest,
+                exec(&format!(
+                    "until grep -q \"/exec-$$\\$\" /proc/$$/cgroup; do :; done; \
+                     setsid sh -c 'exec sleep 30' </dev/null >/dev/null 2>&1 & daemon=$!; \
+                     printf '%s' \"$daemon\" > {pid_file}; \
+                     until [ \"$(cut -d ' ' -f6 /proc/$daemon/stat)\" = \"$daemon\" ]; do :; done; \
+                     printf '%s %s' \"$$\" \"$daemon\""
+                )),
+            ),
+        )
+        .await
+        .expect("exec must not wait for the detached descendant");
+        assert_eq!(response["exitCode"], 0, "{response}");
+        let pids: Vec<u32> = response["stdout"]
+            .as_str()
+            .unwrap()
+            .split_whitespace()
+            .map(|pid| pid.parse().unwrap())
+            .collect();
+        assert_eq!(pids.len(), 2, "{response}");
+        let (shell, daemon) = (pids[0], pids[1]);
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "exec waited on cleanup"
+        );
+        assert!(
+            !root.join(format!("exec-{shell}")).exists(),
+            "per-exec cgroup leaked"
+        );
+        let stat = fs::read_to_string(format!("/proc/{daemon}/stat"))
+            .await
+            .unwrap();
+        assert!(
+            !stat
+                .rsplit_once(')')
+                .unwrap()
+                .1
+                .trim_start()
+                .starts_with('Z'),
+            "daemon died"
+        );
+        assert!(
+            std::fs::read_to_string(root.join("cgroup.procs"))
+                .unwrap()
+                .split_whitespace()
+                .any(|pid| pid == daemon.to_string()),
+            "daemon not moved to parent"
+        );
+        assert!(
+            response["cpuUs"].is_u64(),
+            "CPU measurement absent: {response}"
+        );
+        assert!(
+            response["memoryPeakBytes"].is_u64(),
+            "peak measurement absent: {response}"
+        );
+        assert_eq!(
+            std::fs::read_dir(root)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy().starts_with("exec-"))
+                .count(),
+            0,
+            "repeated exec leaked a cgroup"
+        );
+    }
+    drop(survivors); // Kill only test-owned daemons; production preserves them.
 }
 
 // The guest's PID 1 is tini with the agent as its only child; `tini -s` stands in for PID 1 here.

@@ -3,7 +3,7 @@ use serde::{
     de::{MapAccess, Visitor},
 };
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     fmt,
     net::SocketAddr,
     num::NonZeroU32,
@@ -123,9 +123,162 @@ pub(crate) struct Quota {
 #[derive(Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Telemetry {
-    pub(crate) otlp: Otlp,
+    #[serde(default)]
+    pub(crate) otlp: Option<Otlp>,
+    #[serde(default)]
+    pub(crate) detail: DetailConfig,
+    #[serde(default)]
+    pub(crate) omit: Omit,
 }
-#[derive(Deserialize, serde::Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum Detail {
+    Drip,
+    #[default]
+    Standard,
+    Full,
+}
+impl Detail {
+    pub(crate) const fn filter(self) -> &'static str {
+        match self {
+            Self::Drip => "info",
+            Self::Standard => "debug",
+            Self::Full => "trace",
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Category {
+    VmLifecycle,
+    VmExec,
+    EgressExchange,
+    EgressDns,
+    EgressConnect,
+    EgressDrop,
+    Telemetry,
+}
+impl Category {
+    pub(crate) const ALL: [Self; 7] = [
+        Self::VmLifecycle,
+        Self::VmExec,
+        Self::EgressExchange,
+        Self::EgressDns,
+        Self::EgressConnect,
+        Self::EgressDrop,
+        Self::Telemetry,
+    ];
+    pub(crate) fn from_target(target: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|category| category.target() == target)
+    }
+    pub(crate) const fn target(self) -> &'static str {
+        match self {
+            Self::VmLifecycle => "vm.lifecycle",
+            Self::VmExec => "vm.exec",
+            Self::EgressExchange => "egress.exchange",
+            Self::EgressDns => "egress.dns",
+            Self::EgressConnect => "egress.connect",
+            Self::EgressDrop => "egress.drop",
+            Self::Telemetry => "telemetry",
+        }
+    }
+}
+impl serde::Serialize for Category {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.target())
+    }
+}
+#[derive(Clone, Debug, Default, Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DetailConfig {
+    #[serde(default)]
+    pub default: Detail,
+    #[serde(default, deserialize_with = "categories")]
+    pub categories: BTreeMap<Category, Detail>,
+}
+fn categories<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<BTreeMap<Category, Detail>, D::Error> {
+    let entries = BTreeMap::<String, Detail>::deserialize(deserializer)?;
+    let mut categories = BTreeMap::new();
+    let mut unknown = Vec::new();
+    for (key, detail) in entries {
+        if let Some(category) = Category::from_target(&key) {
+            categories.insert(category, detail);
+        } else {
+            unknown.push(key);
+        }
+    }
+    if !unknown.is_empty() {
+        return Err(serde::de::Error::custom(format!(
+            "unknown telemetry categories: {}",
+            unknown.join(", ")
+        )));
+    }
+    Ok(categories)
+}
+impl DetailConfig {
+    pub(crate) fn level(&self, category: Category) -> Detail {
+        self.categories
+            .get(&category)
+            .copied()
+            .unwrap_or(self.default)
+    }
+    pub(crate) fn filter(&self) -> String {
+        let mut filter = String::from("info");
+        for category in Category::ALL {
+            filter.push_str(&format!(
+                ",{}={}",
+                category.target(),
+                self.level(category).filter()
+            ));
+        }
+        filter.push_str(",hyper=off,tonic=off,h2=off,reqwest=off,opentelemetry=off");
+        filter
+    }
+}
+#[derive(Clone, Default, Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub(crate) struct Omit {
+    #[serde(default)]
+    pub headers: Vec<OmitName>,
+    #[serde(default)]
+    pub query_keys: Vec<OmitName>,
+}
+#[derive(Clone)]
+pub(crate) enum OmitName {
+    Exact(String),
+    Prefix(String),
+}
+impl serde::Serialize for OmitName {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Exact(name) => serializer.serialize_str(name),
+            Self::Prefix(stem) => serializer.serialize_str(&format!("{stem}*")),
+        }
+    }
+}
+impl<'de> Deserialize<'de> for OmitName {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let name = String::deserialize(deserializer)?.to_lowercase();
+        let (stem, prefix) = match name.strip_suffix('*') {
+            Some(stem) => (stem, true),
+            None => (name.as_str(), false),
+        };
+        if stem.is_empty() || stem.contains('*') || stem.chars().any(char::is_control) {
+            return Err(serde::de::Error::custom(
+                "omit name must be nonempty and may have only a trailing *",
+            ));
+        }
+        Ok(if prefix {
+            Self::Prefix(stem.into())
+        } else {
+            Self::Exact(stem.into())
+        })
+    }
+}
+#[derive(Clone, Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub(crate) struct Otlp {
     pub protocol: Protocol,
@@ -133,7 +286,7 @@ pub(crate) struct Otlp {
     pub ca_bundle_file: Option<PathBuf>,
     pub headers_file: Option<PathBuf>,
 }
-#[derive(Deserialize, serde::Serialize)]
+#[derive(Clone, Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum Protocol {
     Grpc,

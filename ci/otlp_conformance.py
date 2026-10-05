@@ -171,7 +171,9 @@ def verify(backend, base, authorization, started, session, url):
         "dekopon.source": "runner",
     }
     expected_span = {
-        "http.request.method": "GET", "url.full": url,
+        "http.request.method": "GET", "url.scheme": "http",
+        "server.port": int(urllib.parse.urlsplit(url).port),
+        "url.path": "/" + session,
         "http.response.status_code": 200, "server.address": "127.0.0.1",
         "egress.decision": "allowed",
     }
@@ -186,7 +188,7 @@ def verify(backend, base, authorization, started, session, url):
     for key, value in expected_span.items():
         actual = (span["span_attributes"].get(key) if backend == "quickwit"
                   else span.get(key.replace(".", "_")))
-        if key == "http.response.status_code":
+        if key in ("http.response.status_code", "server.port"):
             actual = int(actual)
         assert actual == value, f"{backend}: span {key}: {actual!r} != {value!r}"
     trace = span["trace_id"]

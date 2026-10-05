@@ -22,6 +22,11 @@ mkdir -p /dev/pts /dev/shm /scratch/artifacts /home/jail/.pki/nssdb /run
 mount -t devpts devpts /dev/pts -o gid=5,mode=620
 mount -t tmpfs tmpfs /dev/shm -o mode=1777
 mount -t tmpfs tmpfs /run
+mkdir -p /sys/fs/cgroup
+mount -t cgroup2 cgroup2 /sys/fs/cgroup || true
+if [ -w /sys/fs/cgroup/cgroup.subtree_control ]; then
+    printf '+cpu +memory\n' > /sys/fs/cgroup/cgroup.subtree_control || true
+fi
 mount --bind /scratch/artifacts /artifacts
 chown 1000:1000 /artifacts
 openssl x509 -in /dev/vdb -out /usr/local/share/ca-certificates/vm-runner.crt

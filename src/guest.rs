@@ -109,6 +109,10 @@ struct Executed {
     duration_ms: u64,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     timed_out: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cpu_us: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    memory_peak_bytes: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -343,7 +347,9 @@ impl ProcessGroup {
 impl Drop for ProcessGroup {
     fn drop(&mut self) {
         if let Err(error) = self.kill() {
-            tracing::error!(%error, "guest process-group cleanup failed");
+            tracing::error!(name: "vm_runner.exec.cleanup_failed", target: crate::config::Category::VmExec.target(), {
+                telemetry.detail = crate::telemetry::detail!(crate::config::Category::VmExec), %error,
+            }, "guest process-group cleanup failed");
         }
     }
 }
@@ -379,6 +385,67 @@ impl Output {
     }
 }
 
+// Each spawned pid names one cgroup. Failure to measure is never an exec failure.
+struct ExecCgroup(PathBuf);
+impl ExecCgroup {
+    fn attach(root: &Path, pid: u32) -> Option<Self> {
+        let path = root.join(format!("exec-{pid}"));
+        std::fs::create_dir(&path).ok()?;
+        let group = Self(path);
+        std::fs::write(group.0.join("cgroup.procs"), pid.to_string()).ok()?;
+        Some(group)
+    }
+
+    fn measurements(&self) -> Option<(u64, u64)> {
+        let stat = std::fs::read_to_string(self.0.join("cpu.stat")).ok()?;
+        let cpu = stat
+            .lines()
+            .find_map(|line| line.strip_prefix("usage_usec "))?
+            .parse()
+            .ok()?;
+        let peak = std::fs::read_to_string(self.0.join("memory.peak"))
+            .ok()?
+            .trim()
+            .parse()
+            .ok()?;
+        Some((cpu, peak))
+    }
+
+    async fn finish(self) -> Option<(u64, u64)> {
+        let values = self.measurements();
+        let _ = self.release().await;
+        values
+    }
+
+    // Detached daemons (browse's Chromium, agent-browser) outlive their exec by design, so
+    // survivors move to the parent group instead of pinning this one.
+    async fn release(&self) -> Option<()> {
+        let parent = self.0.parent()?.join("cgroup.procs");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let events = std::fs::read_to_string(self.0.join("cgroup.events")).ok()?;
+            if events.lines().any(|line| line == "populated 0") {
+                return std::fs::remove_dir(&self.0).ok();
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            for pid in std::fs::read_to_string(self.0.join("cgroup.procs"))
+                .ok()?
+                .split_whitespace()
+            {
+                drop(std::fs::write(&parent, pid));
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+}
+impl Drop for ExecCgroup {
+    fn drop(&mut self) {
+        drop(std::fs::remove_dir(&self.0));
+    }
+}
+
 async fn execute(
     mut command: Command,
     input: Option<String>,
@@ -390,6 +457,7 @@ async fn execute(
         .id()
         .ok_or_else(|| io::Error::other("child has no pid"))?;
     let mut group = ProcessGroup(Some(Pid::from_raw(-(pid as i32))));
+    let cgroup = ExecCgroup::attach(Path::new("/sys/fs/cgroup"), pid);
     let mut stdin = child
         .stdin
         .take()
@@ -417,27 +485,37 @@ async fn execute(
         })
     };
     let result = timeout(Duration::from_millis(u64::from(deadline_ms)), work).await;
-    let (exit_code, timed_out) = match result {
+    let ended = match result {
         Ok(Ok((status, (), (), ()))) => {
             use std::os::unix::process::ExitStatusExt;
-            (
+            Ok((
                 status
                     .code()
                     .unwrap_or_else(|| -status.signal().unwrap_or(1)),
                 false,
-            )
+            ))
         }
         failure => {
-            group.kill()?;
-            child.start_kill()?;
-            child.wait().await?;
-            if let Ok(Err(error)) = failure {
-                return Err(error.into());
+            async {
+                group.kill()?;
+                child.start_kill()?;
+                child.wait().await?;
+                if let Ok(Err(error)) = failure {
+                    return Err(error);
+                }
+                Ok::<_, io::Error>((-9, true))
             }
-            (-9, true)
+            .await
         }
     };
-    group.kill()?;
+    let duration = start.elapsed();
+    let killed = group.kill();
+    let measurements = match cgroup {
+        Some(cgroup) => cgroup.finish().await,
+        None => None,
+    };
+    let (exit_code, timed_out) = ended?;
+    killed?;
     let (stdout, out_truncated) = out.text();
     let (stderr, err_truncated) = err.text();
     Ok(Executed {
@@ -446,8 +524,10 @@ async fn execute(
         stdout,
         stderr,
         truncated: out_truncated || err_truncated,
-        duration_ms: start.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+        duration_ms: duration.as_millis().try_into().unwrap_or(u64::MAX),
         timed_out,
+        cpu_us: measurements.map(|(cpu, _)| cpu),
+        memory_peak_bytes: measurements.map(|(_, peak)| peak),
     })
 }
 

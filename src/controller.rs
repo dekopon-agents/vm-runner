@@ -101,8 +101,110 @@ struct Session {
     created: u64,
     active: u64,
     pod: Option<String>,
-    retiring: bool,
+    retiring: Option<EndReason>,
+    boot_cause: Option<&'static str>,
+    pod_end: PodEnd,
+    pod_read: bool,
     starting: bool,
+}
+#[derive(Clone, Copy)]
+enum EndReason {
+    Idle,
+    MaxSeconds,
+    BootFailure,
+    Duplicate,
+    Terminal,
+}
+#[derive(Clone, Default)]
+struct PodEnd {
+    uid: Option<String>,
+    phase: Option<String>,
+    terminated_reason: Option<String>,
+    exit_code: Option<i32>,
+}
+impl PodEnd {
+    fn from_pod(pod: &Pod) -> Self {
+        let terminated = pod
+            .status
+            .as_ref()
+            .and_then(|s| s.container_statuses.as_ref())
+            .and_then(|statuses| statuses.iter().find(|s| s.name == "jail"))
+            .and_then(|s| s.state.as_ref())
+            .and_then(|s| s.terminated.as_ref());
+        Self {
+            uid: pod.metadata.uid.clone(),
+            phase: pod.status.as_ref().and_then(|s| s.phase.clone()),
+            terminated_reason: terminated.and_then(|s| s.reason.clone()),
+            exit_code: terminated.map(|s| s.exit_code),
+        }
+    }
+}
+enum ReapAttempt {
+    First,
+    Retry,
+}
+struct Expired {
+    key: String,
+    session_id: String,
+    pod: Option<String>,
+    attempt: ReapAttempt,
+}
+#[must_use]
+fn remove_retired(
+    sessions: &mut HashMap<String, Session>,
+    key: &str,
+    at: u64,
+) -> Option<EndRecord> {
+    let reason = sessions.get(key)?.retiring?;
+    let session = sessions.remove(key)?;
+    Some(EndRecord {
+        session,
+        reason,
+        at,
+    })
+}
+impl EndReason {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::MaxSeconds => "max_seconds",
+            Self::BootFailure => "boot_failure",
+            Self::Duplicate => "duplicate",
+            Self::Terminal => "terminal",
+        }
+    }
+}
+struct EndRecord {
+    session: Session,
+    reason: EndReason,
+    at: u64,
+}
+impl EndRecord {
+    fn emit(self) {
+        let session = &self.session;
+        let duration = i64::try_from(self.at.saturating_sub(session.created).saturating_mul(1000))
+            .unwrap_or(i64::MAX);
+        tracing::info!(name: "vm_runner.session.ended", target: crate::config::Category::VmLifecycle.target(), {
+            telemetry.detail = crate::telemetry::detail!(crate::config::Category::VmLifecycle),
+            vm_runner.session_id = %session.body.session_id,
+            vm_runner.subject = %session.subject,
+            vm_runner.profile = %session.body.profile,
+            vm_runner.shape = %session.body.shape,
+            vm_runner.session.end_reason = self.reason.label(),
+            duration_ms = duration,
+            k8s.pod.name = session.pod.as_deref(),
+            k8s.pod.uid = session.pod_end.uid.as_deref(),
+            k8s.pod.phase = session.pod_end.phase.as_deref(),
+            vm_runner.jail.terminated_reason = session.pod_end.terminated_reason.as_deref(),
+            vm_runner.jail.exit_code = session.pod_end.exit_code.map(i64::from),
+            error = session.boot_cause,
+        }, "session ended");
+    }
+}
+impl Session {
+    fn is_retiring(&self) -> bool {
+        self.retiring.is_some()
+    }
 }
 pub(crate) struct Controller {
     config: Arc<Config>,
@@ -197,40 +299,54 @@ impl Controller {
                     active: active.min(now()),
                     pod: Some(pod.metadata.name.clone()?),
                     starting: false,
-                    retiring: pod.metadata.deletion_timestamp.is_some()
-                        || matches!(
-                            pod.status.as_ref().and_then(|s| s.phase.as_deref()),
-                            Some("Failed" | "Succeeded")
-                        ),
+                    boot_cause: None,
+                    pod_end: PodEnd::default(),
+                    pod_read: false,
+                    retiring: (pod.metadata.deletion_timestamp.is_some()
+                        || matches!(pod.status.as_ref().and_then(|s| s.phase.as_deref()),
+                            Some("Failed" | "Succeeded"))).then_some(EndReason::Terminal),
                 })
             });
             // Foreign/inconsistent pods are not ours to adopt or delete.
             let Some(mut session) = recovered else {
                 continue;
             };
-            if !session.retiring {
-                session.retiring = !ids.insert(session.body.session_id.clone())
-                    || !names.insert((session.subject.clone(), session.body.name.clone()));
+            if !session.is_retiring()
+                && (!ids.insert(session.body.session_id.clone())
+                    || !names.insert((session.subject.clone(), session.body.name.clone())))
+            {
+                session.retiring = Some(EndReason::Duplicate);
             }
             let name = session.pod.as_ref().expect("recovered pod has a name");
-            if session.retiring && pod.metadata.deletion_timestamp.is_none() {
-                let gone = async {
-                    match delete_pod(&pods, name).await {
-                        Ok(gone) => gone,
-                        Err(error) => {
-                            tracing::warn!(%error, "pod cleanup failed; retrying next tick");
-                            false
+            // The list is the pre-cleanup observation even for pods already deleting.
+            if session.is_retiring() {
+                session.pod_end = PodEnd::from_pod(&pod);
+                session.pod_read = true;
+            }
+            if let Some(reason) = session
+                .retiring
+                .filter(|_| pod.metadata.deletion_timestamp.is_none())
+            {
+                // The listed pod is already a read of its status; no extra GET is needed.
+                match delete_pod(&pods, name).await {
+                    Ok(true) => {
+                        EndRecord {
+                            session,
+                            reason,
+                            at: now(),
                         }
+                        .emit();
+                        continue;
                     }
-                }
-                .instrument(tracing::info_span!(
-                    "vm_runner.reap",
-                    k8s.pod.name = name,
-                    cause = "terminal_or_duplicate"
-                ))
-                .await;
-                if gone {
-                    continue;
+                    Ok(false) => {}
+                    Err(error) => {
+                        tracing::warn!(name: "vm_runner.reap.failed", target: crate::config::Category::VmLifecycle.target(), {
+                        telemetry.detail = crate::telemetry::detail!(crate::config::Category::VmLifecycle),
+                        vm_runner.session_id = %session.body.session_id,
+                        k8s.pod.name = %name,
+                        %error,
+                    }, "pod cleanup failed; retrying next tick")
+                    }
                 }
             }
             sessions.insert(name.clone(), session);
@@ -255,7 +371,7 @@ impl Controller {
         let mut sessions = self.sessions.lock().expect("session registry poisoned");
         if let Some(existing) = sessions
             .values_mut()
-            .find(|s| !s.retiring && s.subject == subject && s.body.name == name)
+            .find(|s| !s.is_retiring() && s.subject == subject && s.body.name == name)
         {
             return Ok(if existing.body.profile == request.profile {
                 existing.active = now();
@@ -294,6 +410,15 @@ impl Controller {
             shape: profile.shape.clone(),
             state: SessionState::Pending,
         };
+        let Some((_, shape)) = self
+            .config
+            .shapes
+            .0
+            .iter()
+            .find(|(name, _)| name == &body.shape)
+        else {
+            return Ok(Created::refused(Failure::BadProfile));
+        };
         sessions.insert(
             body.session_id.clone(),
             Session {
@@ -302,11 +427,35 @@ impl Controller {
                 created: now(),
                 active: now(),
                 pod: None,
-                retiring: false,
+                retiring: None,
+                boot_cause: None,
+                pod_end: PodEnd::default(),
+                pod_read: false,
                 starting: false,
             },
         );
+        tracing::info!(name: "vm_runner.session.started", target: crate::config::Category::VmLifecycle.target(), {
+            telemetry.detail = crate::telemetry::detail!(crate::config::Category::VmLifecycle),
+            vm_runner.session_id = %body.session_id,
+            vm_runner.subject = %subject,
+            vm_runner.profile = %body.profile,
+            vm_runner.shape = %body.shape,
+            vm_runner.shape.vcpu.count = i64::from(shape.vcpus.get()),
+            vm_runner.shape.memory.bytes = i64::from(shape.memory.get()) * 1_048_576,
+        }, "session started");
         Ok(Created::New(Json(body)))
+    }
+    pub(crate) fn health(&self) {
+        let count = self
+            .sessions
+            .lock()
+            .expect("session registry poisoned")
+            .len();
+        tracing::info!(name: "telemetry.health", target: crate::config::Category::Telemetry.target(), {
+            telemetry.detail = crate::telemetry::detail!(crate::config::Category::Telemetry),
+            rollup.interval_ms = i64::try_from(crate::ROLLUP_INTERVAL.as_millis()).unwrap_or(i64::MAX),
+            vm_runner.session.live.count = i64::try_from(count).unwrap_or(i64::MAX),
+        }, "telemetry healthy");
     }
     pub(crate) async fn reap(&self, now: u64) {
         // Mark under the same mutex used by create. Network I/O never owns admission
@@ -317,73 +466,110 @@ impl Controller {
             .expect("session registry poisoned")
             .iter_mut()
             .filter_map(|(key, s)| {
-                let expired = self
-                    .config
-                    .profiles
-                    .0
-                    .iter()
-                    .find(|(n, _)| n == &s.body.profile)
-                    .is_some_and(|(_, p)| {
-                        now.saturating_sub(s.created) >= p.max_seconds
-                            || now.saturating_sub(s.active) >= p.idle_seconds
-                    });
-                if !s.retiring && !expired {
-                    return None;
+                let was_retiring = s.is_retiring();
+                if !was_retiring {
+                    s.retiring = self
+                        .config
+                        .profiles
+                        .0
+                        .iter()
+                        .find(|(n, _)| n == &s.body.profile)
+                        .and_then(|(_, p)| {
+                            if now.saturating_sub(s.created) >= p.max_seconds {
+                                Some(EndReason::MaxSeconds)
+                            } else if now.saturating_sub(s.active) >= p.idle_seconds {
+                                Some(EndReason::Idle)
+                            } else {
+                                None
+                            }
+                        });
                 }
-                let was_retiring = s.retiring;
-                s.retiring = true;
+                s.retiring?;
                 if s.starting {
                     return None;
                 }
-                Some((
-                    key.clone(),
-                    s.body.session_id.clone(),
-                    s.pod.clone(),
-                    was_retiring,
-                ))
+                Some(Expired {
+                    key: key.clone(),
+                    session_id: s.body.session_id.clone(),
+                    pod: s.pod.clone(),
+                    attempt: if was_retiring {
+                        ReapAttempt::Retry
+                    } else {
+                        ReapAttempt::First
+                    },
+                })
             })
             .collect();
-        for (key, id, pod, was_retiring) in expired {
-            async {
-                let result = async {
-                    let Some(pod) = pod else { return Ok(true) };
-                    if was_retiring {
-                        let Some(current) = self.pods.get_opt(&pod).await? else {
-                            return Ok(true);
-                        };
-                        if current.metadata.deletion_timestamp.is_some() {
-                            return Ok(false);
-                        }
+        for Expired {
+            key,
+            session_id,
+            pod,
+            attempt,
+        } in expired
+        {
+            let result = async {
+                let Some(pod) = pod else { return Ok(true) };
+                // A failed status read must not prevent cleanup. Retry retains its
+                // existing error/recheck semantics for an already-issued delete.
+                let current = match self.pods.get_opt(&pod).await {
+                    Ok(current) => current,
+                    Err(_) if matches!(attempt, ReapAttempt::First) => None,
+                    Err(error) => return Err(error),
+                };
+                if matches!(attempt, ReapAttempt::First)
+                    && let Some(stored) = self
+                        .sessions
+                        .lock()
+                        .expect("session registry poisoned")
+                        .get_mut(&key)
+                        .filter(|s| !s.pod_read)
+                {
+                    if let Some(current) = &current {
+                        stored.pod_end = PodEnd::from_pod(current);
                     }
-                    delete_pod(&self.pods, &pod).await
+                    stored.pod_read = true;
                 }
-                .await;
-                match result {
-                    Ok(true) => {
-                        let live = {
-                            let mut sessions =
-                                self.sessions.lock().expect("session registry poisoned");
-                            sessions.remove(&key);
-                            sessions
-                                .values()
-                                .any(|s| !s.retiring && s.body.session_id == id)
-                        };
-                        if !live {
-                            self.jobs
-                                .lock()
-                                .expect("job registry poisoned")
-                                .retain(|_, job| job.session != id);
-                        }
+                if let Some(current) = current {
+                    if matches!(attempt, ReapAttempt::Retry)
+                        && current.metadata.deletion_timestamp.is_some()
+                    {
+                        return Ok(false);
                     }
-                    Ok(false) => {}
-                    Err(error) => tracing::warn!(%error, "pod cleanup failed; retrying next tick"),
+                } else if matches!(attempt, ReapAttempt::Retry) {
+                    return Ok(true);
+                }
+                delete_pod(&self.pods, &pod).await
+            }
+            .await;
+            match result {
+                Ok(true) => {
+                    let (ended, live) = {
+                        let mut sessions = self.sessions.lock().expect("session registry poisoned");
+                        let ended = remove_retired(&mut sessions, &key, now);
+                        let live = sessions
+                            .values()
+                            .any(|s| !s.is_retiring() && s.body.session_id == session_id);
+                        (ended, live)
+                    };
+                    if let Some(ended) = ended {
+                        ended.emit();
+                    }
+                    if !live {
+                        self.jobs
+                            .lock()
+                            .expect("job registry poisoned")
+                            .retain(|_, job| job.session != session_id);
+                    }
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(name: "vm_runner.reap.failed", target: crate::config::Category::VmLifecycle.target(), {
+                        telemetry.detail = crate::telemetry::detail!(crate::config::Category::VmLifecycle),
+                        vm_runner.session_id = %session_id,
+                        %error,
+                    }, "pod cleanup failed; retrying next tick")
                 }
             }
-            .instrument(tracing::info_span!(
-                "vm_runner.reap",
-                vm_runner.session_id = id
-            ))
-            .await;
         }
     }
 }

@@ -36,6 +36,9 @@ async fn artifacts_require_auth_and_ownership_and_proxy_encoded_paths_ranges_and
     let client = TestClient::new(crate::endpoint(
         Arc::new(state),
         Arc::new(tokio::sync::Semaphore::new(1)),
+        Arc::new(std::sync::Mutex::new(
+            crate::request_rollups::RequestRollups::new(crate::request_rollups::Origin::Controller),
+        )),
     ));
     let base = format!("/v1/sessions/{id}/artifacts");
     client

@@ -1,7 +1,9 @@
 use crate::{ROLLUP_INTERVAL, config::Category};
 use serde::Deserialize;
-use std::{io, process::Stdio};
+use std::{io, process::Stdio, time::Duration};
 use tokio::{io::AsyncReadExt, process::Command, time::Instant};
+
+const READ_BOUND: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Default)]
 struct Counters {
@@ -35,13 +37,20 @@ enum ReadError {
     Json(#[from] serde_json::Error),
     #[error("missing nft counter {name}")]
     Missing { name: &'static str },
+    #[error("nft counter read timed out after {bound:?}")]
+    TimedOut { bound: Duration },
 }
 
 struct NftOutput(Vec<u8>);
 impl NftOutput {
     async fn read() -> Result<Self, ReadError> {
-        let mut child = Command::new("nft")
-            .args(["-j", "list", "counters", "table", "inet", "vm_runner"])
+        let mut command = Command::new("nft");
+        command.args(["-j", "list", "counters", "table", "inet", "vm_runner"]);
+        Self::run(command, READ_BOUND).await
+    }
+
+    async fn run(mut command: Command, bound: Duration) -> Result<Self, ReadError> {
+        let mut child = command
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .kill_on_drop(true)
@@ -50,23 +59,32 @@ impl NftOutput {
         let stdout = child.stdout.take().ok_or(ReadError::Io {
             kind: io::ErrorKind::BrokenPipe,
         })?;
-        let mut bytes = Vec::with_capacity(4096);
-        stdout
-            .take(65_537)
-            .read_to_end(&mut bytes)
-            .await
-            .map_err(|error| ReadError::Io { kind: error.kind() })?;
-        if bytes.len() > 65_536 {
-            return Err(ReadError::TooLarge);
+        let read = async {
+            let mut bytes = Vec::with_capacity(4096);
+            stdout
+                .take(65_537)
+                .read_to_end(&mut bytes)
+                .await
+                .map_err(|error| ReadError::Io { kind: error.kind() })?;
+            if bytes.len() > 65_536 {
+                return Err(ReadError::TooLarge);
+            }
+            let status = child
+                .wait()
+                .await
+                .map_err(|error| ReadError::Io { kind: error.kind() })?;
+            if !status.success() {
+                return Err(ReadError::Status { status });
+            }
+            Ok(Self(bytes))
+        };
+        match tokio::time::timeout(bound, read).await {
+            Ok(result) => result,
+            Err(_elapsed) => {
+                let _reaped = child.kill().await;
+                Err(ReadError::TimedOut { bound })
+            }
         }
-        let status = child
-            .wait()
-            .await
-            .map_err(|error| ReadError::Io { kind: error.kind() })?;
-        if !status.success() {
-            return Err(ReadError::Status { status });
-        }
-        Ok(Self(bytes))
     }
 
     fn counters(&self) -> Result<Counters, ReadError> {
@@ -112,7 +130,11 @@ impl Firewall {
     }
 
     pub(super) async fn sample(&mut self, interval: Interval) {
-        match NftOutput::read().await.and_then(|output| output.counters()) {
+        self.observe(NftOutput::read().await, interval);
+    }
+
+    fn observe(&mut self, read: Result<NftOutput, ReadError>, interval: Interval) {
+        match read.and_then(|output| output.counters()) {
             Ok(counters) => self.record(counters, interval),
             Err(error) => {
                 self.missed = true;

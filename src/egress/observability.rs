@@ -141,13 +141,18 @@ impl BodyHead {
 pub(super) struct RequestMeasure {
     bytes: u64,
     head: BodyHead,
+    failed: bool,
 }
 impl RequestMeasure {
     pub(super) fn new() -> Self {
         Self {
             bytes: 0,
             head: BodyHead::new(),
+            failed: false,
         }
+    }
+    pub(super) const fn fail(&mut self) {
+        self.failed = true;
     }
     pub(super) fn append(&mut self, bytes: &[u8]) {
         self.bytes = self.bytes.saturating_add(bytes.len() as u64);
@@ -247,6 +252,13 @@ impl Exchange {
             || Arc::new(Mutex::new(RequestMeasure::new())),
             |data| Arc::clone(&data.request),
         )
+    }
+    pub(super) fn request_body_failed(&self) -> bool {
+        self.data.as_ref().is_some_and(|data| {
+            data.request
+                .lock()
+                .is_ok_and(|measured| measured.failed)
+        })
     }
     pub(super) fn headers(
         &mut self,

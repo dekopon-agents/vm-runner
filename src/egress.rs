@@ -315,7 +315,11 @@ impl Body for MeasuredRequestBody {
     ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
         Pin::new(&mut self.incoming).poll_frame(cx).map(|frame| {
             frame.map(|result| {
-                let frame = result?;
+                let frame = result.inspect_err(|_| {
+                    if let Ok(mut measured) = self.measured.lock() {
+                        measured.fail();
+                    }
+                })?;
                 if let Some(data) = frame.data_ref()
                     && let Ok(mut measured) = self.measured.lock()
                 {
@@ -624,7 +628,11 @@ impl Engine {
                     }
                     Err(error) => (
                         reply(StatusCode::BAD_GATEWAY, String::new()),
-                        Outcome::UpstreamFailed,
+                        if exchange.request_body_failed() {
+                            Outcome::BodyError(Phase::RequestBody)
+                        } else {
+                            Outcome::UpstreamFailed
+                        },
                         Some(error.to_string()),
                     ),
                 }

@@ -361,6 +361,107 @@ async fn ping_closes_after_one_response_and_malformed_json_is_refused() {
     );
 }
 
+// Run by CI in a privileged, private-cgroupns container. Never silently skip this witness:
+// the job explicitly invokes the ignored test, and missing cgroup support fails it.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "requires writable cgroup v2; CI runs this in an isolated privileged container"]
+async fn detached_descendants_survive_and_exec_cgroups_are_reaped() {
+    struct Survivor(u32);
+    impl Drop for Survivor {
+        fn drop(&mut self) {
+            drop(kill(Pid::from_raw(self.0 as i32), Signal::SIGKILL));
+        }
+    }
+    let root = Path::new("/sys/fs/cgroup");
+    assert!(
+        root.join("cgroup.controllers").exists(),
+        "cgroup v2 required"
+    );
+    for controller in ["cpu", "memory"] {
+        assert!(
+            std::fs::read_to_string(root.join("cgroup.subtree_control"))
+                .unwrap()
+                .split_whitespace()
+                .any(|name| name == controller),
+            "{controller} controller must be enabled"
+        );
+    }
+    let (_dir, guest) = guest();
+    let mut survivors = Vec::new();
+    for _ in 0..4 {
+        let start = Instant::now();
+        let response = timeout(
+            Duration::from_secs(5),
+            call(
+                &guest,
+                exec(
+                    "setsid sh -c 'exec sleep 30' </dev/null >/dev/null 2>&1 & daemon=$!; \
+             until [ \"$(cut -d ' ' -f6 /proc/$daemon/stat)\" = \"$daemon\" ]; do :; done; \
+             printf '%s %s' \"$$\" \"$daemon\"",
+                ),
+            ),
+        )
+        .await
+        .expect("exec must not wait for the detached descendant");
+        assert_eq!(response["exitCode"], 0, "{response}");
+        let pids: Vec<u32> = response["stdout"]
+            .as_str()
+            .unwrap()
+            .split_whitespace()
+            .map(|pid| pid.parse().unwrap())
+            .collect();
+        assert_eq!(pids.len(), 2, "{response}");
+        let (shell, daemon) = (pids[0], pids[1]);
+        survivors.push(Survivor(daemon));
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "exec waited on cleanup"
+        );
+        assert!(
+            !root.join(format!("exec-{shell}")).exists(),
+            "per-exec cgroup leaked"
+        );
+        let stat = fs::read_to_string(format!("/proc/{daemon}/stat"))
+            .await
+            .unwrap();
+        assert!(
+            !stat
+                .rsplit_once(')')
+                .unwrap()
+                .1
+                .trim_start()
+                .starts_with('Z'),
+            "daemon died"
+        );
+        assert!(
+            std::fs::read_to_string(root.join("cgroup.procs"))
+                .unwrap()
+                .split_whitespace()
+                .any(|pid| pid == daemon.to_string()),
+            "daemon not moved to parent"
+        );
+        assert!(
+            response["cpuUs"].is_u64(),
+            "CPU measurement absent: {response}"
+        );
+        assert!(
+            response["memoryPeakBytes"].is_u64(),
+            "peak measurement absent: {response}"
+        );
+        assert_eq!(
+            std::fs::read_dir(root)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy().starts_with("exec-"))
+                .count(),
+            0,
+            "repeated exec leaked a cgroup"
+        );
+    }
+    drop(survivors); // Kill only test-owned daemons; production preserves them.
+}
+
 // The guest's PID 1 is tini with the agent as its only child; `tini -s` stands in for PID 1 here.
 #[cfg(target_os = "linux")]
 #[test]

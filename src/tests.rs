@@ -336,7 +336,7 @@ fn telemetry_defaults_and_mixed_filter_are_explicit() {
     .unwrap();
     assert_eq!(
         mixed.detail.filter(),
-        "info,vm.lifecycle=info,vm.exec=trace,vm.resources=info,egress.exchange=info,egress.dns=debug,egress.connect=info,egress.drop=info,telemetry=info,hyper=off,tonic=off,h2=off,reqwest=off,opentelemetry=off"
+        "info,vm.lifecycle=info,vm.exec=trace,egress.exchange=info,egress.dns=debug,egress.connect=info,egress.drop=info,telemetry=info,hyper=off,tonic=off,h2=off,reqwest=off,opentelemetry=off"
     );
 }
 #[test]

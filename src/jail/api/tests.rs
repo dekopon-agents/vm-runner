@@ -4,6 +4,89 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 const CONTROLLER: &str = "system:serviceaccount:test:controller";
 
+#[test]
+fn guest_exec_fields_are_recorded_but_not_returned_to_controller() {
+    use opentelemetry::trace::TracerProvider as _;
+    use tracing_subscriber::prelude::*;
+    for (frame, expected) in [
+        (
+            json!({"outcome":"executed","exitCode":0,"stdout":"ok","stderr":"","truncated":false}),
+            None,
+        ),
+        (
+            json!({"outcome":"executed","exitCode":0,"stdout":"ok","stderr":"","truncated":false,
+            "durationMs":17,"timedOut":true,"cpuUs":43,"memoryPeakBytes":8192}),
+            Some((43, 8192)),
+        ),
+    ] {
+        let exporter = opentelemetry_sdk::trace::InMemorySpanExporter::default();
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let dispatch = tracing::Dispatch::new(
+            tracing_subscriber::registry()
+                .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("guest-test"))),
+        );
+        tracing::dispatcher::with_default(&dispatch, || {
+            let span = tracing::info_span!(
+                "vm_runner.exec",
+                vm_runner.exec.outcome = tracing::field::Empty,
+                vm_runner.exec.truncated = tracing::field::Empty,
+                vm_runner.guest.exit_code = tracing::field::Empty,
+                vm_runner.guest.duration_ms = tracing::field::Empty,
+                vm_runner.guest.timed_out = tracing::field::Empty,
+                vm_runner.guest.cpu_us = tracing::field::Empty,
+                vm_runner.guest.memory.peak.bytes = tracing::field::Empty
+            );
+            let _entered = span.enter();
+            let GuestTerminal::Executed(value) = serde_json::from_value(frame).unwrap() else {
+                panic!("executed")
+            };
+            let Terminal::Executed(response) = value.into_response() else {
+                panic!("executed")
+            };
+            assert_eq!(
+                (
+                    response.exit_code,
+                    response.stdout.as_str(),
+                    response.stderr.as_str(),
+                    response.truncated
+                ),
+                (0, "ok", "", false)
+            );
+        });
+        provider.force_flush().unwrap();
+        let spans = exporter.get_finished_spans().unwrap();
+        let attrs = &spans[0].attributes;
+        let field = |key: &str| {
+            attrs
+                .iter()
+                .find(|a| a.key.as_str() == key)
+                .map(|a| a.value.to_string())
+        };
+        assert_eq!(
+            field("vm_runner.exec.outcome").as_deref(),
+            Some("completed")
+        );
+        assert_eq!(
+            field("vm_runner.guest.cpu_us"),
+            expected.map(|(cpu, _)| cpu.to_string())
+        );
+        assert_eq!(
+            field("vm_runner.guest.memory.peak.bytes"),
+            expected.map(|(_, peak)| peak.to_string())
+        );
+        assert_eq!(
+            field("vm_runner.guest.duration_ms").is_some(),
+            expected.is_some()
+        );
+        assert_eq!(
+            field("vm_runner.guest.timed_out").is_some(),
+            expected.is_some()
+        );
+    }
+}
+
 #[tokio::test]
 async fn jail_refuses_a_c4_valid_non_controller_token_as_unknown_subject() {
     let fixture = crate::tests::Fixture::new().await;

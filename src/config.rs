@@ -151,7 +151,6 @@ impl Detail {
 pub(crate) enum Category {
     VmLifecycle,
     VmExec,
-    VmResources,
     EgressExchange,
     EgressDns,
     EgressConnect,
@@ -159,10 +158,9 @@ pub(crate) enum Category {
     Telemetry,
 }
 impl Category {
-    pub(crate) const ALL: [Self; 8] = [
+    pub(crate) const ALL: [Self; 7] = [
         Self::VmLifecycle,
         Self::VmExec,
-        Self::VmResources,
         Self::EgressExchange,
         Self::EgressDns,
         Self::EgressConnect,
@@ -178,7 +176,6 @@ impl Category {
         match self {
             Self::VmLifecycle => "vm.lifecycle",
             Self::VmExec => "vm.exec",
-            Self::VmResources => "vm.resources",
             Self::EgressExchange => "egress.exchange",
             Self::EgressDns => "egress.dns",
             Self::EgressConnect => "egress.connect",

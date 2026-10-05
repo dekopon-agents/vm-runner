@@ -109,6 +109,10 @@ struct Executed {
     duration_ms: u64,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     timed_out: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cpu_us: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    memory_peak_bytes: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -381,6 +385,44 @@ impl Output {
     }
 }
 
+// Each spawned pid names one cgroup. Failure to measure is never an exec failure.
+struct ExecCgroup(PathBuf);
+impl ExecCgroup {
+    fn attach(root: &Path, pid: u32) -> Option<Self> {
+        let path = root.join(format!("exec-{pid}"));
+        std::fs::create_dir(&path).ok()?;
+        let group = Self(path);
+        std::fs::write(group.0.join("cgroup.procs"), pid.to_string()).ok()?;
+        Some(group)
+    }
+
+    fn measurements(&self) -> Option<(u64, u64)> {
+        let stat = std::fs::read_to_string(self.0.join("cpu.stat")).ok()?;
+        let cpu = stat
+            .lines()
+            .find_map(|line| line.strip_prefix("usage_usec "))?
+            .parse()
+            .ok()?;
+        let peak = std::fs::read_to_string(self.0.join("memory.peak"))
+            .ok()?
+            .trim()
+            .parse()
+            .ok()?;
+        Some((cpu, peak))
+    }
+
+    fn finish(self) -> Option<(u64, u64)> {
+        let values = self.measurements()?;
+        std::fs::remove_dir(&self.0).ok()?;
+        Some(values)
+    }
+}
+impl Drop for ExecCgroup {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir(&self.0);
+    }
+}
+
 async fn execute(
     mut command: Command,
     input: Option<String>,
@@ -392,6 +434,7 @@ async fn execute(
         .id()
         .ok_or_else(|| io::Error::other("child has no pid"))?;
     let mut group = ProcessGroup(Some(Pid::from_raw(-(pid as i32))));
+    let cgroup = ExecCgroup::attach(Path::new("/sys/fs/cgroup"), pid);
     let mut stdin = child
         .stdin
         .take()
@@ -440,6 +483,7 @@ async fn execute(
         }
     };
     group.kill()?;
+    let measurements = cgroup.and_then(ExecCgroup::finish);
     let (stdout, out_truncated) = out.text();
     let (stderr, err_truncated) = err.text();
     Ok(Executed {
@@ -450,6 +494,8 @@ async fn execute(
         truncated: out_truncated || err_truncated,
         duration_ms: start.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
         timed_out,
+        cpu_us: measurements.map(|(cpu, _)| cpu),
+        memory_peak_bytes: measurements.map(|(_, peak)| peak),
     })
 }
 

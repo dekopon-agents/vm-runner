@@ -75,6 +75,27 @@ async fn exec_delivers_stdin_environment_and_default_home() {
     );
 }
 
+#[test]
+fn per_command_cgroup_measurements_are_optional_on_failure() {
+    let root = tempfile::tempdir().unwrap();
+    assert!(ExecCgroup::attach(&root.path().join("missing"), 123).is_none());
+    let group = ExecCgroup::attach(root.path(), 123).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(group.0.join("cgroup.procs")).unwrap(),
+        "123"
+    );
+    assert_eq!(group.measurements(), None);
+    std::fs::write(group.0.join("cpu.stat"), "usage_usec 42\nuser_usec 40\n").unwrap();
+    std::fs::write(group.0.join("memory.peak"), "8192\n").unwrap();
+    assert_eq!(group.measurements(), Some((42, 8192)));
+    let path = group.0.clone();
+    std::fs::remove_file(path.join("cgroup.procs")).unwrap();
+    std::fs::remove_file(path.join("cpu.stat")).unwrap();
+    std::fs::remove_file(path.join("memory.peak")).unwrap();
+    drop(group);
+    assert!(!path.exists());
+}
+
 #[tokio::test]
 async fn exec_reports_nonzero_exit_and_spawn_refusals() {
     let (_dir, guest) = guest();

@@ -16,6 +16,19 @@ returns its subject and session quota. Optional `telemetry.otlp` selects `grpc` 
 with an endpoint and optional `caBundleFile` and `headersFile` (`key: value` per line).
 Without telemetry configuration, tracing goes only to stdout JSON logs.
 
+## Telemetry
+
+`telemetry.detail.default` and `telemetry.detail.categories` choose `drip` (INFO),
+`standard` (DEBUG), or `full` (TRACE) for each category: `vm.lifecycle`, `vm.exec`,
+`egress.exchange`, `egress.dns`, `egress.connect`, `egress.drop`, and `telemetry`.
+`telemetry.omit.headers` and `telemetry.omit.queryKeys` suppress named values from
+recorded exchanges. At `drip`, session start/end, exchange/request/DNS/connect rollups,
+refusals, failures, firewall drops, and telemetry health remain; per-operation spans
+without a trace parent require `standard`. Guest exec exit code, duration, timeout,
+CPU microseconds and peak memory bytes are **guest-reported** on jail exec spans, not
+controller API fields. CPU and memory are absent for older guests or when per-command
+cgroup v2 measurement is unavailable; execution still succeeds.
+
 ## Controller TLS (C3 config / C4 API)
 
 Optional `tls: {certFile: /path/tls.crt, keyFile: /path/tls.key}` makes `serve` HTTPS-only

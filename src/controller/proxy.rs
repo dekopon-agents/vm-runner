@@ -126,6 +126,19 @@ enum ExecResult {
     Executed(Executed),
     NotExecuted(ExecRefused),
 }
+fn record_exec_result(result: &ExecResult) {
+    let span = tracing::Span::current();
+    match result {
+        ExecResult::Executed(value) => {
+            span.record("vm_runner.exec.outcome", "completed");
+            span.record("vm_runner.exec.truncated", value.truncated);
+        }
+        ExecResult::NotExecuted(value) => {
+            span.record("vm_runner.exec.outcome", "not-executed");
+            span.record("vm_runner.exec.truncated", value.truncated);
+        }
+    }
+}
 #[derive(Object, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[oai(rename_all = "camelCase")]
@@ -282,6 +295,7 @@ impl Controller {
             jobs.len() >= 1024 || jobs.values().filter(|job| job.session == id).count() >= 64
         };
         if full {
+            tracing::Span::current().record("vm_runner.exec.outcome", "not-executed");
             return Ok(ExecResponse::Complete(Json(ExecResult::NotExecuted(
                 ExecRefused {
                     reason: "job_capacity".into(),
@@ -289,10 +303,22 @@ impl Controller {
                 },
             ))));
         }
-        if let Err(error) = self.boot(&key, &session).await {
+        let cold = session.pod.is_none();
+        let boot_start = std::time::Instant::now();
+        let boot_result = self.boot(&key, &session).await;
+        tracing::Span::current().record(
+            "vm_runner.exec.boot_wait_ms",
+            if cold {
+                boot_start.elapsed().as_millis().min(i64::MAX as u128) as i64
+            } else {
+                0
+            },
+        );
+        if let Err(error) = boot_result {
             if !matches!(error, Error::Boot(_)) {
                 return Err(error);
             }
+            tracing::Span::current().record("vm_runner.exec.outcome", "not-executed");
             tracing::warn!(name: "vm_runner.exec.not_started", target: crate::config::Category::VmExec.target(), {
                 telemetry.detail = crate::telemetry::detail!(crate::config::Category::VmExec),
                 cause = %error,
@@ -327,6 +353,7 @@ impl Controller {
                     jail_id: pending.job_id,
                 },
             );
+            tracing::Span::current().record("vm_runner.exec.outcome", "pending");
             Ok(ExecResponse::Pending(Json(Pending {
                 outcome: Unknown::Unknown,
                 job_id,
@@ -334,6 +361,7 @@ impl Controller {
         } else {
             let mut result = json(checked(response, 200)?).await?;
             cap(&mut result);
+            record_exec_result(&result);
             Ok(ExecResponse::Complete(Json(result)))
         }
     }
@@ -397,14 +425,22 @@ impl Api {
         if body.argv.first().is_none_or(String::is_empty) {
             return Ok(ExecResponse::Invalid(Json(refused("invalid exec request"))));
         }
-        Ok(controller(&state)?
+        let span = tracing::info_span!(
+            target: crate::config::Category::VmExec.target(), "vm_runner.exec",
+            telemetry.detail = crate::telemetry::detail!(crate::config::Category::VmExec),
+            vm_runner.session_id = crate::egress::cut(&id.0),
+            vm_runner.exec.boot_wait_ms = tracing::field::Empty,
+            vm_runner.exec.outcome = tracing::field::Empty,
+            vm_runner.exec.truncated = tracing::field::Empty
+        );
+        let result = controller(&state)?
             .exec(&subject, &id, &body)
-            .instrument(tracing::info_span!(
-                target: crate::config::Category::VmExec.target(), "vm_runner.exec",
-                telemetry.detail = crate::telemetry::detail!(crate::config::Category::VmExec),
-                vm_runner.session_id = crate::egress::cut(&id.0)
-            ))
-            .await?)
+            .instrument(span.clone())
+            .await;
+        if result.is_err() {
+            span.record("vm_runner.exec.outcome", "failed");
+        }
+        Ok(result?)
     }
     #[oai(path = "/v1/jobs/:jobId", method = "get")]
     async fn job(

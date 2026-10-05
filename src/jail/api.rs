@@ -39,6 +39,58 @@ struct NotExecuted {
     #[serde(default)]
     truncated: bool,
 }
+// Guest-only measurements never enter the controller-facing OpenAPI response.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GuestExecuted {
+    exit_code: i32,
+    stdout: String,
+    stderr: String,
+    truncated: bool,
+    duration_ms: Option<u64>,
+    timed_out: Option<bool>,
+    cpu_us: Option<u64>,
+    memory_peak_bytes: Option<u64>,
+}
+impl GuestExecuted {
+    fn into_response(self) -> Terminal {
+        let current = tracing::Span::current();
+        current.record("vm_runner.exec.outcome", "completed");
+        current.record("vm_runner.exec.truncated", self.truncated);
+        current.record("vm_runner.guest.exit_code", i64::from(self.exit_code));
+        if let Some(ms) = self.duration_ms {
+            current.record(
+                "vm_runner.guest.duration_ms",
+                ms.min(i64::MAX as u64) as i64,
+            );
+        }
+        if let Some(timed_out) = self.timed_out {
+            current.record("vm_runner.guest.timed_out", timed_out);
+        }
+        if let Some(cpu) = self.cpu_us {
+            current.record("vm_runner.guest.cpu_us", cpu.min(i64::MAX as u64) as i64);
+        }
+        if let Some(peak) = self.memory_peak_bytes {
+            current.record(
+                "vm_runner.guest.memory.peak.bytes",
+                peak.min(i64::MAX as u64) as i64,
+            );
+        }
+        Terminal::Executed(Executed {
+            exit_code: self.exit_code,
+            stdout: self.stdout,
+            stderr: self.stderr,
+            truncated: self.truncated,
+        })
+        .capped()
+    }
+}
+#[derive(Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+enum GuestTerminal {
+    Executed(GuestExecuted),
+    NotExecuted(NotExecuted),
+}
 #[derive(Clone, Deserialize, Union)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 #[oai(discriminator_name = "outcome", rename_all = "snake_case")]
@@ -155,8 +207,17 @@ impl State {
         let guest = Arc::clone(&self.guest);
         let runtime = tokio::runtime::Handle::current();
         let dispatch = tracing::dispatcher::get_default(Clone::clone);
+        let queued = std::time::Instant::now();
         let span = tracing::info_span!(target: crate::config::Category::VmExec.target(), "vm_runner.exec",
-            telemetry.detail = crate::telemetry::detail!(crate::config::Category::VmExec));
+            telemetry.detail = crate::telemetry::detail!(crate::config::Category::VmExec),
+            vm_runner.exec.queue_wait_ms = tracing::field::Empty,
+            vm_runner.exec.outcome = tracing::field::Empty,
+            vm_runner.exec.truncated = tracing::field::Empty,
+            vm_runner.guest.exit_code = tracing::field::Empty,
+            vm_runner.guest.duration_ms = tracing::field::Empty,
+            vm_runner.guest.timed_out = tracing::field::Empty,
+            vm_runner.guest.cpu_us = tracing::field::Empty,
+            vm_runner.guest.memory.peak.bytes = tracing::field::Empty);
         // The bounded table owns these workers until shutdown, even after HTTP cancellation.
         jobs.workers.spawn_blocking(move || {
             tracing::dispatcher::with_default(&dispatch, || {
@@ -169,12 +230,20 @@ impl State {
                             env: None,
                             cwd: None,
                         };
+                        tracing::Span::current().record("vm_runner.exec.queue_wait_ms", queued.elapsed().as_millis().min(i64::MAX as u128) as i64);
                         let result = match guest
-                            .call::<Terminal>(&request, Duration::from_secs(610))
+                            .call::<GuestTerminal>(&request, Duration::from_secs(610))
                             .await
                         {
-                            Ok(result) => Progress::Done(Arc::new(result.capped())),
+                            Ok(GuestTerminal::Executed(value)) => {
+                                Progress::Done(Arc::new(value.into_response()))
+                            }
+                            Ok(GuestTerminal::NotExecuted(value)) => {
+                                tracing::Span::current().record("vm_runner.exec.outcome", "failed");
+                                Progress::Done(Arc::new(Terminal::NotExecuted(value).capped()))
+                            }
                             Err(error) => {
+                                tracing::Span::current().record("vm_runner.exec.outcome", "unknown");
                                 tracing::error!(name: "vm_runner.exec.outcome_unknown", target: crate::config::Category::VmExec.target(), {
                                     telemetry.detail = crate::telemetry::detail!(crate::config::Category::VmExec), %error,
                                 }, "guest exec outcome unknown");

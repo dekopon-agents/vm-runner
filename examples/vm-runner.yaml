@@ -30,6 +30,8 @@ profiles:
       idleSeconds: 90
       maxConnectionSeconds: 1800
       maxConnections: 128
+# Categories: vm.lifecycle, vm.exec, egress.exchange, egress.dns,
+# egress.connect, egress.drop, telemetry. drip=INFO, standard=DEBUG, full=TRACE.
 telemetry:
   detail:
     default: standard

@@ -96,6 +96,24 @@ fn per_command_cgroup_measurements_are_optional_on_failure() {
     assert!(!path.exists());
 }
 
+#[tokio::test(start_paused = true)]
+async fn cgroup_release_timeout_keeps_measurements_and_stops_at_deadline() {
+    let root = tempfile::tempdir().unwrap();
+    let group = ExecCgroup::attach(root.path(), 123).unwrap();
+    let path = group.0.clone();
+    std::fs::write(path.join("cpu.stat"), "usage_usec 42\n").unwrap();
+    std::fs::write(path.join("memory.peak"), "8192\n").unwrap();
+    std::fs::write(path.join("cgroup.events"), "populated 1\n").unwrap();
+    let start = tokio::time::Instant::now();
+    assert_eq!(group.finish().await, Some((42, 8192)));
+    assert_eq!(start.elapsed(), Duration::from_secs(2));
+    // A real cgroup moves remaining tasks on release; the tempdir's synthetic
+    // files cannot be rmdir'd by Drop, so remove only this test's fixtures.
+    for file in ["cpu.stat", "memory.peak", "cgroup.events", "cgroup.procs"] {
+        std::fs::remove_file(path.join(file)).unwrap();
+    }
+    std::fs::remove_dir(path).unwrap();
+}
 #[tokio::test]
 async fn exec_reports_nonzero_exit_and_spawn_refusals() {
     let (_dir, guest) = guest();

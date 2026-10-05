@@ -413,7 +413,7 @@ impl ExecCgroup {
 
     async fn finish(self) -> Option<(u64, u64)> {
         let values = self.measurements();
-        self.release().await?;
+        let _ = self.release().await;
         values
     }
 

@@ -1,4 +1,5 @@
-use super::{Engine, Error, Stream, allowed, cut};
+use super::observability::cut_text;
+use super::{Engine, Error, Stream, allowed};
 use hickory_proto::{
     op::{Message, MessageType, OpCode, ResponseCode},
     rr::{DNSClass, RData, Record, RecordType, rdata::A},
@@ -121,10 +122,10 @@ pub(super) fn refusal(engine: &Engine, decision: Decision, name: &str) {
         rollups.dns(name, true);
     }
     let _span = tracing::debug_span!(target: crate::config::Category::EgressDns.target(), parent: None, "egress.dns",
-        telemetry.detail = crate::telemetry::detail!(crate::config::Category::EgressDns), dns.question.name = %cut(name), dns.question.type = "", egress.decision = decision.as_str());
+        telemetry.detail = crate::telemetry::detail!(crate::config::Category::EgressDns), dns.question.name = %cut_text(name), dns.question.type = "", egress.decision = decision.as_str());
     tracing::info!(name: "egress.refused", target: crate::config::Category::EgressDrop.target(), {
         telemetry.detail = crate::telemetry::detail!(crate::config::Category::EgressDrop),
-        dns.question.name = %cut(name), egress.decision = decision.as_str(), egress.refused.count = 1_i64,
+        dns.question.name = %cut_text(name), egress.decision = decision.as_str(), egress.refused.count = 1_i64,
     }, "egress.refused");
 }
 fn answer(engine: &Engine, packet: &[u8], gateway: Ipv4Addr) -> Result<Option<Vec<u8>>, Error> {
@@ -166,11 +167,11 @@ fn answer(engine: &Engine, packet: &[u8], gateway: Ipv4Addr) -> Result<Option<Ve
         if !matches!(decision, Decision::Allowed) {
             tracing::info!(name: "egress.refused", target: crate::config::Category::EgressDrop.target(), {
                 telemetry.detail = crate::telemetry::detail!(crate::config::Category::EgressDrop),
-                dns.question.name = %cut(&name), egress.decision = decision.as_str(), egress.refused.count = 1_i64,
+                dns.question.name = %cut_text(&name), egress.decision = decision.as_str(), egress.refused.count = 1_i64,
             }, "egress.refused");
         }
         let span = tracing::debug_span!(target: crate::config::Category::EgressDns.target(), parent: None, "egress.dns",
-            telemetry.detail = crate::telemetry::detail!(crate::config::Category::EgressDns), dns.question.name = %cut(&name), dns.question.type = %kind,
+            telemetry.detail = crate::telemetry::detail!(crate::config::Category::EgressDns), dns.question.name = %cut_text(&name), dns.question.type = %kind,
             egress.decision = decision.as_str());
         reply.add_query(question.clone());
         if !matches!(decision, Decision::Allowed) {

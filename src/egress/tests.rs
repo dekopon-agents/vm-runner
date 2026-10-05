@@ -338,6 +338,45 @@ async fn disallowed_plain_host_gets_exact_refusal_and_span_without_connecting() 
     assert!(!spans.iter().any(|s| s.name == "egress.connect"));
 }
 #[tokio::test]
+async fn denied_head_and_get_close_as_one_refusal_each() {
+    for (method, body) in [("HEAD", ""), ("GET", "egress refused: denied.invalid")] {
+        let proxy = Proxy::new(RootCertStore::empty()).await;
+        let stream = TcpStream::connect(proxy.addr).await.unwrap();
+        let request = format!(
+            "{method} http://denied.invalid/ HTTP/1.1\r\nHost: denied.invalid\r\nConnection: close\r\n\r\n"
+        );
+        assert_eq!(exchange(stream, &request).await, (403, body.into()));
+        let (spans, logs) = proxy.finish_with_logs().await;
+        let refusals: Vec<_> = logs
+            .iter()
+            .filter(|l| l.record.event_name() == Some("egress.refused"))
+            .collect();
+        assert_eq!(refusals.len(), 1);
+        assert_eq!(log_int(refusals[0], "egress.refused.count"), Some(1));
+        assert!(format!("{refusals:?}").contains("refused:not_allowed"));
+        assert!(format!("{refusals:?}").contains("denied.invalid"));
+        assert!(
+            !logs
+                .iter()
+                .any(|l| l.record.event_name() == Some("egress.exchange.failed"))
+        );
+        let requests: Vec<_> = spans
+            .iter()
+            .filter(|s| s.name == "egress.request")
+            .collect();
+        assert_eq!(requests.len(), 1);
+        let s = requests[0];
+        assert!(attribute(s, "egress.decision", "refused:not_allowed"));
+        assert!(attribute(s, "egress.exchange.outcome", "refused"));
+        assert!(attribute(s, "server.address", "denied.invalid"));
+        assert!(span_attribute(s, "egress.exchange.phase").is_none());
+        assert_eq!(
+            span_attribute(s, "http.response.body.size"),
+            Some(&(body.len() as i64).into())
+        );
+    }
+}
+#[tokio::test]
 async fn telemetry_keeps_public_url_components_without_credentials() {
     use std::io::{Read, Seek};
     let proxy = Proxy::new(RootCertStore::empty()).await;
@@ -1039,6 +1078,63 @@ fn span_attribute_assertions_reject_duplicate_values_of_any_type() {
     provider.shutdown().unwrap();
 }
 #[tokio::test]
+async fn dropped_refusal_keeps_decision_and_emits_once() {
+    let spans = InMemorySpanExporter::default();
+    let provider = SdkTracerProvider::builder()
+        .with_simple_exporter(spans.clone())
+        .build();
+    let logs = InMemoryLogExporter::default();
+    let logger = SdkLoggerProvider::builder()
+        .with_simple_exporter(logs.clone())
+        .build();
+    let subscriber = tracing_subscriber::registry()
+        .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("dropped-refusal")))
+        .with(opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new(&logger));
+    tracing::subscriber::with_default(subscriber, || {
+        let mut exchange = Exchange::new(
+            "denied.invalid",
+            Some(80),
+            "GET",
+            "http://denied.invalid/",
+            &[],
+            Arc::new(Mutex::new(Rollups::new())),
+        );
+        exchange.refuse(Refusal::NotAllowed);
+        exchange.refuse(Refusal::NotAllowed); // decision-time emission is idempotent
+        drop(exchange);
+    });
+    let refusals: Vec<_> = logs
+        .get_emitted_logs()
+        .unwrap()
+        .into_iter()
+        .filter(|l| l.record.event_name() == Some("egress.refused"))
+        .collect();
+    assert_eq!(refusals.len(), 1);
+    assert_eq!(log_int(&refusals[0], "egress.refused.count"), Some(1));
+    assert!(
+        !logs
+            .get_emitted_logs()
+            .unwrap()
+            .iter()
+            .any(|l| l.record.event_name() == Some("egress.exchange.failed"))
+    );
+    let recorded = spans.get_finished_spans().unwrap();
+    assert_eq!(recorded.len(), 1);
+    assert!(attribute(
+        &recorded[0],
+        "egress.decision",
+        "refused:not_allowed"
+    ));
+    assert!(attribute(
+        &recorded[0],
+        "egress.exchange.outcome",
+        "refused"
+    ));
+    assert!(span_attribute(&recorded[0], "egress.exchange.phase").is_none());
+    provider.shutdown().unwrap();
+    logger.shutdown().unwrap();
+}
+#[tokio::test]
 async fn failed_and_empty_dns_answers_have_distinct_single_refusal_decisions() {
     let exporter = InMemorySpanExporter::default();
     let provider = SdkTracerProvider::builder()
@@ -1347,6 +1443,35 @@ async fn omitted_and_credential_pairs_keep_parallel_arrays_aligned_without_secre
             .filter(|log| log.record.event_name() == Some("egress.exchange.noise"))
             .all(|log| !format!("{log:?}").contains("drop"))
     );
+}
+#[tokio::test]
+async fn query_noise_only_inspects_first_sixty_four_pairs() {
+    let proxy = Proxy::new(RootCertStore::empty()).await;
+    let query = (0..70)
+        .map(|n| format!("q{n}=v"))
+        .collect::<Vec<_>>()
+        .join("&");
+    let stream = TcpStream::connect(proxy.addr).await.unwrap();
+    assert_eq!(exchange(stream, &format!("GET http://denied.invalid/?{query} HTTP/1.1\r\nHost: denied.invalid\r\nConnection: close\r\n\r\n")).await.0, 403);
+    let (_, logs) = proxy.finish_with_logs().await;
+    let noise: Vec<_> = logs
+        .iter()
+        .filter(|l| l.record.event_name() == Some("egress.exchange.noise"))
+        .filter(|l| {
+            l.record.attributes_iter().any(|(k, v)| {
+                k.as_str() == "egress.noise.kind"
+                    && v == &opentelemetry::logs::AnyValue::from("query-key")
+            })
+        })
+        .collect();
+    assert_eq!(
+        noise
+            .iter()
+            .filter_map(|l| log_int(l, "egress.noise.value.count"))
+            .sum::<i64>(),
+        64
+    );
+    assert!(!format!("{noise:?}").contains("q69"));
 }
 #[test]
 fn suffix_allowlist_respects_label_boundaries_and_attributes_are_byte_bounded() {

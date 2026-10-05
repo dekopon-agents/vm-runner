@@ -14,6 +14,7 @@ Before serving, configure the issuer URL, optional CA/token files and exact serv
 subjects in the example config. `/healthz` is public; `/v1/whoami` requires a bearer JWT and
 returns its subject and session quota. Optional `telemetry.otlp` selects `grpc` or `http`
 with an endpoint and optional `caBundleFile` and `headersFile` (`key: value` per line).
+For `protocol: http`, the endpoint must end in `/v1/traces`.
 Without telemetry configuration, tracing goes only to stdout JSON logs.
 
 ## Telemetry

@@ -515,6 +515,13 @@ fn record_request(
         Ok(response) => response.status(),
         Err(error) => error.status(),
     };
+    if status.as_u16() >= 400 {
+        tracing::info!(name: "vm_runner.request.failed", target: crate::config::Category::VmExec.target(), {
+            telemetry.detail = crate::telemetry::detail!(crate::config::Category::VmExec),
+            http.response.status_code = i64::from(status.as_u16()),
+            http.route = %route,
+        }, "vm_runner request failed");
+    }
     if let Ok(mut rollups) = rollups.lock() {
         rollups.record(route, path, status);
     }

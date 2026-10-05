@@ -198,7 +198,7 @@ impl Exchange {
             && let Some(query) = url.query()
             && let Ok(mut totals) = rollups.lock()
         {
-            for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+            for (key, value) in url::form_urlencoded::parse(query.as_bytes()).take(64) {
                 if !omitted(&key, omit_query) {
                     totals.noise(NoiseKind::QueryKey, &key, value.as_bytes());
                 }

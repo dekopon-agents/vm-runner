@@ -779,6 +779,60 @@ async fn jail_request_records_only_the_matched_route_template() {
     provider.shutdown().unwrap();
     logger.shutdown().unwrap();
 }
+#[cfg(unix)]
+#[tokio::test]
+async fn jail_parentless_failure_survives_info_filter_without_path_or_credentials() {
+    use tracing::instrument::WithSubscriber;
+    use tracing_subscriber::layer::SubscriberExt;
+    let exporter = opentelemetry_sdk::logs::InMemoryLogExporter::default();
+    let provider = opentelemetry_sdk::logs::SdkLoggerProvider::builder()
+        .with_simple_exporter(exporter.clone())
+        .build();
+    let dispatch = tracing_subscriber::registry()
+        .with(opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new(&provider))
+        .with(tracing_subscriber::EnvFilter::new("info,vm.exec=info"));
+    let route = poem::Route::new().at(
+        "/v1/sessions/:id/exec",
+        poem::get(poem::endpoint::make(|_| async {
+            Ok::<_, poem::Error>(
+                poem::Response::builder()
+                    .status(StatusCode::UNAUTHORIZED)
+                    .finish(),
+            )
+        })),
+    );
+    let (endpoint, requests) = traced(route, 1);
+    async {
+        TestClient::new(endpoint)
+            .get("/v1/sessions/private-sentinel/exec")
+            .header("authorization", "Bearer credential-sentinel")
+            .send()
+            .await
+            .assert_status(StatusCode::UNAUTHORIZED);
+        requests.drain().await.unwrap();
+    }
+    .with_subscriber(dispatch)
+    .await;
+    let logs = exporter.get_emitted_logs().unwrap();
+    let failures: Vec<_> = logs
+        .iter()
+        .filter(|log| log.record.event_name() == Some("vm_runner.request.failed"))
+        .collect();
+    assert_eq!(failures.len(), 1);
+    let fields: Vec<_> = failures[0].record.attributes_iter().collect();
+    assert!(
+        fields
+            .iter()
+            .any(|(k, v)| k.as_str() == "http.response.status_code"
+                && *v == opentelemetry::logs::AnyValue::Int(401))
+    );
+    assert!(fields.iter().any(|(k, v)| k.as_str() == "http.route"
+        && *v == opentelemetry::logs::AnyValue::from("/v1/sessions/{id}/exec")));
+    assert!(fields.iter().any(|(k, v)| k.as_str() == "telemetry.detail"
+        && *v == opentelemetry::logs::AnyValue::from("drip")));
+    assert!(!format!("{failures:?}").contains("sentinel"));
+    provider.shutdown().unwrap();
+}
 #[tokio::test]
 async fn controller_rollup_excludes_health_and_counts_unauthorized_requests() {
     use tracing::instrument::WithSubscriber;
@@ -790,12 +844,14 @@ async fn controller_rollup_excludes_health_and_counts_unauthorized_requests() {
         .with_simple_exporter(exporter.clone())
         .build();
     let dispatch = tracing_subscriber::registry()
-        .with(opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new(&provider));
+        .with(opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new(&provider))
+        .with(tracing_subscriber::EnvFilter::new("info,vm.exec=info"));
     async {
         let client = TestClient::new(endpoint);
         client.get("/healthz").send().await.assert_status_is_ok();
         client
             .get("/v1/whoami")
+            .header("authorization", "Bearer secret-sentinel")
             .send()
             .await
             .assert_status(StatusCode::UNAUTHORIZED);
@@ -809,6 +865,23 @@ async fn controller_rollup_excludes_health_and_counts_unauthorized_requests() {
         .filter(|log| log.record.event_name() == Some("vm_runner.request.rollup"))
         .collect();
     assert_eq!(rollups.len(), 1);
+    let failures: Vec<_> = logs
+        .iter()
+        .filter(|log| log.record.event_name() == Some("vm_runner.request.failed"))
+        .collect();
+    assert_eq!(failures.len(), 1);
+    let fields: Vec<_> = failures[0].record.attributes_iter().collect();
+    assert!(
+        fields
+            .iter()
+            .any(|(k, v)| k.as_str() == "http.response.status_code"
+                && *v == opentelemetry::logs::AnyValue::Int(401))
+    );
+    assert!(fields.iter().any(|(k, v)| k.as_str() == "http.route"
+        && *v == opentelemetry::logs::AnyValue::from("unmatched")));
+    assert!(fields.iter().any(|(k, v)| k.as_str() == "telemetry.detail"
+        && *v == opentelemetry::logs::AnyValue::from("drip")));
+    assert!(!format!("{failures:?}").contains("secret-sentinel"));
     assert!(
         rollups[0]
             .record

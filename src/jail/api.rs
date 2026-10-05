@@ -244,7 +244,7 @@ impl State {
                             Ok(GuestTerminal::NotExecuted(value)) => {
                                 let response = Terminal::NotExecuted(value).capped();
                                 let span = tracing::Span::current();
-                                span.record("vm_runner.exec.outcome", "failed");
+                                span.record("vm_runner.exec.outcome", "not-executed");
                                 if let Terminal::NotExecuted(result) = &response {
                                     span.record("vm_runner.exec.truncated", result.truncated);
                                 }

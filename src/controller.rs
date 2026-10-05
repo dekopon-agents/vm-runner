@@ -318,13 +318,16 @@ impl Controller {
                 session.retiring = Some(EndReason::Duplicate);
             }
             let name = session.pod.as_ref().expect("recovered pod has a name");
+            // The list is the pre-cleanup observation even for pods already deleting.
+            if session.is_retiring() {
+                session.pod_end = PodEnd::from_pod(&pod);
+                session.pod_read = true;
+            }
             if let Some(reason) = session
                 .retiring
                 .filter(|_| pod.metadata.deletion_timestamp.is_none())
             {
                 // The listed pod is already a read of its status; no extra GET is needed.
-                session.pod_end = PodEnd::from_pod(&pod);
-                session.pod_read = true;
                 match delete_pod(&pods, name).await {
                     Ok(true) => {
                         EndRecord {

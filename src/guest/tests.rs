@@ -375,12 +375,10 @@ async fn detached_descendants_survive_and_exec_cgroups_are_reaped() {
             for file in &self.0 {
                 if let Ok(pid) = std::fs::read_to_string(file)
                     && let Ok(pid) = pid.parse::<i32>()
+                    && let Err(error) = kill(Pid::from_raw(pid), Signal::SIGKILL)
+                    && error != nix::errno::Errno::ESRCH
                 {
-                    if let Err(error) = kill(Pid::from_raw(pid), Signal::SIGKILL)
-                        && error != nix::errno::Errno::ESRCH
-                    {
-                        eprintln!("failed to clean up test daemon {pid}: {error}");
-                    }
+                    eprintln!("failed to clean up test daemon {pid}: {error}");
                 }
             }
         }

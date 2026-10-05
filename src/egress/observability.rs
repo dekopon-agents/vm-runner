@@ -254,11 +254,9 @@ impl Exchange {
         )
     }
     pub(super) fn request_body_failed(&self) -> bool {
-        self.data.as_ref().is_some_and(|data| {
-            data.request
-                .lock()
-                .is_ok_and(|measured| measured.failed)
-        })
+        self.data
+            .as_ref()
+            .is_some_and(|data| data.request.lock().is_ok_and(|measured| measured.failed))
     }
     pub(super) fn headers(
         &mut self,

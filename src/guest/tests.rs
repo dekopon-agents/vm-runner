@@ -408,7 +408,8 @@ async fn detached_descendants_survive_and_exec_cgroups_are_reaped() {
             call(
                 &guest,
                 exec(&format!(
-                    "setsid sh -c 'exec sleep 30' </dev/null >/dev/null 2>&1 & daemon=$!; \
+                    "until grep -q \"/exec-$$\\$\" /proc/$$/cgroup; do :; done; \
+                     setsid sh -c 'exec sleep 30' </dev/null >/dev/null 2>&1 & daemon=$!; \
                      printf '%s' \"$daemon\" > {pid_file}; \
                      until [ \"$(cut -d ' ' -f6 /proc/$daemon/stat)\" = \"$daemon\" ]; do :; done; \
                      printf '%s %s' \"$$\" \"$daemon\""

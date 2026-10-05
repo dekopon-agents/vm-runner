@@ -91,7 +91,7 @@ await_holding_refcell_ref = "deny"
 # this repository. A site that legitimately drops one takes a scoped `#[allow]` with a reason.
 map_err_ignore = "deny"
 let_underscore_must_use = "deny"
-# A panic in `dekopond` drops a live chat session and one in `dekopon-brokerd` takes the only
+# A panic in `dekopon-gatewayd` drops a live chat session and one in `dekopon-brokerd` takes the only
 # authorization path down with it. `expect_used` follows once the poisoned-mutex policy is settled.
 unwrap_used = "deny"
 # `Arc::clone(&x)`/`Rc::clone(&x)` at the callsite distinguishes a refcount bump from a deep copy

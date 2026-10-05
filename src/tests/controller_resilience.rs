@@ -68,7 +68,7 @@ async fn reaper_kube_error_or_timeout_leaves_api_serving_and_retries_next_tick()
     let mut tasks = tokio::task::JoinSet::new();
     let reaping = Arc::clone(&requests);
     tasks.spawn(async move { reaping.reap().await.unwrap() }.with_subscriber(subscriber));
-    for (index, method) in ["DELETE", "GET", "GET"].into_iter().enumerate() {
+    for (index, method) in ["GET", "DELETE", "GET", "GET"].into_iter().enumerate() {
         let (request, send) = tokio::select! {
             request = mock.next_request() => request.unwrap(),
             result = tasks.join_next() => panic!("reaper stopped: {result:?}"),
@@ -88,9 +88,10 @@ async fn reaper_kube_error_or_timeout_leaves_api_serving_and_retries_next_tick()
                 StatusCode::OK
             });
         match index {
-            0 => send.send_response(hyper::Response::builder().status(503).body(kube::client::Body::from(
+            0 => send.send_response(hyper::Response::new(kube::client::Body::from(controller::tests::pod().to_string().into_bytes()))),
+            1 => send.send_response(hyper::Response::builder().status(503).body(kube::client::Body::from(
                 json!({"kind":"Status","apiVersion":"v1","status":"Failure","reason":"ServiceUnavailable","message":"retry-test","code":503}).to_string().into_bytes())).unwrap()),
-            1 => send.send_error(std::io::Error::new(std::io::ErrorKind::TimedOut, "read timeout test")),
+            2 => send.send_error(std::io::Error::new(std::io::ErrorKind::TimedOut, "read timeout test")),
             _ => send.send_response(hyper::Response::builder().status(404).body(kube::client::Body::from(
                 json!({"kind":"Status","apiVersion":"v1","status":"Failure","reason":"NotFound","message":"gone","code":404}).to_string().into_bytes())).unwrap()),
         }

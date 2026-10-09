@@ -27,8 +27,8 @@ the design; read the section your change touches.
 
 ## Build and verify
 
-A PR passes `Test (ubuntu-24.04)`, `Test (ubuntu-24.04-arm)`, `Image (…)`, `KVM` and
-`Guest (…)` before merge. Run `Test`'s steps before a push (Linux, with `tini` installed):
+A PR passes `Test (ubuntu-24.04)`, `Test (ubuntu-24.04-arm)`, `Image (…)`, `OTLP conformance`,
+`kvm` and `Guest (…)` before merge. Run `Test`'s steps before a push (Linux, with `tini` installed):
 
 ```console
 cargo fmt --all --check

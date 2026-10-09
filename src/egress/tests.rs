@@ -52,6 +52,7 @@ impl Proxy {
             None,
             Default::default(),
             Some("info,egress.exchange=info,egress.connect=info,egress.dns=info,egress.drop=info"),
+            None,
         )
         .await
     }
@@ -61,8 +62,22 @@ impl Proxy {
         omit: crate::config::Omit,
     ) -> Self {
         let exporter = InMemorySpanExporter::default();
-        Self::with_listeners(roots, egress, exporter.clone(), exporter, None, omit, None).await
+        Self::with_listeners(
+            roots,
+            egress,
+            exporter.clone(),
+            exporter,
+            None,
+            omit,
+            None,
+            None,
+        )
+        .await
     }
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "test fixture; callers vary listeners, omit, filter and models"
+    )]
     async fn with_listeners(
         roots: RootCertStore,
         egress: Egress,
@@ -71,6 +86,7 @@ impl Proxy {
         listeners: Option<gateway::Listeners>,
         omit: crate::config::Omit,
         filter: Option<&str>,
+        models: Option<models::Route>,
     ) -> Self {
         let (ca, pem) = Ca::new().unwrap();
         let mut trust = RootCertStore::empty();
@@ -117,6 +133,7 @@ impl Proxy {
             tls: client_config(roots).unwrap(),
             omit,
             rollups: Arc::new(Mutex::new(Rollups::new())),
+            models,
         });
         let task = tokio::spawn(
             engine
@@ -761,6 +778,7 @@ async fn cancelled_upstream_request_exports_abandoned_without_a_status() {
             tls: client_config(RootCertStore::empty()).unwrap(),
             omit: Default::default(),
             rollups: Arc::new(Mutex::new(Rollups::new())),
+            models: None,
         };
         let (mut client, stream) = tokio::io::duplex(4096);
         client.write_all(format!("GET http://localhost:{port}/ HTTP/1.1\r\nHost: localhost:{port}\r\n\r\n").as_bytes()).await.unwrap();
@@ -967,6 +985,7 @@ async fn idle_connection_closes_only_after_inactivity_and_reads_reset_the_deadli
         tls: client_config(RootCertStore::empty()).unwrap(),
         omit: Default::default(),
         rollups: Arc::new(Mutex::new(Rollups::new())),
+        models: None,
     };
     let (mut client, stream) = tokio::io::duplex(4096);
     let mut record = ConnectionRecord::default();
@@ -1000,6 +1019,7 @@ async fn maximum_lifetime_closes_even_an_active_connection() {
         tls: client_config(RootCertStore::empty()).unwrap(),
         omit: Default::default(),
         rollups: Arc::new(Mutex::new(Rollups::new())),
+        models: None,
     };
     let (mut client, stream) = tokio::io::duplex(4096);
     let mut record = ConnectionRecord::default();

@@ -152,7 +152,7 @@ fn answer(engine: &Engine, packet: &[u8], gateway: Ipv4Addr) -> Result<Option<Ve
     for question in &query.queries {
         let name = question.name().to_ascii();
         let kind = question.query_type();
-        let decision = if !allowed(&name, &engine.egress.allow) {
+        let decision = if !(allowed(&name, &engine.egress.allow) || engine.routes_models(&name)) {
             Decision::Host
         } else if question.query_class() != DNSClass::IN
             || !matches!(kind, RecordType::A | RecordType::AAAA)

@@ -43,6 +43,7 @@ use observability::{
     ConnectAttempt, ConnectOutcome, Exchange, HeaderSide, Outcome, Phase, Recorded, RequestMeasure,
     Rollups,
 };
+pub(crate) mod models;
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
 type HttpBody = UnsyncBoxBody<Bytes, Error>;
@@ -125,6 +126,12 @@ struct Engine {
     tls: Arc<ClientConfig>,
     omit: crate::config::Omit,
     rollups: Arc<Mutex<Rollups>>,
+    models: Option<models::Route>,
+}
+impl Engine {
+    fn routes_models(&self, host: &str) -> bool {
+        self.models.is_some() && models::Route::addressed(host)
+    }
 }
 #[derive(Clone)]
 struct Tunnel {
@@ -214,7 +221,7 @@ fn port(authority: &hyper::http::uri::Authority, default: u16) -> Result<u16, Re
 fn destination(
     req: &Request<Incoming>,
     tunnel: Option<&Tunnel>,
-    allow: &[String],
+    allowed: impl Fn(&str) -> bool,
 ) -> Result<Uri, Refusal> {
     let connect = req.method() == hyper::Method::CONNECT;
     if connect && tunnel.is_some() {
@@ -260,7 +267,7 @@ fn destination(
     {
         return Err(Refusal::HostMismatch);
     }
-    if !allowed(authority.host(), allow) {
+    if !allowed(authority.host()) {
         return Err(Refusal::NotAllowed);
     }
     Uri::builder()
@@ -284,6 +291,7 @@ fn strip(headers: &mut hyper::HeaderMap) {
     for name in [
         "traceparent",
         "tracestate",
+        models::SUBJECT_HEADER,
         "connection",
         "proxy-connection",
         "proxy-authorization",
@@ -484,15 +492,30 @@ impl Engine {
         uri: Uri,
         exchange: &mut Exchange,
     ) -> Result<Response<HttpBody>, Error> {
+        let route = self
+            .models
+            .as_ref()
+            .filter(|_| uri.host().is_some_and(models::Route::addressed));
         exchange.phase(Phase::Connect);
-        let stream = self.connect(&uri).await?;
+        let stream = match route {
+            Some(route) => route.connect().await?,
+            None => self.connect(&uri).await?,
+        };
         exchange.phase(Phase::Headers);
         let (mut sender, mut driver) =
             hyper::client::conn::http1::handshake(TokioIo::new(stream)).await?;
         // Preserve the validated wire value even if Connection nominates Host.
-        let host = req.headers().get(header::HOST).ok_or(RefusalError)?.clone();
+        let host = match route {
+            Some(route) => route.authority(),
+            None => req.headers().get(header::HOST).ok_or(RefusalError)?.clone(),
+        };
         strip(req.headers_mut());
         req.headers_mut().insert(header::HOST, host);
+        if let Some(route) = route {
+            // Only the jail asserts the subject; strip() already removed the guest's copies.
+            req.headers_mut()
+                .insert(models::SUBJECT_HEADER, route.subject());
+        }
         req.headers_mut().insert(
             header::CONNECTION,
             hyper::http::HeaderValue::from_static("close"),
@@ -581,7 +604,9 @@ impl Engine {
         );
         exchange.headers(req.headers(), HeaderSide::Request, &self.omit.headers);
         let head = req.method() == hyper::Method::HEAD;
-        let decision = destination(&req, tunnel, &self.egress.allow);
+        let decision = destination(&req, tunnel, |host| {
+            allowed(host, &self.egress.allow) || self.routes_models(host)
+        });
         let (response, outcome, error) = match decision {
             Err(reason) => {
                 exchange.refuse(reason);
@@ -1130,6 +1155,7 @@ impl Gateway {
         egress: Egress,
         ca: Ca,
         omit: crate::config::Omit,
+        models: Option<models::Route>,
     ) -> Result<Self, Error> {
         let roots = RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         Ok(Self {
@@ -1139,6 +1165,7 @@ impl Gateway {
                 tls: client_config(roots)?,
                 omit,
                 rollups: Arc::new(Mutex::new(Rollups::new())),
+                models,
             }),
             listeners: gateway::Listeners::bind(None, Some(std::net::Ipv4Addr::new(10, 0, 2, 1)))
                 .await?,
@@ -1178,6 +1205,8 @@ pub async fn run(
                 .as_ref()
                 .map_or_else(Default::default, |telemetry| telemetry.omit.clone()),
             rollups: Arc::new(Mutex::new(Rollups::new())),
+            // The standalone egress proxy serves no VM, so it has no subject to assert.
+            models: None,
         });
         engine
             .serve(

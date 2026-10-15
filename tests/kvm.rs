@@ -544,15 +544,11 @@ async fn model_upstream() -> (
                                 .unwrap()
                         } else if path == "/v1/responses" {
                             calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                            let body = concat!(
-                                "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_1\"}}\n\n",
-                                "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"CANNED_SOL_OK\"}\n\n",
-                                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}\n\n"
-                            );
+                            let body = include_bytes!("../images/guest/pi/response.sse");
                             hyper::Response::builder()
                                 .header("content-type", "text/event-stream")
                                 .body(http_body_util::Full::new(hyper::body::Bytes::from_static(
-                                    body.as_bytes(),
+                                    body,
                                 )))
                                 .unwrap()
                         } else {

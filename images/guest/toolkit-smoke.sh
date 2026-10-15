@@ -3,6 +3,7 @@ set -eu
 [ "$(id -u)" = 1000 ]
 uv --version | grep -Ex 'uv 0\.12\.21( \([^)]*\))?'
 [ "$(pi --version)" = 1.2.0 ]
+node /opt/pi/sse-smoke.cjs /opt/pi/node_modules/openai/core/streaming.js /home/jail/.pi-proxy/response.sse
 node -e 'const l=require("/opt/pi/package-lock.json"); const p=l.packages["node_modules/@earendil-works/pi-coding-agent"]; if(p.version!=="1.2.0"||p.integrity!=="sha512-h/4WaVWv1VlCaY8x8qEN5U+7jbF/e7+Ck6moPeEOFn5juMTWwNAXjwgYM7gRgbBYh8Zppwt6qWvJDzNTf4GNEQ==") process.exit(1)'
 # With no model route and no network the wrapper must not find a public fallback.
 if timeout 20 pi --provider vm-proxy --model sol --print 'offline route probe' > /tmp/pi-out 2>/tmp/pi-err; then

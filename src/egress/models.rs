@@ -1,6 +1,3 @@
-//! The guest route to dekopon-gatewayd's model proxy: `models.vm.internal` bypasses the allowlist and
-//! forwards over mTLS to one configured upstream, asserting the VM's subject in a header the
-//! guest can never set.
 use super::{Error, Stream, same_host};
 use std::{path::PathBuf, sync::Arc};
 use tokio::net::TcpStream;
@@ -17,6 +14,7 @@ use tracing::Instrument;
 pub(crate) const HOST: &str = "models.vm.internal";
 /// Set by the jail on every routed request; any copy the guest sent is stripped first.
 pub(crate) const SUBJECT_HEADER: &str = "x-dekopon-vm-subject";
+pub(crate) const SESSION_HEADER: &str = "x-dekopon-vm-session";
 /// Where the controller mounts the jail client-certificate Secret (`tls.crt`, `tls.key`,
 /// `ca.crt`): 0440 root:1000 under the pod's fsGroup, like `/kube/token`.
 pub(crate) const TLS_DIR: &str = "/models-tls";
@@ -34,6 +32,7 @@ pub(crate) struct Route {
     port: u16,
     authority: hyper::header::HeaderValue,
     subject: hyper::header::HeaderValue,
+    session: hyper::header::HeaderValue,
     dir: PathBuf,
 }
 /// `https://host[:port]` with nothing else; the guest's path is forwarded unchanged. Returns the
@@ -64,11 +63,17 @@ pub(crate) fn subject(value: &str) -> Result<&str, InvalidRoute> {
     }
 }
 impl Route {
-    pub(crate) fn new(upstream: &str, subject: &str, dir: PathBuf) -> Result<Self, Error> {
+    pub(crate) fn new(
+        upstream: &str,
+        subject: &str,
+        session: &str,
+        dir: PathBuf,
+    ) -> Result<Self, Error> {
         let (host, server, port) = self::upstream(upstream)?;
         Ok(Self {
             authority: format!("{host}:{port}").parse()?,
             subject: self::subject(subject)?.parse()?,
+            session: session.parse()?,
             server,
             port,
             dir,
@@ -82,6 +87,9 @@ impl Route {
     }
     pub(super) fn subject(&self) -> hyper::header::HeaderValue {
         self.subject.clone()
+    }
+    pub(super) fn session(&self) -> hyper::header::HeaderValue {
+        self.session.clone()
     }
     /// Rereads the mounted Secret on every connection so cert-manager rotation needs no restart.
     async fn client_config(&self) -> Result<Arc<ClientConfig>, Error> {

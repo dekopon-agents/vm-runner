@@ -734,6 +734,7 @@ struct ModelRequest {
     path: String,
     headers: hyper::HeaderMap,
     client_cert: Vec<u8>,
+    trailers: Option<hyper::HeaderMap>,
 }
 async fn model_upstream(
     listener: TcpListener,
@@ -755,19 +756,27 @@ async fn model_upstream(
             .serve_connection(
                 TokioIo::new(tls),
                 service_fn(move |req: Request<Incoming>| {
-                    *record.lock().unwrap() = Some((req.uri().to_string(), req.headers().clone()));
-                    async {
+                    let record = Arc::clone(&record);
+                    async move {
+                        let (parts, body) = req.into_parts();
+                        let collected = body.collect().await.unwrap();
+                        *record.lock().unwrap() = Some((
+                            parts.uri.to_string(),
+                            parts.headers,
+                            collected.trailers().cloned(),
+                        ));
                         Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(b"model"))))
                     }
                 }),
             )
             .await
             .unwrap();
-        let (path, headers) = seen.lock().unwrap().take().unwrap();
+        let (path, headers, trailers) = seen.lock().unwrap().take().unwrap();
         received.push(ModelRequest {
             path,
             headers,
             client_cert,
+            trailers,
         });
     }
     received
@@ -775,7 +784,7 @@ async fn model_upstream(
 const FORGED: &str =
     "x-dekopon-vm-subject: dekopon:forged\r\nX-Dekopon-VM-Subject: dekopon:forged-too\r\n";
 #[tokio::test]
-async fn models_route_answers_dns_and_forwards_sni_host_and_connect_over_mtls_with_one_subject() {
+async fn models_route_forwards_one_jail_session_and_subject_without_guest_trailer_identity() {
     let pki = ModelPki::new();
     let dir = tempfile::tempdir().unwrap();
     let first = pki.client(dir.path());
@@ -786,6 +795,7 @@ async fn models_route_answers_dns_and_forwards_sni_host_and_connect_over_mtls_wi
     let route = models::Route::new(
         &format!("https://localhost:{port}"),
         "dekopon:gylmar-vm",
+        "019591f2-439b-7000-8000-000000000001",
         dir.path().to_owned(),
     )
     .unwrap();
@@ -812,7 +822,7 @@ async fn models_route_answers_dns_and_forwards_sni_host_and_connect_over_mtls_wi
 
     let request = |path: &str| {
         format!(
-            "POST {path} HTTP/1.1\r\nHost: models.vm.internal\r\n{FORGED}authorization: Bearer vm\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+            "POST {path} HTTP/1.1\r\nHost: models.vm.internal\r\n{FORGED}x-dekopon-vm-session: forged-header\r\nauthorization: Bearer vm\r\nTransfer-Encoding: chunked\r\nTrailer: x-dekopon-vm-session, x-dekopon-vm-subject, x-checksum\r\nConnection: close\r\n\r\n2\r\n{{}}\r\n0\r\nx-dekopon-vm-session: forged-trailer\r\nx-dekopon-vm-subject: dekopon:forged-trailer\r\nx-checksum: kept\r\n\r\n"
         )
     };
     // SNI on the gateway's :443.
@@ -822,7 +832,7 @@ async fn models_route_answers_dns_and_forwards_sni_host_and_connect_over_mtls_wi
         .await
         .unwrap();
     assert_eq!(
-        exchange(tls, &request("/v1/messages")).await,
+        exchange(tls, &request("/v1/messages?mode=verify")).await,
         (200, "model".into())
     );
     // Origin-form Host on :80.
@@ -865,7 +875,7 @@ async fn models_route_answers_dns_and_forwards_sni_host_and_connect_over_mtls_wi
     assert_eq!(
         paths,
         [
-            "/v1/messages",
+            "/v1/messages?mode=verify",
             "/v1/responses",
             "/v1/chat/completions",
             "/v1/messages/count_tokens"
@@ -878,6 +888,17 @@ async fn models_route_answers_dns_and_forwards_sni_host_and_connect_over_mtls_wi
             .iter()
             .collect();
         assert_eq!(subjects, ["dekopon:gylmar-vm"]);
+        assert_eq!(
+            request
+                .headers
+                .get_all(models::SESSION_HEADER)
+                .iter()
+                .collect::<Vec<_>>(),
+            ["019591f2-439b-7000-8000-000000000001"]
+        );
+        // The existing proxy strips the Trailer declaration, so Hyper drops all
+        // forwarded trailer fields; the request still carries real body trailer frames.
+        assert!(request.trailers.is_none());
         assert_eq!(request.headers[header::HOST], format!("localhost:{port}"));
         // The guest's token is left for dekopon-gatewayd to drop; the jail adds no credential.
         assert_eq!(request.headers[header::AUTHORIZATION], "Bearer vm");
@@ -885,6 +906,7 @@ async fn models_route_answers_dns_and_forwards_sni_host_and_connect_over_mtls_wi
     assert!(received[..3].iter().all(|r| r.client_cert == first));
     assert_eq!(received[3].client_cert, second);
     assert_ne!(first, second);
+    assert_eq!(received.len(), 4);
 
     let spans = gateway.proxy.finish().await;
     // Four forwarded requests plus the CONNECT envelope.
@@ -898,6 +920,11 @@ async fn models_route_answers_dns_and_forwards_sni_host_and_connect_over_mtls_wi
     assert_eq!(
         spans.iter().filter(|s| s.name == "egress.connect").count(),
         4
+    );
+    assert!(
+        spans.iter().flat_map(|s| &s.attributes).all(|kv| {
+            kv.value != "forged-header".into() && kv.value != "forged-trailer".into()
+        })
     );
 }
 #[tokio::test]
@@ -968,7 +995,15 @@ fn models_upstream_is_an_https_origin_and_subject_is_namespace_name() {
             9090
         )
     );
-    assert!(models::Route::new("https://[::1]:9090", "dekopon:gylmar-vm", "/".into()).is_ok());
+    assert!(
+        models::Route::new(
+            "https://[::1]:9090",
+            "dekopon:gylmar-vm",
+            "session",
+            "/".into()
+        )
+        .is_ok()
+    );
     for invalid in [
         "http://dekopon:9090",
         "https://dekopon:9090/v1",

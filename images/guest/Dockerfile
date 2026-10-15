@@ -4,7 +4,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 ARG TARGETARCH
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl ca-certificates openssl libnss3-tools iproute2 util-linux xz-utils tini \
-    python3 jq ripgrep zip unzip poppler-utils \
+    python3 jq ripgrep zip unzip poppler-utils ffmpeg \
     && groupadd --gid 1000 jail && useradd --uid 1000 --gid 1000 --create-home jail
 RUN case "$TARGETARCH" in \
       amd64) node_arch=x64; sha=fd8e59d5a511510f6a298afb548f18c7d2b1be404d8b4a27d94fbe49f56cb2d6 ;; \
@@ -30,6 +30,12 @@ RUN case "$TARGETARCH" in \
     && rm -rf /tmp/uv.tar.gz "/tmp/uv-$uv_arch-unknown-linux-gnu" \
     && /usr/local/bin/uv-native --version | grep -Ex 'uv 0\.12\.21( \([^)]*\))?'
 COPY --chmod=0755 uv /usr/local/bin/uv
+COPY pi/package.json pi/package-lock.json /opt/pi/
+RUN cd /opt/pi && npm ci --omit=dev --ignore-scripts --no-audit --no-fund \
+    && node -e 'const l=require("./package-lock.json"); if(l.packages["node_modules/@earendil-works/pi-coding-agent"].integrity!=="sha512-h/4WaVWv1VlCaY8x8qEN5U+7jbF/e7+Ck6moPeEOFn5juMTWwNAXjwgYM7gRgbBYh8Zppwt6qWvJDzNTf4GNEQ==") process.exit(1)' \
+    && npm cache clean --force
+COPY pi/models.json /opt/pi/models.json
+COPY --chmod=0755 pi-wrapper /usr/local/bin/pi
 WORKDIR /opt/playwright
 RUN npm install --save-exact playwright@1.63.0 \
     && PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright npx playwright install --with-deps chromium \
@@ -55,6 +61,7 @@ COPY --chmod=0755 agent-browser /usr/local/bin/agent-browser
 COPY --chmod=0755 vm-guest-agent /usr/local/bin/vm-guest-agent
 COPY --chmod=0755 vm-init /sbin/vm-init
 COPY --chmod=0755 browse /usr/local/bin/browse
+COPY --chmod=0755 record-cdp /usr/local/bin/record-cdp
 COPY browser-smoke.cjs /tmp/browser-smoke.cjs
 # Match the guest agent's cleared environment and identity, not Docker ENV defaults.
 RUN setpriv --reuid=1000 --regid=1000 --clear-groups \

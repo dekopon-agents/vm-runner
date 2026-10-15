@@ -58,6 +58,8 @@ async fn jail_vmm_has_no_new_privileges_and_confined_identity_and_egress() {
         serde_yaml_ng::from_str(include_str!("../examples/vm-runner.yaml")).unwrap();
     value["profiles"]["travel"]["image"] = std::env::var("KVM_GUEST_IMAGE").unwrap().into();
     value["profiles"]["travel"]["egress"]["allow"] = json!(["example.com"]);
+    value["shapes"]["proof-1c512m"] = json!({"vcpus":1,"memoryMiB":512,"diskMiB":4096});
+    value["profiles"]["travel"]["shape"] = json!("proof-1c512m");
     value["auth"]["issuers"] = json!([{"issuer":issuer}]);
     let (models, received_models) = model_upstream().await;
     peers.spawn(models);
@@ -103,7 +105,7 @@ async fn jail_vmm_has_no_new_privileges_and_confined_identity_and_egress() {
             }
         }
     });
-    let outcome = tokio::time::timeout(Duration::from_secs(90), async {
+    let outcome = tokio::time::timeout(Duration::from_secs(300), async {
         let pid = received_ready.await.expect("jail exited before ready");
         let status = tokio::fs::read_to_string(format!("/proc/{pid}/status")).await.unwrap();
         for field in ["Uid:", "Gid:"] {
@@ -123,7 +125,7 @@ async fn jail_vmm_has_no_new_privileges_and_confined_identity_and_egress() {
         for path in ["ip_forward", "conf/all/rp_filter", "conf/default/rp_filter", "conf/tap0/rp_filter"] {
             assert_eq!(tokio::fs::read_to_string(format!("/proc/sys/net/ipv4/{path}")).await.unwrap().trim(), if path == "ip_forward" { "0" } else { "1" });
         }
-        let api = reqwest::Client::builder().timeout(Duration::from_secs(30)).build().unwrap();
+        let api = reqwest::Client::builder().timeout(Duration::from_secs(180)).build().unwrap();
         assert_eq!(api.get("http://127.0.0.1:8080/healthz").bearer_auth(&token).send().await.unwrap().status(), 200);
         let result = exec(&api, &token, "node -e \"require('node:dns').resolve4('example.com',(e,a)=>{if(e||JSON.stringify(a)!=='[\\\"10.0.2.1\\\"]')process.exit(1)})\" && curl --fail --http1.1 --max-time 15 https://example.com").await;
         assert!(result["stdout"].as_str().unwrap().contains("Example Domain"));
@@ -134,6 +136,15 @@ async fn jail_vmm_has_no_new_privileges_and_confined_identity_and_egress() {
         let (path, subjects) = received_models.requests.lock().await.recv().await.unwrap();
         assert_eq!(path, "/v1/messages");
         assert_eq!(subjects, ["test:kvm-vm"]);
+        let result = exec(&api, &token, "pi --no-session --no-tools --no-mcp --provider vm-proxy --model sol --print 'Reply CANNED_SOL_OK exactly'").await;
+        println!("child stdout: {}", result["stdout"]);
+        assert!(result["stdout"].as_str().unwrap().contains("CANNED_SOL_OK"));
+        let (path, subjects) = received_models.requests.lock().await.recv().await.unwrap();
+        assert_eq!(path, "/v1/responses");
+        assert_eq!(subjects, ["test:kvm-vm"]);
+        let denied = exec(&api, &token, "if pi --no-session --no-tools --no-mcp --provider vm-proxy --model unlisted --print 'deny' >/artifacts/denied.txt 2>&1; then exit 1; fi; echo UNKNOWN_MODEL_REFUSED").await;
+        assert_eq!(denied["stdout"], "UNKNOWN_MODEL_REFUSED\n");
+        assert!(received_models.requests.lock().await.try_recv().is_err(), "unlisted model must make zero upstream calls");
         exec(&api, &token, "mkdir -p /artifacts/nested; printf hello > /artifacts/nested/test.txt").await;
         let files: Value = api.get("http://127.0.0.1:8080/artifacts").bearer_auth(&token).send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
         assert_eq!(files[0]["path"], "nested/test.txt");
@@ -164,6 +175,13 @@ async fn jail_vmm_has_no_new_privileges_and_confined_identity_and_egress() {
         assert_eq!(exec(&api, &token, &script).await["stdout"], "NEGATIVE_OK\n");
         assert!(dropped().await > before, "negative packets must reach tap0's actual nft drop rule");
         assert!(tokio::fs::read_to_string("/run/vm-runner/console/serial.log").await.unwrap().contains("Run /sbin/vm-init as init process"));
+        // Record against the same booted PR guest; the recipe starts browse in this exec.
+        let result = exec(&api, &token, "record-cdp proof").await;
+        println!("encode stdout: {}", result["stdout"]);
+        assert!(result["stdout"].as_str().unwrap().contains("published /artifacts/proof.mp4"));
+        let files: Value = api.get("http://127.0.0.1:8080/artifacts").bearer_auth(&token).send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+        assert!(files.as_array().unwrap().iter().any(|f| f["path"] == "proof.mp4"));
+        assert!(files.as_array().unwrap().iter().any(|f| f["path"] == "proof.png"));
         pid
     }).await;
     nix::sys::signal::kill(
@@ -296,22 +314,54 @@ async fn model_upstream() -> (
                 continue;
             };
             let sender = sender.clone();
-            let service =
-                hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+            let service = hyper::service::service_fn(
+                move |req: hyper::Request<hyper::body::Incoming>| {
                     let subjects = req
                         .headers()
                         .get_all("x-dekopon-vm-subject")
                         .iter()
                         .map(|v| v.to_str().unwrap().to_owned())
                         .collect();
-                    let sent = sender.try_send((req.uri().to_string(), subjects));
+                    let path = req.uri().to_string();
+                    let dummy = req
+                        .headers()
+                        .get("authorization")
+                        .map(|v| v.as_bytes() == b"Bearer guest-no-credential")
+                        .unwrap_or(false);
                     async move {
-                        sent.unwrap();
-                        Ok::<_, std::convert::Infallible>(hyper::Response::new(
-                            http_body_util::Full::new(hyper::body::Bytes::from_static(b"model")),
-                        ))
+                        let body = http_body_util::BodyExt::collect(req.into_body())
+                            .await
+                            .unwrap()
+                            .to_bytes();
+                        if path == "/v1/responses" {
+                            assert!(dummy, "child must send only the baked non-secret key");
+                            assert_eq!(
+                                serde_json::from_slice::<Value>(&body).unwrap()["model"],
+                                "sol"
+                            );
+                        }
+                        sender.send((path.clone(), subjects)).await.unwrap();
+                        let response = if path == "/v1/responses" {
+                            let body = concat!(
+                                "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_1\"}}\n\n",
+                                "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"CANNED_SOL_OK\"}\n\n",
+                                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}\n\n"
+                            );
+                            hyper::Response::builder()
+                                .header("content-type", "text/event-stream")
+                                .body(http_body_util::Full::new(hyper::body::Bytes::from_static(
+                                    body.as_bytes(),
+                                )))
+                                .unwrap()
+                        } else {
+                            hyper::Response::new(http_body_util::Full::new(
+                                hyper::body::Bytes::from_static(b"model"),
+                            ))
+                        };
+                        Ok::<_, std::convert::Infallible>(response)
                     }
-                });
+                },
+            );
             let _closed = hyper::server::conn::http1::Builder::new()
                 .keep_alive(false)
                 .serve_connection(hyper_util::rt::TokioIo::new(tls), service)

@@ -1,0 +1,10 @@
+{
+  "providers": {
+    "vm-proxy": {
+      "baseUrl": "https://models.vm.internal/v1",
+      "api": "openai-responses",
+      "apiKey": "guest-no-credential",
+      "models": [{"id": "sol", "reasoning": true, "contextWindow": 200000, "maxTokens": 4096}]
+    }
+  }
+}

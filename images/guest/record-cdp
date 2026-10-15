@@ -1,0 +1,41 @@
+#!/bin/sh
+set -eu
+# Capture a live CDP tab, then atomically publish only a probed MP4.
+name=${1:?usage: record-cdp output-name (without extension)}
+case "$name" in *[!a-zA-Z0-9_-]*|'') exit 2;; esac
+work=$(mktemp -d /home/jail/.record.XXXXXX)
+partial="/artifacts/.$name.partial.mp4"
+trap 'rm -rf "$work"; rm -f "$partial"' EXIT HUP INT TERM
+browse open 'data:text/html,<title>CDP proof</title><body style="background:#174b72;color:white"><h1>CDP proof</h1></body>'
+node - "$work" <<'JS'
+const {chromium} = require('/opt/playwright/node_modules/playwright');
+const path = require('node:path');
+(async () => {
+  const browser = await chromium.connectOverCDP('http://127.0.0.1:9222');
+  const page = browser.contexts()[0].pages().at(-1);
+  await page.setViewportSize({width:1280, height:720});
+  for (let i = 0; i < 30; i++) {
+    await page.locator('h1').evaluate((h, n) => h.textContent = `CDP proof frame ${n}`, i);
+    await page.screenshot({path:path.join(process.argv[2], `frame${String(i).padStart(2,'0')}.png`)});
+  }
+  await browser.close();
+})().catch(e => { console.error(e); process.exitCode = 1; });
+JS
+cp "$work/frame00.png" "$work/preview.png"
+grep -E 'MemTotal|MemFree|MemAvailable' /proc/meminfo
+grep oom_kill /proc/vmstat
+ffmpeg -hide_banner -loglevel error -framerate 1 -i "$work/frame%02d.png" \
+    -c:v libx264 -threads 1 -pix_fmt yuv420p -r 30 -movflags +faststart "$work/output.mp4"
+grep -E 'MemTotal|MemFree|MemAvailable' /proc/meminfo
+grep oom_kill /proc/vmstat
+ffprobe -v error -show_entries format=duration,size -show_entries stream=codec_name,width,height -of json "$work/output.mp4"
+python3 - "$work/output.mp4" <<'PY'
+from pathlib import Path
+import sys
+p = Path(sys.argv[1]).read_bytes()
+assert p.index(b'moov') < p.index(b'mdat')
+PY
+cp "$work/output.mp4" "$partial"
+mv "$partial" "/artifacts/$name.mp4"
+cp "$work/preview.png" "/artifacts/$name.png"
+printf 'published /artifacts/%s.mp4 and matching PNG\n' "$name"

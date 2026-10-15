@@ -2,6 +2,16 @@
 set -eu
 [ "$(id -u)" = 1000 ]
 uv --version | grep -Ex 'uv 0\.12\.21( \([^)]*\))?'
+[ "$(pi --version)" = 1.2.0 ]
+node -e 'const l=require("/opt/pi/package-lock.json"); const p=l.packages["node_modules/@earendil-works/pi-coding-agent"]; if(p.version!=="1.2.0"||p.integrity!=="sha512-h/4WaVWv1VlCaY8x8qEN5U+7jbF/e7+Ck6moPeEOFn5juMTWwNAXjwgYM7gRgbBYh8Zppwt6qWvJDzNTf4GNEQ==") process.exit(1)'
+# With no model route and no network the wrapper must not find a public fallback.
+if timeout 20 pi --provider vm-proxy --model sol --print 'offline route probe' > /tmp/pi-out 2>/tmp/pi-err; then
+    echo 'unrouted pi call unexpectedly succeeded' >&2; exit 1
+fi
+if grep -Eqi 'openai\.com|openrouter\.ai' /tmp/pi-err; then
+    echo 'public fallback in pi failure' >&2; exit 1
+fi
+rm -f /tmp/pi-out /tmp/pi-err
 [ "$(uv cache dir)" = /home/jail/.cache/uv ]
 work=$(mktemp -d /home/jail/toolkit-smoke.XXXXXX)
 trap 'rm -rf "$work"' EXIT HUP INT TERM
@@ -9,6 +19,13 @@ export UV_CACHE_DIR="$work/cache"
 mkdir -p "$UV_CACHE_DIR"
 printf writable > "$UV_CACHE_DIR/probe"
 cd "$work"
+ffmpeg -hide_banner -loglevel error -f lavfi -i 'color=c=blue:s=1280x720:r=1:d=2' -c:v libx264 -pix_fmt yuv420p -movflags +faststart clip.mp4
+ffprobe -v error -show_entries stream=codec_name,width,height -of json clip.mp4 | jq -e '.streams[0] | .codec_name == "h264" and .width == 1280 and .height == 720'
+python3 - <<'PY'
+from pathlib import Path
+p = Path('clip.mp4').read_bytes()
+assert p.index(b'moov') < p.index(b'mdat')
+PY
 python3 - <<'PY'
 import json, pathlib, sys, zipfile
 assert sys.executable == '/usr/bin/python3'

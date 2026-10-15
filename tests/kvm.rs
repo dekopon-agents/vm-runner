@@ -187,32 +187,38 @@ async fn jail_vmm_has_no_new_privileges_and_confined_identity_and_egress() {
         assert!(dropped().await > before, "negative packets must reach tap0's actual nft drop rule");
         assert!(tokio::fs::read_to_string("/run/vm-runner/console/serial.log").await.unwrap().contains("Run /sbin/vm-init as init process"));
         if pr_guest {
+        // Warm the current proof tab before any capture; browse can report a first-CDP timeout.
+        let proof_page = "browse open 'data:text/html,<title>CDP proof</title><body style=\"background:#174b72;color:white\"><h1>CDP proof</h1></body>'";
+        let mut ready = false;
+        for attempt in 1..=6 {
+            let response = tokio::time::timeout(Duration::from_secs(20), exec_raw(&api, &token, proof_page)).await.expect("browse readiness attempt exceeded 20 seconds");
+            println!("browser readiness attempt {attempt}: {response}");
+            if response["outcome"] == "executed" && response["exitCode"] == 0 { ready = true; break; }
+            if attempt < 6 { tokio::time::sleep(Duration::from_secs(2)).await; }
+        }
+        assert!(ready, "browser failed six bounded readiness attempts");
         // A failed encoder must leave the artifact namespace untouched.
-        let failure = succeeded(exec_job(&api, &token, "set -eu; d=$(mktemp -d /home/jail/failed-encode.XXXXXX); printf '#!/bin/sh\\necho FORCED_ENCODER_FAILURE >&2\\nexit 42\\n' > \"$d/ffmpeg\"; chmod +x \"$d/ffmpeg\"; code=0; PATH=\"$d:/usr/local/bin:/usr/bin:/bin\" record-cdp rejected || code=$?; rm -rf \"$d\"; test \"$code\" -ne 0; echo ENCODE_FAILED").await);
+        let failure = succeeded(exec_job(&api, &token, "set -eu; d=$(mktemp -d /home/jail/failed-encode.XXXXXX); printf '#!/bin/sh\\neval \"out=\\${$#}\"\\nprintf junk > \"$out\"\\necho FORCED_ENCODER_FAILURE >&2\\nexit 42\\n' > \"$d/ffmpeg\"; chmod +x \"$d/ffmpeg\"; code=0; PATH=\"$d:/usr/local/bin:/usr/bin:/bin\" record-cdp rejected || code=$?; rm -rf \"$d\"; test \"$code\" -ne 0; echo ENCODE_FAILED").await);
         assert_capture_seconds(&failure);
+        assert!(failure["stdout"].as_str().unwrap().contains("CDP_FRAME_ELAPSED_MS="), "capture must complete before forced encoder failure: {failure}");
         assert_eq!(failure["stdout"].as_str().unwrap().lines().last(), Some("ENCODE_FAILED"));
         assert!(failure["stderr"].as_str().unwrap().contains("FORCED_ENCODER_FAILURE"), "the encode, not capture, must be the failing step: {failure}");
         let files = list_artifacts(&api, &token).await;
         assert!(!files.iter().any(|f| f["path"].as_str().unwrap().starts_with("rejected")));
 
-        // Record against the same booted PR guest; assert no entry while the exec runs.
+        // Record the current tab and compare every observed artifact to final content.
         let runner = api.clone();
         let bearer = token.clone();
         let mut recording = tokio::spawn(async move { succeeded(exec_job(&runner, &bearer, "record-cdp proof").await) });
         let mut polls = 0;
-        let started = std::time::Instant::now();
+        let mut sampled = Vec::new();
         let result = loop {
             tokio::select! {
                 biased;
                 result = &mut recording => break result.unwrap(),
                 _ = tokio::time::sleep(Duration::from_millis(200)) => {
-                    // The successful job must return 202 after 25 s. Samples within
-                    // 20 s of submission are therefore confirmed in-flight; do not
-                    // assert on a listing fetched after the job may have finished.
-                    if started.elapsed() >= Duration::from_secs(20) || recording.is_finished() { continue; }
                     let files = list_artifacts(&api, &token).await;
-                    if started.elapsed() >= Duration::from_secs(20) || recording.is_finished() { continue; }
-                    assert!(!files.iter().any(|f| f["path"] == "proof.mp4" || f["path"] == "proof.png"), "in-flight recording became visible: {files:?}");
+                    sampled.extend(proof_entries(&files));
                     polls += 1;
                 }
             }
@@ -222,6 +228,7 @@ async fn jail_vmm_has_no_new_privileges_and_confined_identity_and_egress() {
         assert_capture_seconds(&result);
         assert!(result["stdout"].as_str().unwrap().contains("published /artifacts/proof.mp4"));
         let files = list_artifacts(&api, &token).await;
+        assert!(samples_match_final(&sampled, &files), "observed partial or unpublished proof entry: {sampled:?}; final: {files:?}");
         let movie = files.iter().find(|f| f["path"] == "proof.mp4").unwrap();
         let png = files.iter().find(|f| f["path"] == "proof.png").unwrap();
         let movie_bytes = read_artifact(&api, &token, movie).await;
@@ -289,6 +296,39 @@ fn succeeded(result: Value) -> Value {
     assert_eq!(result["outcome"], "executed", "{result}");
     assert_eq!(result["exitCode"], 0, "{result}");
     result
+}
+fn proof_entries(files: &[Value]) -> Vec<(String, u64, String)> {
+    files
+        .iter()
+        .filter(|file| file["path"].as_str().unwrap().contains("proof"))
+        .map(|file| {
+            (
+                file["path"].as_str().unwrap().to_owned(),
+                file["bytes"].as_u64().unwrap(),
+                file["sha256"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect()
+}
+fn samples_match_final(samples: &[(String, u64, String)], final_files: &[Value]) -> bool {
+    let final_entries = proof_entries(final_files);
+    samples.iter().all(|sample| final_entries.contains(sample))
+}
+#[test]
+fn sampled_proof_rejects_partial_or_hidden_entries() {
+    let final_files = [json!({"path":"proof.mp4","bytes":10,"sha256":"final"})];
+    assert!(samples_match_final(
+        &[("proof.mp4".into(), 10, "final".into())],
+        &final_files
+    ));
+    assert!(!samples_match_final(
+        &[("proof.mp4".into(), 5, "partial".into())],
+        &final_files
+    ));
+    assert!(!samples_match_final(
+        &[(".proof.tmp".into(), 5, "partial".into())],
+        &final_files
+    ));
 }
 fn valid_frame_cadence(frames: &[u64]) -> bool {
     frames.len() == 30

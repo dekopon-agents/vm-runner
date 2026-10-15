@@ -34,7 +34,7 @@ COPY pi/package.json pi/package-lock.json /opt/pi/
 RUN cd /opt/pi && npm ci --omit=dev --ignore-scripts --no-audit --no-fund \
     && node -e 'const l=require("./package-lock.json"); if(l.packages["node_modules/@earendil-works/pi-coding-agent"].integrity!=="sha512-h/4WaVWv1VlCaY8x8qEN5U+7jbF/e7+Ck6moPeEOFn5juMTWwNAXjwgYM7gRgbBYh8Zppwt6qWvJDzNTf4GNEQ==") process.exit(1)' \
     && npm cache clean --force
-COPY pi/models.json /opt/pi/models.json
+COPY pi/models.json /home/jail/.pi-proxy/models.json
 COPY --chmod=0755 pi-wrapper /usr/local/bin/pi
 WORKDIR /opt/playwright
 RUN npm install --save-exact playwright@1.63.0 \

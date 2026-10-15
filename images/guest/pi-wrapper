@@ -1,5 +1,5 @@
 #!/bin/sh
 set -eu
 # The guest exec clears its environment; never inherit a public provider route or key.
-export PI_CODING_AGENT_DIR=/opt/pi
+export PI_CODING_AGENT_DIR=/home/jail/.pi-proxy
 exec /opt/pi/node_modules/.bin/pi "$@"

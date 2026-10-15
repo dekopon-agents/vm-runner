@@ -71,7 +71,7 @@ The ext4 proof reads with debugfs; the separate PR guest KVM job boots it.
 The image ships Debian ffmpeg/ffprobe and npm `@earendil-works/pi-coding-agent`
 1.2.0, pinned by `pi/package-lock.json` with integrity
 `sha512-h/4WaVWv1VlCaY8x8qEN5U+7jbF/e7+Ck6moPeEOFn5juMTWwNAXjwgYM7gRgbBYh8Zppwt6qWvJDzNTf4GNEQ==`.
-The `pi` PATH wrapper selects `/opt/pi/models.json` even when the exec environment
+The `pi` PATH wrapper selects `/home/jail/.pi-proxy/models.json` even when the exec environment
 is cleared: only `vm-proxy/sol` via the existing `models.vm.internal` Responses
 route, with a non-secret dummy key. It does not create a grant: absent model
 routing fails closed, and egress still requires the subject's proxy grant.

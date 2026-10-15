@@ -1,0 +1,84 @@
+#!/bin/sh
+set -eu
+# Capture a live CDP tab, then atomically publish only a probed MP4.
+name=${1:?usage: record-cdp output-name (without extension)}
+case "$name" in *[!a-zA-Z0-9_-]*|'') exit 2;; esac
+work=$(mktemp -d /scratch/recordings/.record.XXXXXX)
+trap 'rm -rf "$work"' EXIT HUP INT TERM
+node - "$work" <<'JS'
+const {chromium} = require('/opt/playwright/node_modules/playwright');
+const fs = require('node:fs');
+const path = require('node:path');
+(async () => {
+  const browser = await chromium.connectOverCDP('http://127.0.0.1:9222', {timeout:30000});
+  const page = browser.contexts()[0].pages().at(-1);
+  await page.setViewportSize({width:1280, height:720});
+  const cdp = await page.context().newCDPSession(page);
+  await cdp.send('Page.enable');
+  let count = 0;
+  const frameElapsed = [];
+  const started = performance.now();
+  await page.evaluate(() => {
+    const marker = document.createElement('div');
+    marker.dataset.cdpRecording = 'true';
+    marker.style.cssText = 'position:fixed;top:0;left:0;background:#174b72;color:white;z-index:2147483647';
+    (document.body || document.documentElement).append(marker);
+    let n = 0;
+    window.recordTimer = setInterval(() => {
+      marker.textContent = `CDP proof frame ${++n}`;
+    }, 1000);
+  });
+  await new Promise((resolve, reject) => {
+    const limit = setTimeout(() => reject(new Error(`screencast stalled at ${count}/30 frames`)), 55000);
+    cdp.on('Page.screencastFrame', async ({data, sessionId}) => {
+      try {
+        const elapsed = Math.round(performance.now() - started);
+        if (count < 30 && elapsed >= (count + 1) * 1000 &&
+            (count === 0 || elapsed - frameElapsed.at(-1) >= 500)) {
+          fs.writeFileSync(path.join(process.argv[2], `frame${String(count++).padStart(2,'0')}.png`), Buffer.from(data, 'base64'));
+          frameElapsed.push(elapsed);
+        }
+        await cdp.send('Page.screencastFrameAck', {sessionId});
+        if (count === 30) { clearTimeout(limit); resolve(); }
+      } catch (error) { clearTimeout(limit); reject(error); }
+    });
+    cdp.send('Page.startScreencast', {format:'png', everyNthFrame:1}).catch(reject);
+  });
+  console.log(`CDP_FRAME_ELAPSED_MS=${frameElapsed.join(',')}`);
+  console.log(`CDP_CAPTURE_ELAPSED_MS=${Math.round(performance.now() - started)}`);
+  await cdp.send('Page.stopScreencast');
+  await page.evaluate(() => clearInterval(window.recordTimer));
+  await cdp.detach();
+  await browser.close();
+})().catch(e => { console.error(e); process.exitCode = 1; });
+JS
+cp "$work/frame00.png" "$work/preview.png"
+grep -E 'MemTotal|MemFree|MemAvailable' /proc/meminfo
+grep oom_kill /proc/vmstat
+ffmpeg -hide_banner -loglevel error -framerate 1 -i "$work/frame%02d.png" \
+    -c:v libx264 -threads 1 -pix_fmt yuv420p -r 30 -movflags +faststart "$work/output.mp4"
+grep -E 'MemTotal|MemFree|MemAvailable' /proc/meminfo
+grep oom_kill /proc/vmstat
+ffprobe -v error -show_entries format=duration,size -show_entries stream=codec_name,width,height -of json "$work/output.mp4"
+python3 - "$work/output.mp4" <<'PY'
+from pathlib import Path
+import sys
+p = Path(sys.argv[1]).read_bytes()
+assert p.index(b'moov') < p.index(b'mdat')
+PY
+python3 - "$work" "$name" <<'PY'
+import os, shutil, sys
+work, name = sys.argv[1:]
+dir_fd = os.open('/artifacts', os.O_RDONLY | os.O_DIRECTORY)
+try:
+    for src, dst in (('output.mp4', f'{name}.mp4'), ('preview.png', f'{name}.png')):
+        fd = os.open('/artifacts', os.O_TMPFILE | os.O_WRONLY, 0o644)
+        with open(os.path.join(work, src), 'rb') as f, os.fdopen(fd, 'wb') as out:
+            shutil.copyfileobj(f, out)
+            out.flush()
+            os.fsync(fd)
+            os.link(f'/proc/self/fd/{fd}', dst, dst_dir_fd=dir_fd)
+finally:
+    os.close(dir_fd)
+PY
+printf 'published /artifacts/%s.mp4 and matching PNG\n' "$name"

@@ -18,10 +18,13 @@ if [ "${1:-}" != '--overlay' ]; then
 fi
 
 umount -l /oldroot
-mkdir -p /dev/pts /dev/shm /scratch/artifacts /home/jail/.pki/nssdb /run
+mkdir -p /dev/pts /dev/shm /scratch/artifacts /scratch/recordings /home/jail/.pki/nssdb /run
+chown 1000:1000 /scratch/recordings
+chmod 0700 /scratch/recordings
 mount -t devpts devpts /dev/pts -o gid=5,mode=620
 mount -t tmpfs tmpfs /dev/shm -o mode=1777
 mount -t tmpfs tmpfs /run
+printf '1\n' > /proc/sys/vm/overcommit_memory
 mkdir -p /sys/fs/cgroup
 mount -t cgroup2 cgroup2 /sys/fs/cgroup || true
 if [ -w /sys/fs/cgroup/cgroup.subtree_control ]; then

@@ -21,6 +21,9 @@ by scratch, mounts `/artifacts` there for uid 1000, installs system/NSS/Node
 trust, and configures eth0 as 10.0.2.2/30 via 10.0.2.1, then execs Debian's `tini` as
 PID 1 with the agent as its only child. Orphans such as `browse`'s detached Chromium
 reparent to tini, which reaps them; the agent waits only for its own execs.
+Init sets `vm.overcommit_memory=1`: in a 512 MiB guest the default heuristic refuses
+any single mapping larger than RAM, which is what V8's x64 CodeRange reservation is, so every
+Chromium renderer would die at startup. Exhaustion becomes an in-guest OOM kill instead of `ENOMEM`.
 The `jail` user's default Node module and browser-cache paths point at the baked
 Playwright installation; no browser download is needed at exec time.
 
@@ -30,7 +33,10 @@ call starts it in its own session, outside the exec's process group, with DevToo
 tabs, cookies and page state carry across execs. Playwright scripts can attach with
 `chromium.connectOverCDP('http://127.0.0.1:9222')`.
 
-The Guest image workflow builds both architectures on PRs without publishing.
+The Guest image workflow builds both architectures on PRs without publishing. Its
+`KVM PR guest` job boots the amd64 artifact (not the released digest) against a
+local fake; if hosted `/dev/kvm` is absent the job fails rather than proving a
+published guest. The regular `kvm` workflow still boots a pinned release.
 An owner-pushed annotated `guest-v*` tag on main additionally publishes
 `ghcr.io/dekopon-agents/vm-runner-guest:v*`. Each platform manifest has two
 annotated layers (zstd ext4 and kernel); the OCI index advertises both platforms
@@ -61,4 +67,27 @@ text/metadata from a tiny generated PDF. Fixtures, the venv and its cache are re
 `verify.sh` checks these shipped executables in ext4, including Python's symlink
 target. Dual-arch guest CI is the full image gate.
 
-The PR proof reads ext4 using debugfs; it is not a VM boot or a KVM proof.
+The ext4 proof reads with debugfs; the separate PR guest KVM job boots it.
+
+## CDP video recipe
+
+The image ships Debian ffmpeg/ffprobe and npm `@earendil-works/pi-coding-agent`
+1.2.0, pinned by `pi/package-lock.json` with integrity
+`sha512-h/4WaVWv1VlCaY8x8qEN5U+7jbF/e7+Ck6moPeEOFn5juMTWwNAXjwgYM7gRgbBYh8Zppwt6qWvJDzNTf4GNEQ==`.
+The `pi` PATH wrapper selects `/home/jail/.pi-proxy/models.json` even when the exec environment
+is cleared: only `vm-proxy/sol` via the existing `models.vm.internal` Responses
+route, with a non-secret dummy key. It does not create a grant: absent model
+routing fails closed, and egress still requires the subject's proxy grant.
+
+Inside a jail, open a tab first (for example, `browse open 'data:text/html,<p>Capture me</p>'`),
+then run `record-cdp proof` to capture the current tab. It does not open a page itself.
+It captures 30 1280×720 PNG frames from CDP `Page.startScreencast` (not screenshots), encodes
+a 30-second H.264 MP4 with faststart in a private `/scratch/recordings` directory
+and probes it. Each finished file is copied into an unnamed `O_TMPFILE` in
+`/artifacts` and only then linked as `/artifacts/proof.mp4` and `/artifacts/proof.png` (the first
+captured frame), so listing and reads never see a partial file and an existing name is never
+replaced.
+It prints `/proc/meminfo` and `oom_kill /proc/vmstat` before and after encoding,
+and ffprobe duration/size/codec. The jail exec span records `memory.peak`.
+A failed encode does not publish an MP4. Do not attach the file until the exec
+has completed, or assume Stop reclaims a still-running child promptly.

@@ -21,6 +21,8 @@ cargo test -p vm-runner --locked --test kvm --no-run --message-format=json > "$R
 python3 -c 'import json,sys; print(next(x["executable"] for x in map(json.loads,open(sys.argv[1])) if x.get("target",{}).get("name")=="kvm" and x.get("executable")))' "$RUNNER_TEMP/kvm-build.jsonl" > "$RUNNER_TEMP/kvm-executable"
 mkdir "$RUNNER_TEMP/kvm-context"
 cp Dockerfile target/debug/vm-runnerd "$RUNNER_TEMP/kvm-context/"
+# The host-side KVM witness runs inside this container, not on the Ubuntu runner.
+printf '\nUSER 0\nRUN apt-get update && apt-get install -y --no-install-recommends ffmpeg && rm -rf /var/lib/apt/lists/*\nUSER 1000:1000\n' >> "$RUNNER_TEMP/kvm-context/Dockerfile"
 docker build --build-arg TARGETARCH=amd64 -t vm-runner:kvm "$RUNNER_TEMP/kvm-context"
 gid=60000
 while getent group "$gid" >/dev/null; do gid=$((gid + 1)); done

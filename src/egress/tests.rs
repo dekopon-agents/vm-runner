@@ -850,11 +850,15 @@ fn request_trailers_cannot_reintroduce_trace_headers() {
     let mut trailers = hyper::HeaderMap::new();
     trailers.insert("traceparent", "sentinel".parse().unwrap());
     trailers.insert("tracestate", "sentinel".parse().unwrap());
+    trailers.insert(models::SESSION_HEADER, "forged-trailer".parse().unwrap());
+    trailers.insert(models::SUBJECT_HEADER, "forged-subject".parse().unwrap());
     trailers.insert("x-checksum", "kept".parse().unwrap());
     let frame = strip_trailers(Frame::trailers(trailers));
     let trailers = frame.trailers_ref().unwrap();
     assert!(!trailers.contains_key("traceparent"));
     assert!(!trailers.contains_key("tracestate"));
+    assert!(!trailers.contains_key(models::SESSION_HEADER));
+    assert!(!trailers.contains_key(models::SUBJECT_HEADER));
     assert_eq!(trailers["x-checksum"], "kept");
 }
 #[tokio::test]

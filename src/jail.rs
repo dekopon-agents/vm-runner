@@ -307,6 +307,7 @@ pub async fn run(config: Config, profile: &str, session: &str) -> Result<()> {
         Some(models) => Some(crate::egress::models::Route::new(
             &models.upstream,
             models.subject.as_deref().ok_or(Error::ModelsSubject)?,
+            session,
             crate::egress::models::TLS_DIR.into(),
         )?),
         None => None,

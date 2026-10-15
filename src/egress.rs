@@ -292,6 +292,7 @@ fn strip(headers: &mut hyper::HeaderMap) {
         "traceparent",
         "tracestate",
         models::SUBJECT_HEADER,
+        models::SESSION_HEADER,
         "connection",
         "proxy-connection",
         "proxy-authorization",
@@ -515,6 +516,8 @@ impl Engine {
             // Only the jail asserts the subject; strip() already removed the guest's copies.
             req.headers_mut()
                 .insert(models::SUBJECT_HEADER, route.subject());
+            req.headers_mut()
+                .insert(models::SESSION_HEADER, route.session());
         }
         req.headers_mut().insert(
             header::CONNECTION,

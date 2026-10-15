@@ -1,5 +1,5 @@
 #![cfg(target_os = "linux")]
-#![allow(clippy::unwrap_used)]
+#![allow(clippy::unwrap_used, clippy::disallowed_methods)]
 use aws_lc_rs::signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, KeyPair};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD as B64};
 use serde_json::{Value, json};
@@ -191,7 +191,7 @@ async fn jail_vmm_has_no_new_privileges_and_confined_identity_and_egress() {
         // Record against the same booted PR guest; assert no entry while the exec runs.
         let runner = api.clone();
         let bearer = token.clone();
-        let mut recording = tokio::spawn(async move { exec(&runner, &bearer, "record-cdp proof").await });
+        let mut recording = tokio::spawn(async move { succeeded(exec_job(&runner, &bearer, "record-cdp proof").await) });
         let mut polls = 0;
         let result = loop {
             tokio::select! {
@@ -236,7 +236,7 @@ async fn jail_vmm_has_no_new_privileges_and_confined_identity_and_egress() {
         println!("first-frame RGB absolute error sum={error}, pixels={}", first.len());
         assert!(error / (first.len() as u64) < 12, "PNG must match the first video frame despite lossy H.264");
         let prior_hash = movie["sha256"].clone();
-        let duplicate = exec_raw(&api, &token, "record-cdp proof").await;
+        let duplicate = exec_job(&api, &token, "record-cdp proof").await;
         assert_eq!(duplicate["outcome"], "executed");
         assert_ne!(duplicate["exitCode"], 0, "existing artifact must not be overwritten");
         assert!(duplicate["stderr"].as_str().unwrap().contains("FileExistsError"), "the existing name, not capture, must cause refusal: {duplicate}");
@@ -268,21 +268,53 @@ async fn jail_vmm_has_no_new_privileges_and_confined_identity_and_egress() {
     );
 }
 async fn exec(api: &reqwest::Client, token: &str, script: &str) -> Value {
-    let result = exec_raw(api, token, script).await;
+    succeeded(exec_raw(api, token, script).await)
+}
+fn succeeded(result: Value) -> Value {
     assert_eq!(result["outcome"], "executed", "{result}");
     assert_eq!(result["exitCode"], 0, "{result}");
     result
 }
-async fn exec_raw(api: &reqwest::Client, token: &str, script: &str) -> Value {
-    let response = api
-        .post("http://127.0.0.1:8080/exec")
+async fn submit(api: &reqwest::Client, token: &str, script: &str) -> reqwest::Response {
+    api.post("http://127.0.0.1:8080/exec")
         .bearer_auth(token)
         .json(&json!({"argv":["/bin/sh","-c",script],"deadlineMs":25000}))
         .send()
         .await
-        .unwrap();
+        .unwrap()
+}
+async fn exec_raw(api: &reqwest::Client, token: &str, script: &str) -> Value {
+    let response = submit(api, token, script).await;
     assert_eq!(response.status(), 200);
     response.json().await.unwrap()
+}
+async fn exec_job(api: &reqwest::Client, token: &str, script: &str) -> Value {
+    let response = submit(api, token, script).await;
+    assert_eq!(
+        response.status(),
+        202,
+        "a 30-second recording must outlive the 25-second response deadline"
+    );
+    let pending: Value = response.json().await.unwrap();
+    assert_eq!(pending["outcome"], "unknown", "{pending}");
+    let job = format!(
+        "http://127.0.0.1:8080/jobs/{}",
+        pending["jobId"].as_str().unwrap()
+    );
+    tokio::time::timeout(Duration::from_secs(120), async {
+        loop {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let response = api.get(&job).bearer_auth(token).send().await.unwrap();
+            assert_eq!(response.status(), 200, "job outcome must be known");
+            let view: Value = response.json().await.unwrap();
+            if view["state"] != "running" {
+                println!("{script}: job {job} finished: {}", view["outcome"]);
+                return view;
+            }
+        }
+    })
+    .await
+    .expect("job did not finish within 120 s of its 202")
 }
 async fn list_artifacts(api: &reqwest::Client, token: &str) -> Vec<Value> {
     api.get("http://127.0.0.1:8080/artifacts")

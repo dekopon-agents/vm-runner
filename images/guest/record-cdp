@@ -4,8 +4,7 @@ set -eu
 name=${1:?usage: record-cdp output-name (without extension)}
 case "$name" in *[!a-zA-Z0-9_-]*|'') exit 2;; esac
 work=$(mktemp -d /home/jail/.record.XXXXXX)
-partial="/artifacts/.$name.partial.mp4"
-trap 'rm -rf "$work"; rm -f "$partial"' EXIT HUP INT TERM
+trap 'rm -rf "$work"' EXIT HUP INT TERM
 browse open 'data:text/html,<title>CDP proof</title><body style="background:#174b72;color:white"><h1>CDP proof</h1></body>'
 node - "$work" <<'JS'
 const {chromium} = require('/opt/playwright/node_modules/playwright');
@@ -35,7 +34,15 @@ import sys
 p = Path(sys.argv[1]).read_bytes()
 assert p.index(b'moov') < p.index(b'mdat')
 PY
-cp "$work/output.mp4" "$partial"
-mv "$partial" "/artifacts/$name.mp4"
-cp "$work/preview.png" "/artifacts/$name.png"
+python3 - "$work" "$name" <<'PY'
+import os, shutil, sys
+work, name = sys.argv[1:]
+for src, dst in (('output.mp4', f'{name}.mp4'), ('preview.png', f'{name}.png')):
+    fd = os.open('/artifacts', os.O_TMPFILE | os.O_WRONLY, 0o644)
+    with open(os.path.join(work, src), 'rb') as f, os.fdopen(fd, 'wb') as out:
+        shutil.copyfileobj(f, out)
+        out.flush()
+        os.fsync(fd)
+        os.link(f'/proc/self/fd/{fd}', os.path.join('/artifacts', dst))
+PY
 printf 'published /artifacts/%s.mp4 and matching PNG\n' "$name"

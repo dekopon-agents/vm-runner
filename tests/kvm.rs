@@ -131,20 +131,26 @@ async fn jail_vmm_has_no_new_privileges_and_confined_identity_and_egress() {
         assert!(result["stdout"].as_str().unwrap().contains("Example Domain"));
         assert!(!tokio::fs::try_exists("/usr/bin/curl").await.unwrap());
         // The guest's forged subject is replaced by the jail's, over mTLS, outside the allowlist.
-        let result = exec(&api, &token, "curl --fail --silent --show-error --http1.1 --max-time 15 -H 'x-dekopon-vm-subject: test:forged' -H 'content-type: application/json' -d '{}' https://models.vm.internal/v1/messages").await;
+        let result = exec(&api, &token, "curl --fail --silent --show-error --http1.1 --max-time 15 -H 'x-dekopon-vm-subject: test:forged' -H 'content-type: application/json' -d '{\"model\":\"claude-opus\"}' https://models.vm.internal/v1/messages").await;
         assert_eq!(result["stdout"], "model");
-        let (path, subjects) = received_models.requests.lock().await.recv().await.unwrap();
-        assert_eq!(path, "/v1/messages");
-        assert_eq!(subjects, ["test:kvm-vm"]);
+        let seen = received_models.requests.lock().await.recv().await.unwrap();
+        assert_eq!((seen.path.as_str(), seen.subjects.as_slice(), seen.model.as_str(), seen.admitted), ("/v1/messages", ["test:kvm-vm".to_owned()].as_slice(), "claude-opus", true));
+        assert_eq!(received_models.upstream_calls(), 1);
         let result = exec(&api, &token, "pi --no-session --no-tools --no-mcp --provider vm-proxy --model sol --print 'Reply CANNED_SOL_OK exactly'").await;
         println!("child stdout: {}", result["stdout"]);
         assert!(result["stdout"].as_str().unwrap().contains("CANNED_SOL_OK"));
-        let (path, subjects) = received_models.requests.lock().await.recv().await.unwrap();
-        assert_eq!(path, "/v1/responses");
-        assert_eq!(subjects, ["test:kvm-vm"]);
-        let denied = exec(&api, &token, "if pi --no-session --no-tools --no-mcp --provider vm-proxy --model unlisted --print 'deny' >/artifacts/denied.txt 2>&1; then exit 1; fi; echo UNKNOWN_MODEL_REFUSED").await;
-        assert_eq!(denied["stdout"], "UNKNOWN_MODEL_REFUSED\n");
-        assert!(received_models.requests.lock().await.try_recv().is_err(), "unlisted model must make zero upstream calls");
+        let seen = received_models.requests.lock().await.recv().await.unwrap();
+        assert_eq!((seen.path.as_str(), seen.subjects.as_slice(), seen.model.as_str(), seen.admitted), ("/v1/responses", ["test:kvm-vm".to_owned()].as_slice(), "sol", true));
+        assert_eq!(seen.authorization.as_deref(), Some("Bearer guest-no-credential"), "child must send only the baked non-secret key");
+        assert_eq!(received_models.upstream_calls(), 2);
+        let denied = exec(&api, &token, "curl --silent --show-error --http1.1 --max-time 15 -w '\\n%{http_code}' -H 'authorization: Bearer guest-no-credential' -H 'content-type: application/json' -d '{\"model\":\"unlisted\",\"stream\":true,\"input\":\"deny\"}' https://models.vm.internal/v1/responses").await;
+        let (body, status) = denied["stdout"].as_str().unwrap().rsplit_once('\n').unwrap();
+        assert_eq!(status, "403");
+        assert_eq!(serde_json::from_str::<Value>(body).unwrap()["error"]["code"], "permission_denied");
+        let seen = received_models.requests.lock().await.recv().await.unwrap();
+        assert_eq!((seen.path.as_str(), seen.subjects.as_slice(), seen.model.as_str(), seen.admitted), ("/v1/responses", ["test:kvm-vm".to_owned()].as_slice(), "unlisted", false));
+        assert_eq!(received_models.upstream_calls(), 2, "a model outside the subject's grant must make zero upstream calls");
+        assert!(received_models.requests.lock().await.try_recv().is_err());
         exec(&api, &token, "mkdir -p /artifacts/nested; printf hello > /artifacts/nested/test.txt").await;
         let files: Value = api.get("http://127.0.0.1:8080/artifacts").bearer_auth(&token).send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
         assert_eq!(files[0]["path"], "nested/test.txt");
@@ -236,12 +242,30 @@ async fn dropped() -> u64 {
         .and_then(|entry| entry["counter"]["packets"].as_u64())
         .unwrap()
 }
+struct Arrival {
+    path: String,
+    subjects: Vec<String>,
+    model: String,
+    authorization: Option<String>,
+    admitted: bool,
+}
 struct ModelUpstream {
     port: u16,
-    requests: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<(String, Vec<String>)>>,
+    requests: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<Arrival>>,
+    upstream: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
+impl ModelUpstream {
+    fn upstream_calls(&self) -> usize {
+        self.upstream.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+const GUESTS: &[(&str, &[(&str, &str)])] = &[(
+    "test:kvm-vm",
+    &[("sol", "/v1/responses"), ("claude-opus", "/v1/messages")],
+)];
 /// dekopon-gatewayd's side of the contract: TLS that requires a client certificate from the test CA,
-/// which the jail reads from `/models-tls` like the controller-mounted Secret.
+/// which the jail reads from `/models-tls` like the controller-mounted Secret, then the model
+/// proxy's grant check on the jail-asserted subject before anything reaches a model upstream.
 async fn model_upstream() -> (
     impl std::future::Future<Output = ()> + Send + 'static,
     ModelUpstream,
@@ -304,6 +328,8 @@ async fn model_upstream() -> (
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let (sender, requests) = tokio::sync::mpsc::channel(4);
+    let upstream = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let calls = std::sync::Arc::clone(&upstream);
     let serve = async move {
         loop {
             let (stream, _) = listener.accept().await.unwrap();
@@ -314,34 +340,55 @@ async fn model_upstream() -> (
                 continue;
             };
             let sender = sender.clone();
+            let calls = std::sync::Arc::clone(&calls);
             let service = hyper::service::service_fn(
                 move |req: hyper::Request<hyper::body::Incoming>| {
-                    let subjects = req
+                    let subjects: Vec<String> = req
                         .headers()
                         .get_all("x-dekopon-vm-subject")
                         .iter()
                         .map(|v| v.to_str().unwrap().to_owned())
                         .collect();
                     let path = req.uri().to_string();
-                    let dummy = req
+                    let authorization = req
                         .headers()
                         .get("authorization")
-                        .map(|v| v.as_bytes() == b"Bearer guest-no-credential")
-                        .unwrap_or(false);
+                        .map(|v| v.to_str().unwrap().to_owned());
+                    let sender = sender.clone();
+                    let calls = std::sync::Arc::clone(&calls);
                     async move {
                         let body = http_body_util::BodyExt::collect(req.into_body())
                             .await
                             .unwrap()
                             .to_bytes();
-                        if path == "/v1/responses" {
-                            assert!(dummy, "child must send only the baked non-secret key");
-                            assert_eq!(
-                                serde_json::from_slice::<Value>(&body).unwrap()["model"],
-                                "sol"
-                            );
-                        }
-                        sender.send((path.clone(), subjects)).await.unwrap();
-                        let response = if path == "/v1/responses" {
+                        let model = serde_json::from_slice::<Value>(&body)
+                            .ok()
+                            .and_then(|body| body["model"].as_str().map(str::to_owned))
+                            .unwrap_or_default();
+                        let admitted = GUESTS.iter().any(|(subject, grant)| {
+                            subjects == [*subject]
+                                && grant.contains(&(model.as_str(), path.as_str()))
+                        });
+                        sender
+                            .send(Arrival {
+                                path: path.clone(),
+                                subjects,
+                                model,
+                                authorization,
+                                admitted,
+                            })
+                            .await
+                            .unwrap();
+                        let response = if !admitted {
+                            hyper::Response::builder()
+                                .status(403)
+                                .header("content-type", "application/json")
+                                .body(http_body_util::Full::new(hyper::body::Bytes::from_static(
+                                    br#"{"error":{"message":"sandbox: this agent may only call its configured models.","type":"invalid_request_error","param":null,"code":"permission_denied"}}"#,
+                                )))
+                                .unwrap()
+                        } else if path == "/v1/responses" {
+                            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                             let body = concat!(
                                 "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_1\"}}\n\n",
                                 "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"CANNED_SOL_OK\"}\n\n",
@@ -354,6 +401,7 @@ async fn model_upstream() -> (
                                 )))
                                 .unwrap()
                         } else {
+                            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                             hyper::Response::new(http_body_util::Full::new(
                                 hyper::body::Bytes::from_static(b"model"),
                             ))
@@ -373,6 +421,7 @@ async fn model_upstream() -> (
         ModelUpstream {
             port,
             requests: tokio::sync::Mutex::new(requests),
+            upstream,
         },
     )
 }

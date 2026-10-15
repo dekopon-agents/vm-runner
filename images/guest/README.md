@@ -78,8 +78,10 @@ routing fails closed, and egress still requires the subject's proxy grant.
 
 Inside a jail, `record-cdp proof` opens Chromium through `browse`, captures 30
 1280×720 CDP PNG frames, encodes a 30-second H.264 MP4 with faststart in a
-private directory and probes it before atomically moving the finished file to
-`/artifacts/proof.mp4`; `/artifacts/proof.png` is the first captured frame.
+private directory and probes it. Each finished file is copied into an unnamed `O_TMPFILE` in
+`/artifacts` and only then linked as `/artifacts/proof.mp4` and `/artifacts/proof.png` (the first
+captured frame), so listing and reads never see a partial file and an existing name is never
+replaced.
 It prints `/proc/meminfo` and `oom_kill /proc/vmstat` before and after encoding,
 and ffprobe duration/size/codec. The jail exec span records `memory.peak`.
 A failed encode does not publish an MP4. Do not attach the file until the exec

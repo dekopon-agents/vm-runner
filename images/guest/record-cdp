@@ -3,20 +3,42 @@ set -eu
 # Capture a live CDP tab, then atomically publish only a probed MP4.
 name=${1:?usage: record-cdp output-name (without extension)}
 case "$name" in *[!a-zA-Z0-9_-]*|'') exit 2;; esac
-work=$(mktemp -d /home/jail/.record.XXXXXX)
+work=$(mktemp -d /scratch/recordings/.record.XXXXXX)
 trap 'rm -rf "$work"' EXIT HUP INT TERM
 browse open 'data:text/html,<title>CDP proof</title><body style="background:#174b72;color:white"><h1>CDP proof</h1></body>'
 node - "$work" <<'JS'
 const {chromium} = require('/opt/playwright/node_modules/playwright');
+const fs = require('node:fs');
 const path = require('node:path');
 (async () => {
   const browser = await chromium.connectOverCDP('http://127.0.0.1:9222');
   const page = browser.contexts()[0].pages().at(-1);
   await page.setViewportSize({width:1280, height:720});
-  for (let i = 0; i < 30; i++) {
-    await page.locator('h1').evaluate((h, n) => h.textContent = `CDP proof frame ${n}`, i);
-    await page.screenshot({path:path.join(process.argv[2], `frame${String(i).padStart(2,'0')}.png`)});
-  }
+  const cdp = await page.context().newCDPSession(page);
+  await cdp.send('Page.enable');
+  let count = 0;
+  await page.evaluate(() => {
+    let n = 0;
+    window.recordTimer = setInterval(() => {
+      document.querySelector('h1').textContent = `CDP proof frame ${++n}`;
+    }, 1000);
+  });
+  await new Promise((resolve, reject) => {
+    const limit = setTimeout(() => reject(new Error(`screencast stalled at ${count}/30 frames`)), 55000);
+    cdp.on('Page.screencastFrame', async ({data, sessionId}) => {
+      try {
+        if (count < 30) {
+          fs.writeFileSync(path.join(process.argv[2], `frame${String(count++).padStart(2,'0')}.png`), Buffer.from(data, 'base64'));
+        }
+        await cdp.send('Page.screencastFrameAck', {sessionId});
+        if (count === 30) { clearTimeout(limit); resolve(); }
+      } catch (error) { clearTimeout(limit); reject(error); }
+    });
+    cdp.send('Page.startScreencast', {format:'png', everyNthFrame:1}).catch(reject);
+  });
+  await cdp.send('Page.stopScreencast');
+  await page.evaluate(() => clearInterval(window.recordTimer));
+  await cdp.detach();
   await browser.close();
 })().catch(e => { console.error(e); process.exitCode = 1; });
 JS

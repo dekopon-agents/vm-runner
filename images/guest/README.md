@@ -77,8 +77,9 @@ route, with a non-secret dummy key. It does not create a grant: absent model
 routing fails closed, and egress still requires the subject's proxy grant.
 
 Inside a jail, `record-cdp proof` opens Chromium through `browse`, captures 30
-1280×720 CDP PNG frames, encodes a 30-second H.264 MP4 with faststart in a
-private directory and probes it. Each finished file is copied into an unnamed `O_TMPFILE` in
+1280×720 PNG frames from CDP `Page.startScreencast` (not screenshots), encodes
+a 30-second H.264 MP4 with faststart in a private `/scratch/recordings` directory
+and probes it. Each finished file is copied into an unnamed `O_TMPFILE` in
 `/artifacts` and only then linked as `/artifacts/proof.mp4` and `/artifacts/proof.png` (the first
 captured frame), so listing and reads never see a partial file and an existing name is never
 replaced.

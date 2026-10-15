@@ -105,7 +105,7 @@ async fn jail_vmm_has_no_new_privileges_and_confined_identity_and_egress() {
             }
         }
     });
-    let outcome = tokio::time::timeout(Duration::from_secs(300), async {
+    let outcome = tokio::time::timeout(Duration::from_secs(450), async {
         let pid = received_ready.await.expect("jail exited before ready");
         let status = tokio::fs::read_to_string(format!("/proc/{pid}/status")).await.unwrap();
         for field in ["Uid:", "Gid:"] {
@@ -181,13 +181,68 @@ async fn jail_vmm_has_no_new_privileges_and_confined_identity_and_egress() {
         assert_eq!(exec(&api, &token, &script).await["stdout"], "NEGATIVE_OK\n");
         assert!(dropped().await > before, "negative packets must reach tap0's actual nft drop rule");
         assert!(tokio::fs::read_to_string("/run/vm-runner/console/serial.log").await.unwrap().contains("Run /sbin/vm-init as init process"));
-        // Record against the same booted PR guest; the recipe starts browse in this exec.
-        let result = exec(&api, &token, "record-cdp proof").await;
+        // A failed encoder must leave the artifact namespace untouched.
+        let failure = exec(&api, &token, "set -eu; d=$(mktemp -d /home/jail/failed-encode.XXXXXX); printf '#!/bin/sh\\necho FORCED_ENCODER_FAILURE >&2\\nexit 42\\n' > \"$d/ffmpeg\"; chmod +x \"$d/ffmpeg\"; code=0; PATH=\"$d:/usr/local/bin:/usr/bin:/bin\" record-cdp rejected || code=$?; rm -rf \"$d\"; test \"$code\" -ne 0; echo ENCODE_FAILED").await;
+        assert_eq!(failure["stdout"].as_str().unwrap().lines().last(), Some("ENCODE_FAILED"));
+        assert!(failure["stderr"].as_str().unwrap().contains("FORCED_ENCODER_FAILURE"), "the encode, not capture, must be the failing step: {failure}");
+        let files = list_artifacts(&api, &token).await;
+        assert!(!files.iter().any(|f| f["path"].as_str().unwrap().starts_with("rejected")));
+
+        // Record against the same booted PR guest; assert no entry while the exec runs.
+        let runner = api.clone();
+        let bearer = token.clone();
+        let mut recording = tokio::spawn(async move { exec(&runner, &bearer, "record-cdp proof").await });
+        let mut polls = 0;
+        let result = loop {
+            tokio::select! {
+                biased;
+                result = &mut recording => break result.unwrap(),
+                _ = tokio::time::sleep(Duration::from_millis(200)) => {
+                    if recording.is_finished() { continue; }
+                    let files = list_artifacts(&api, &token).await;
+                    assert!(!files.iter().any(|f| f["path"] == "proof.mp4" || f["path"] == "proof.png"), "unfinished recording became visible: {files:?}");
+                    polls += 1;
+                }
+            }
+        };
+        assert!(polls > 1, "artifact listing must be sampled during capture and encode");
         println!("encode stdout: {}", result["stdout"]);
         assert!(result["stdout"].as_str().unwrap().contains("published /artifacts/proof.mp4"));
-        let files: Value = api.get("http://127.0.0.1:8080/artifacts").bearer_auth(&token).send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
-        assert!(files.as_array().unwrap().iter().any(|f| f["path"] == "proof.mp4"));
-        assert!(files.as_array().unwrap().iter().any(|f| f["path"] == "proof.png"));
+        let files = list_artifacts(&api, &token).await;
+        let movie = files.iter().find(|f| f["path"] == "proof.mp4").unwrap();
+        let png = files.iter().find(|f| f["path"] == "proof.png").unwrap();
+        let movie_bytes = read_artifact(&api, &token, movie).await;
+        let png_bytes = read_artifact(&api, &token, png).await;
+        let dir = tempfile::tempdir().unwrap();
+        let mp4_path = dir.path().join("proof.mp4");
+        let png_path = dir.path().join("proof.png");
+        tokio::fs::write(&mp4_path, &movie_bytes).await.unwrap();
+        tokio::fs::write(&png_path, &png_bytes).await.unwrap();
+        let probe = Command::new("ffprobe").args(["-v", "error", "-show_entries", "stream=codec_name,width,height:format=duration,size", "-of", "json"]).arg(&mp4_path).output().await.unwrap();
+        assert!(probe.status.success());
+        let measured: Value = serde_json::from_slice(&probe.stdout).unwrap();
+        println!("MP4 actual bytes={} sha256={} ffprobe={measured}", movie_bytes.len(), movie["sha256"]);
+        assert_eq!(measured["streams"][0]["codec_name"], "h264");
+        assert_eq!(measured["streams"][0]["width"], 1280);
+        assert_eq!(measured["streams"][0]["height"], 720);
+        assert!((measured["format"]["duration"].as_str().unwrap().parse::<f64>().unwrap() - 30.0).abs() < 0.1);
+        assert_eq!(measured["format"]["size"].as_str().unwrap().parse::<usize>().unwrap(), movie_bytes.len());
+        assert!(movie_bytes.len() <= 8 * 1024 * 1024, "MP4 must fit the attachment limit");
+        let first = decoded_rgb(&mp4_path).await;
+        let preview = decoded_rgb(&png_path).await;
+        assert_eq!(first.len(), 1280 * 720 * 3);
+        assert_eq!(first.len(), preview.len());
+        let error: u64 = first.iter().zip(&preview).map(|(a, b)| u64::from(a.abs_diff(*b))).sum();
+        println!("first-frame RGB absolute error sum={error}, pixels={}", first.len());
+        assert!(error / (first.len() as u64) < 12, "PNG must match the first video frame despite lossy H.264");
+        let prior_hash = movie["sha256"].clone();
+        let duplicate = exec_raw(&api, &token, "record-cdp proof").await;
+        assert_eq!(duplicate["outcome"], "executed");
+        assert_ne!(duplicate["exitCode"], 0, "existing artifact must not be overwritten");
+        assert!(duplicate["stderr"].as_str().unwrap().contains("FileExistsError"), "the existing name, not capture, must cause refusal: {duplicate}");
+        let after = list_artifacts(&api, &token).await;
+        assert_eq!(after.iter().find(|f| f["path"] == "proof.mp4").unwrap()["sha256"], prior_hash);
+        assert_eq!(read_artifact(&api, &token, after.iter().find(|f| f["path"] == "proof.mp4").unwrap()).await, movie_bytes);
         pid
     }).await;
     nix::sys::signal::kill(
@@ -213,6 +268,12 @@ async fn jail_vmm_has_no_new_privileges_and_confined_identity_and_egress() {
     );
 }
 async fn exec(api: &reqwest::Client, token: &str, script: &str) -> Value {
+    let result = exec_raw(api, token, script).await;
+    assert_eq!(result["outcome"], "executed", "{result}");
+    assert_eq!(result["exitCode"], 0, "{result}");
+    result
+}
+async fn exec_raw(api: &reqwest::Client, token: &str, script: &str) -> Value {
     let response = api
         .post("http://127.0.0.1:8080/exec")
         .bearer_auth(token)
@@ -221,10 +282,60 @@ async fn exec(api: &reqwest::Client, token: &str, script: &str) -> Value {
         .await
         .unwrap();
     assert_eq!(response.status(), 200);
-    let result: Value = response.json().await.unwrap();
-    assert_eq!(result["outcome"], "executed", "{result}");
-    assert_eq!(result["exitCode"], 0, "{result}");
-    result
+    response.json().await.unwrap()
+}
+async fn list_artifacts(api: &reqwest::Client, token: &str) -> Vec<Value> {
+    api.get("http://127.0.0.1:8080/artifacts")
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
+}
+async fn read_artifact(api: &reqwest::Client, token: &str, listed: &Value) -> Vec<u8> {
+    let path = listed["path"].as_str().unwrap();
+    let response = api
+        .get(format!("http://127.0.0.1:8080/artifacts/{path}"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    assert_eq!(
+        response.headers()["sha256"],
+        listed["sha256"].as_str().unwrap()
+    );
+    let bytes = response.bytes().await.unwrap().to_vec();
+    assert_eq!(bytes.len() as u64, listed["bytes"].as_u64().unwrap());
+    let hash = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, &bytes);
+    let hex = hash
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    assert_eq!(hex, listed["sha256"]);
+    println!("artifact {path} bytes={} sha256={hex}", bytes.len());
+    bytes
+}
+async fn decoded_rgb(path: &std::path::Path) -> Vec<u8> {
+    let output = Command::new("ffmpeg")
+        .args(["-v", "error", "-i"])
+        .arg(path)
+        .args(["-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"])
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "ffmpeg: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output.stdout
 }
 async fn dropped() -> u64 {
     let output = Command::new("nft")

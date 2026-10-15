@@ -15,6 +15,7 @@ zstd -d -c rootfs.ext4.zst > "$RUNNER_TEMP/images/sha256-$hash-x86_64/rootfs.ext
 cp vmlinux "$RUNNER_TEMP/images/sha256-$hash-x86_64/vmlinux"
 printf 'PR_HEAD=%s GUEST_MANIFEST_SHA256=%s ROOTFS_SHA256=%s\n' "$GITHUB_SHA" "$hash" "$(sha256sum "$RUNNER_TEMP/images/sha256-$hash-x86_64/rootfs.ext4" | cut -d' ' -f1)"
 cd "$GITHUB_WORKSPACE"
+sudo apt-get update && sudo apt-get install -y ffmpeg
 cargo build -p vm-runner --locked --bin vm-runnerd
 cargo test -p vm-runner --locked --test kvm --no-run --message-format=json > "$RUNNER_TEMP/kvm-build.jsonl"
 python3 -c 'import json,sys; print(next(x["executable"] for x in map(json.loads,open(sys.argv[1])) if x.get("target",{}).get("name")=="kvm" and x.get("executable")))' "$RUNNER_TEMP/kvm-build.jsonl" > "$RUNNER_TEMP/kvm-executable"

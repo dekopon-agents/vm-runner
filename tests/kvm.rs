@@ -189,6 +189,7 @@ async fn jail_vmm_has_no_new_privileges_and_confined_identity_and_egress() {
         if pr_guest {
         // A failed encoder must leave the artifact namespace untouched.
         let failure = succeeded(exec_job(&api, &token, "set -eu; d=$(mktemp -d /home/jail/failed-encode.XXXXXX); printf '#!/bin/sh\\necho FORCED_ENCODER_FAILURE >&2\\nexit 42\\n' > \"$d/ffmpeg\"; chmod +x \"$d/ffmpeg\"; code=0; PATH=\"$d:/usr/local/bin:/usr/bin:/bin\" record-cdp rejected || code=$?; rm -rf \"$d\"; test \"$code\" -ne 0; echo ENCODE_FAILED").await);
+        assert_capture_seconds(&failure);
         assert_eq!(failure["stdout"].as_str().unwrap().lines().last(), Some("ENCODE_FAILED"));
         assert!(failure["stderr"].as_str().unwrap().contains("FORCED_ENCODER_FAILURE"), "the encode, not capture, must be the failing step: {failure}");
         let files = list_artifacts(&api, &token).await;
@@ -218,6 +219,7 @@ async fn jail_vmm_has_no_new_privileges_and_confined_identity_and_egress() {
         };
         assert!(polls > 1, "artifact listing must be sampled during capture and encode");
         println!("encode stdout: {}", result["stdout"]);
+        assert_capture_seconds(&result);
         assert!(result["stdout"].as_str().unwrap().contains("published /artifacts/proof.mp4"));
         let files = list_artifacts(&api, &token).await;
         let movie = files.iter().find(|f| f["path"] == "proof.mp4").unwrap();
@@ -248,6 +250,7 @@ async fn jail_vmm_has_no_new_privileges_and_confined_identity_and_egress() {
         assert!(error / (first.len() as u64) < 12, "PNG must match the first video frame despite lossy H.264");
         let prior_hash = movie["sha256"].clone();
         let duplicate = exec_job(&api, &token, "record-cdp proof").await;
+        assert_capture_seconds(&duplicate);
         assert_eq!(duplicate["outcome"], "executed");
         assert_ne!(duplicate["exitCode"], 0, "existing artifact must not be overwritten");
         assert!(duplicate["stderr"].as_str().unwrap().contains("FileExistsError"), "the existing name, not capture, must cause refusal: {duplicate}");
@@ -287,6 +290,20 @@ fn succeeded(result: Value) -> Value {
     assert_eq!(result["exitCode"], 0, "{result}");
     result
 }
+fn assert_capture_seconds(result: &Value) {
+    let elapsed: u64 = result["stdout"]
+        .as_str()
+        .unwrap()
+        .lines()
+        .find_map(|line| line.strip_prefix("CDP_CAPTURE_ELAPSED_MS="))
+        .expect("record-cdp must report wall-clock capture time")
+        .parse()
+        .unwrap();
+    assert!(
+        elapsed >= 30_000,
+        "30 frames must span at least 30 seconds: {elapsed}ms"
+    );
+}
 async fn submit(api: &reqwest::Client, token: &str, script: &str) -> reqwest::Response {
     api.post("http://127.0.0.1:8080/exec")
         .bearer_auth(token)
@@ -302,12 +319,12 @@ async fn exec_raw(api: &reqwest::Client, token: &str, script: &str) -> Value {
 }
 async fn exec_job(api: &reqwest::Client, token: &str, script: &str) -> Value {
     let response = submit(api, token, script).await;
-    assert_eq!(
-        response.status(),
-        202,
-        "a 30-second recording must outlive the 25-second response deadline"
-    );
+    let status = response.status();
     let pending: Value = response.json().await.unwrap();
+    assert_eq!(
+        status, 202,
+        "a 30-second recording must outlive the 25-second response deadline: {pending}"
+    );
     assert_eq!(pending["outcome"], "unknown", "{pending}");
     let job = format!(
         "http://127.0.0.1:8080/jobs/{}",

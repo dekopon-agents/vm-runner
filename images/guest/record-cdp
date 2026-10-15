@@ -23,11 +23,12 @@ const path = require('node:path');
       document.querySelector('h1').textContent = `CDP proof frame ${++n}`;
     }, 1000);
   });
+  const started = performance.now();
   await new Promise((resolve, reject) => {
     const limit = setTimeout(() => reject(new Error(`screencast stalled at ${count}/30 frames`)), 55000);
     cdp.on('Page.screencastFrame', async ({data, sessionId}) => {
       try {
-        if (count < 30) {
+        if (count < 30 && performance.now() - started >= (count + 1) * 1000) {
           fs.writeFileSync(path.join(process.argv[2], `frame${String(count++).padStart(2,'0')}.png`), Buffer.from(data, 'base64'));
         }
         await cdp.send('Page.screencastFrameAck', {sessionId});
@@ -36,6 +37,7 @@ const path = require('node:path');
     });
     cdp.send('Page.startScreencast', {format:'png', everyNthFrame:1}).catch(reject);
   });
+  console.log(`CDP_CAPTURE_ELAPSED_MS=${Math.round(performance.now() - started)}`);
   await cdp.send('Page.stopScreencast');
   await page.evaluate(() => clearInterval(window.recordTimer));
   await cdp.detach();

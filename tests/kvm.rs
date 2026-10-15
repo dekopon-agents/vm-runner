@@ -290,7 +290,38 @@ fn succeeded(result: Value) -> Value {
     assert_eq!(result["exitCode"], 0, "{result}");
     result
 }
+fn valid_frame_cadence(frames: &[u64]) -> bool {
+    frames.len() == 30
+        && frames[0] >= 1000
+        && frames[29] >= 29_000
+        && frames
+            .windows(2)
+            .all(|pair| pair[1].checked_sub(pair[0]).is_some_and(|gap| gap >= 500))
+}
+#[test]
+fn frame_cadence_rejects_bursts_and_missing_span() {
+    let good: Vec<u64> = (1..=30).map(|n| n * 1000).collect();
+    assert!(valid_frame_cadence(&good));
+    let burst: Vec<u64> = (0..30).map(|n| 30_000 + n * 10).collect();
+    assert!(!valid_frame_cadence(&burst));
+    assert!(!valid_frame_cadence(&good[..29]));
+    let too_short: Vec<u64> = (1..=30).map(|n| n * 500).collect();
+    assert!(!valid_frame_cadence(&too_short));
+}
 fn assert_capture_seconds(result: &Value) {
+    let frames: Vec<u64> = result["stdout"]
+        .as_str()
+        .unwrap()
+        .lines()
+        .find_map(|line| line.strip_prefix("CDP_FRAME_ELAPSED_MS="))
+        .expect("record-cdp must report accepted frame timestamps")
+        .split(',')
+        .map(|ms| ms.parse().unwrap())
+        .collect();
+    assert!(
+        valid_frame_cadence(&frames),
+        "30 spaced frames must span capture: {frames:?}"
+    );
     let elapsed: u64 = result["stdout"]
         .as_str()
         .unwrap()

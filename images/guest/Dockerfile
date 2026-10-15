@@ -71,6 +71,6 @@ RUN setpriv --reuid=1000 --regid=1000 --clear-groups \
 COPY toolkit-smoke.sh /tmp/toolkit-smoke.sh
 RUN --network=none setpriv --reuid=1000 --regid=1000 --clear-groups \
     env -i HOME=/home/jail PATH=/usr/local/bin:/usr/bin:/bin sh /tmp/toolkit-smoke.sh \
-    && rm /tmp/toolkit-smoke.sh
+    && rm /tmp/toolkit-smoke.sh /opt/pi/sse-smoke.cjs /home/jail/.pi-proxy/response.sse
 WORKDIR /home/jail
 ENTRYPOINT ["/sbin/vm-init"]

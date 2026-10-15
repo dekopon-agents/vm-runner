@@ -193,14 +193,19 @@ async fn jail_vmm_has_no_new_privileges_and_confined_identity_and_egress() {
         let bearer = token.clone();
         let mut recording = tokio::spawn(async move { succeeded(exec_job(&runner, &bearer, "record-cdp proof").await) });
         let mut polls = 0;
+        let started = std::time::Instant::now();
         let result = loop {
             tokio::select! {
                 biased;
                 result = &mut recording => break result.unwrap(),
                 _ = tokio::time::sleep(Duration::from_millis(200)) => {
-                    if recording.is_finished() { continue; }
+                    // The successful job must return 202 after 25 s. Samples within
+                    // 20 s of submission are therefore confirmed in-flight; do not
+                    // assert on a listing fetched after the job may have finished.
+                    if started.elapsed() >= Duration::from_secs(20) || recording.is_finished() { continue; }
                     let files = list_artifacts(&api, &token).await;
-                    assert!(!files.iter().any(|f| f["path"] == "proof.mp4" || f["path"] == "proof.png"), "unfinished recording became visible: {files:?}");
+                    if started.elapsed() >= Duration::from_secs(20) || recording.is_finished() { continue; }
+                    assert!(!files.iter().any(|f| f["path"] == "proof.mp4" || f["path"] == "proof.png"), "in-flight recording became visible: {files:?}");
                     polls += 1;
                 }
             }

@@ -140,6 +140,22 @@ async fn jail_vmm_has_no_new_privileges_and_confined_identity_and_egress() {
         assert_eq!((seen.path.as_str(), seen.subjects.as_slice(), seen.model.as_str(), seen.admitted), ("/v1/messages", ["test:kvm-vm".to_owned()].as_slice(), "claude-opus", true));
         assert_eq!(received_models.upstream_calls(), 1);
         if pr_guest {
+            let pre_pi_script = "printf '#!/bin/sh\\nexec /usr/local/bin/chromium \"$@\" 2>>/tmp/chromium.stderr\\n' > /tmp/chromium-logged; chmod +x /tmp/chromium-logged; BROWSE_CHROMIUM=/tmp/chromium-logged browse open about:blank";
+            let attempt = tokio::time::timeout(Duration::from_secs(20), api.post("http://127.0.0.1:8080/exec")
+                .bearer_auth(&token)
+                .json(&json!({"argv":["/bin/sh","-c",pre_pi_script],"deadlineMs":25000}))
+                .send()).await;
+            let pre_pi_ready = match attempt {
+                Ok(Ok(response)) => {
+                    let status = response.status();
+                    let body: Value = response.json().await.unwrap_or_default();
+                    println!("pre-pi browse open about:blank (HTTP {status}): {body}");
+                    status == 200 && body["outcome"] == "executed" && body["exitCode"] == 0
+                }
+                Ok(Err(error)) => { println!("pre-pi browse open about:blank transport error: {error}"); false }
+                Err(_) => { println!("pre-pi browse open about:blank timed out after 20 s"); false }
+            };
+            if !pre_pi_ready { browser_diagnostic(&api, &token).await; }
             let result = exec(&api, &token, "pi --no-session --no-tools --no-mcp --provider vm-proxy --model sol --print 'Reply CANNED_SOL_OK exactly'").await;
             println!("child stdout: {}", result["stdout"]);
             assert!(result["stdout"].as_str().unwrap().contains("CANNED_SOL_OK"));

@@ -188,13 +188,16 @@ async fn jail_vmm_has_no_new_privileges_and_confined_identity_and_egress() {
         assert!(tokio::fs::read_to_string("/run/vm-runner/console/serial.log").await.unwrap().contains("Run /sbin/vm-init as init process"));
         if pr_guest {
         // Warm the current proof tab before any capture; browse can report a first-CDP timeout.
-        let proof_page = "browse open 'data:text/html,<title>CDP proof</title><body style=\"background:#174b72;color:white\"><p>CDP proof without heading</p></body>'";
+        let proof_page = "printf '#!/bin/sh\\nexec /usr/local/bin/chromium \"$@\" 2>>/tmp/chromium.stderr\\n' > /tmp/chromium-logged; chmod +x /tmp/chromium-logged; BROWSE_CHROMIUM=/tmp/chromium-logged browse open 'data:text/html,<title>CDP proof</title><body style=\"background:#174b72;color:white\"><p>CDP proof without heading</p></body>'";
         let mut ready = false;
         for attempt in 1..=6 {
             let response = tokio::time::timeout(Duration::from_secs(20), exec_raw(&api, &token, proof_page)).await.expect("browse readiness attempt exceeded 20 seconds");
             println!("browser readiness attempt {attempt}: {response}");
             if response["outcome"] == "executed" && response["exitCode"] == 0 { ready = true; break; }
             if attempt < 6 { tokio::time::sleep(Duration::from_secs(2)).await; }
+        }
+        if !ready {
+            browser_diagnostic(&api, &token).await;
         }
         assert!(ready, "browser failed six bounded readiness attempts");
         assert_eq!(exec(&api, &token, "browse eval \"document.querySelector('h1') === null\"").await["stdout"], "true\n", "proof tab must have no heading");
@@ -417,6 +420,88 @@ async fn exec_job(api: &reqwest::Client, token: &str, script: &str) -> Value {
     })
     .await
     .expect("job did not finish within 120 s of its 202")
+}
+const BROWSER_DIAGNOSTIC: &str = r#"
+echo '== memory'
+grep -E '^(MemTotal|MemFree|MemAvailable|Cached|Shmem|AnonPages|Committed_AS):' /proc/meminfo
+grep -E '^(oom_kill|pgmajfault) ' /proc/vmstat
+df -k /tmp /dev/shm
+echo '== targets'
+curl -s --max-time 3 http://127.0.0.1:9222/json/list
+echo
+echo '== connectOverCDP with DEBUG=pw:protocol'
+DEBUG=pw:protocol timeout 12 node -e 'require("/opt/playwright/node_modules/playwright").chromium.connectOverCDP("http://127.0.0.1:9222",{timeout:8000}).then(b=>{console.log("CDP_DIAG connected pages="+b.contexts()[0].pages().length);process.exit(0)},e=>{console.log("CDP_DIAG "+e.message);process.exit(1)})' 2>&1 | tail -c 8000
+echo '== chromium stderr'
+tail -c 8000 /tmp/chromium.stderr
+echo '== processes: pid state ppid rss_kB cpu_s cmd type'
+for d in /proc/[0-9]*; do
+  s=$(sed 's/^.*) //' "$d/stat" 2>/dev/null) || continue
+  c=$(tr '\0' ' ' < "$d/cmdline" 2>/dev/null | cut -c1-48)
+  t=$(tr '\0' '\n' < "$d/cmdline" 2>/dev/null | grep -m1 -- '^--type=')
+  echo "${d#/proc/} $(echo "$s" | awk '{print $1, $2, $22*4, ($12+$13)/100}') $c $t"
+done
+echo '== chrome threads: comm:state, then tid:wchan'
+for d in /proc/[0-9]*; do
+  grep -qa chrome "$d/cmdline" 2>/dev/null || continue
+  echo "pid ${d#/proc/}: $(awk '{sub(/^[^(]*\(/, ""); n = index($0, ") "); printf " %s:%s", substr($0, 1, n - 1), substr($0, n + 2, 1)}' "$d"/task/*/stat | cut -c1-1500)"
+  echo "  $(grep -H . "$d"/task/*/wchan 2>/dev/null | sed 's|.*/task/||; s|/wchan:|:|' | tr '\n' ' ' | cut -c1-1500)"
+done
+"#;
+async fn browser_diagnostic(api: &reqwest::Client, token: &str) {
+    let response = submit(api, token, BROWSER_DIAGNOSTIC).await;
+    let status = response.status();
+    let mut view: Value = response.json().await.unwrap_or_default();
+    if status == 202 {
+        let job = format!(
+            "http://127.0.0.1:8080/jobs/{}",
+            view["jobId"].as_str().unwrap_or_default()
+        );
+        for _ in 0..60 {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let Ok(response) = api.get(&job).bearer_auth(token).send().await else {
+                break;
+            };
+            view = response.json().await.unwrap_or_default();
+            if view["state"] != "running" {
+                break;
+            }
+        }
+    }
+    println!(
+        "browser diagnostic (HTTP {status}, outcome {}):\n{}\n== diagnostic stderr\n{}",
+        view["outcome"],
+        view["stdout"].as_str().unwrap_or_default(),
+        view["stderr"].as_str().unwrap_or_default()
+    );
+    let console = tokio::fs::read_to_string("/run/vm-runner/console/serial.log")
+        .await
+        .unwrap_or_default();
+    let flagged: Vec<&str> = console
+        .lines()
+        .filter(|line| {
+            let line = line.to_ascii_lowercase();
+            [
+                "oom",
+                "out of memory",
+                "killed process",
+                "segfault",
+                "traps:",
+                "blocked for more than",
+            ]
+            .iter()
+            .any(|needle| line.contains(needle))
+        })
+        .collect();
+    println!(
+        "guest console flagged lines ({}):\n{}",
+        flagged.len(),
+        flagged[flagged.len().saturating_sub(80)..].join("\n")
+    );
+    let lines: Vec<&str> = console.lines().collect();
+    println!(
+        "guest console tail:\n{}",
+        lines[lines.len().saturating_sub(30)..].join("\n")
+    );
 }
 async fn list_artifacts(api: &reqwest::Client, token: &str) -> Vec<Value> {
     api.get("http://127.0.0.1:8080/artifacts")

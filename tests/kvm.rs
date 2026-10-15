@@ -238,7 +238,7 @@ async fn jail_vmm_has_no_new_privileges_and_confined_identity_and_egress() {
         // Record the current tab and compare every observed artifact to final content.
         let runner = api.clone();
         let bearer = token.clone();
-        let mut recording = tokio::spawn(async move { succeeded(exec_job(&runner, &bearer, "record-cdp proof").await) });
+        let mut recording = tokio::spawn(async move { succeeded(exec_job(&runner, &bearer, "set -eu; record-cdp proof; group=$(sed -n 's/^0:://p' /proc/self/cgroup); case \"$group\" in /exec-[0-9]*) :;; *) echo \"unexpected exec cgroup: $group\" >&2; exit 1;; esac; peak_file=\"/sys/fs/cgroup$group/memory.peak\"; test -r \"$peak_file\" || { echo \"missing encode exec cgroup peak: $peak_file\" >&2; exit 1; }; printf 'EXEC_MEMORY_PEAK_BYTES=%s\\n' \"$(cat \"$peak_file\")\"").await) });
         let mut polls = 0;
         let mut sampled = Vec::new();
         let result = loop {
@@ -254,8 +254,11 @@ async fn jail_vmm_has_no_new_privileges_and_confined_identity_and_egress() {
         };
         assert!(polls > 1, "artifact listing must be sampled during capture and encode");
         println!("encode stdout: {}", result["stdout"]);
-        let peak = result["memoryPeakBytes"].as_u64().expect("recording/encode job must report its cgroup memoryPeakBytes");
-        assert!(peak > 0, "recording/encode job cgroup memoryPeakBytes must be non-zero: {result}");
+        let peak: u64 = result["stdout"].as_str().unwrap().lines()
+            .find_map(|line| line.strip_prefix("EXEC_MEMORY_PEAK_BYTES="))
+            .expect("recording/encode exec must print its own cgroup memory.peak")
+            .parse().expect("encode exec memory.peak must be an integer");
+        assert!(peak > 0, "recording/encode exec cgroup memory.peak must be non-zero: {result}");
         assert_capture_seconds(&result);
         assert!(result["stdout"].as_str().unwrap().contains("published /artifacts/proof.mp4"));
         let files = list_artifacts(&api, &token).await;
@@ -439,10 +442,13 @@ async fn exec_job(api: &reqwest::Client, token: &str, script: &str) -> Value {
             assert_eq!(response.status(), 200, "job outcome must be known");
             let view: Value = response.json().await.unwrap();
             if view["state"] != "running" {
-                println!(
-                    "{script}: job {job} finished: {} memoryPeakBytes={}",
-                    view["outcome"], view["memoryPeakBytes"]
-                );
+                println!("{script}: job {job} finished: {}", view["outcome"]);
+                if let Some(peak) = view["stdout"].as_str().and_then(|out| {
+                    out.lines()
+                        .find(|line| line.starts_with("EXEC_MEMORY_PEAK_BYTES="))
+                }) {
+                    println!("{script}: job {job} {peak}");
+                }
                 return view;
             }
         }

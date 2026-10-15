@@ -735,11 +735,13 @@ struct ModelRequest {
     headers: hyper::HeaderMap,
     client_cert: Vec<u8>,
     trailers: Option<hyper::HeaderMap>,
+    admitted: bool,
 }
 async fn model_upstream(
     listener: TcpListener,
     server: Arc<ServerConfig>,
     count: usize,
+    model_calls: Arc<std::sync::atomic::AtomicUsize>,
 ) -> Vec<ModelRequest> {
     let mut received = Vec::new();
     for _ in 0..count {
@@ -751,38 +753,61 @@ async fn model_upstream(
         let client_cert = tls.get_ref().1.peer_certificates().unwrap()[0].to_vec();
         let seen = Arc::new(Mutex::new(None));
         let record = Arc::clone(&seen);
+        let calls = Arc::clone(&model_calls);
         hyper::server::conn::http1::Builder::new()
             .keep_alive(false)
             .serve_connection(
                 TokioIo::new(tls),
                 service_fn(move |req: Request<Incoming>| {
                     let record = Arc::clone(&record);
+                    let calls = Arc::clone(&calls);
                     async move {
                         let (parts, body) = req.into_parts();
                         let collected = body.collect().await.unwrap();
+                        let admitted = parts
+                            .headers
+                            .get_all(models::SUBJECT_HEADER)
+                            .iter()
+                            .collect::<Vec<_>>()
+                            == ["dekopon:gylmar-vm"];
                         *record.lock().unwrap() = Some((
                             parts.uri.to_string(),
                             parts.headers,
                             collected.trailers().cloned(),
+                            admitted,
                         ));
-                        Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(b"model"))))
+                        if admitted {
+                            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        }
+                        let mut response =
+                            Response::new(Full::new(Bytes::from_static(if admitted {
+                                b"model"
+                            } else {
+                                b"denied"
+                            })));
+                        if !admitted {
+                            *response.status_mut() = StatusCode::FORBIDDEN;
+                        }
+                        Ok::<_, Infallible>(response)
                     }
                 }),
             )
             .await
             .unwrap();
-        let (path, headers, trailers) = seen.lock().unwrap().take().unwrap();
+        let (path, headers, trailers, admitted) = seen.lock().unwrap().take().unwrap();
         received.push(ModelRequest {
             path,
             headers,
             client_cert,
             trailers,
+            admitted,
         });
     }
     received
 }
 const FORGED: &str =
     "x-dekopon-vm-subject: dekopon:forged\r\nX-Dekopon-VM-Subject: dekopon:forged-too\r\n";
+const GUEST_TOKEN: &str = "synthetic-guest-credential-12345";
 #[tokio::test]
 async fn models_route_forwards_one_jail_session_and_subject_without_guest_trailer_identity() {
     let pki = ModelPki::new();
@@ -791,7 +816,13 @@ async fn models_route_forwards_one_jail_session_and_subject_without_guest_traile
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     // The fourth request runs after the client certificate rotates on disk.
-    let peer = tokio::spawn(model_upstream(listener, pki.server(), 4));
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let peer = tokio::spawn(model_upstream(
+        listener,
+        pki.server(),
+        4,
+        Arc::clone(&calls),
+    ));
     let route = models::Route::new(
         &format!("https://localhost:{port}"),
         "dekopon:gylmar-vm",
@@ -822,7 +853,7 @@ async fn models_route_forwards_one_jail_session_and_subject_without_guest_traile
 
     let request = |path: &str| {
         format!(
-            "POST {path} HTTP/1.1\r\nHost: models.vm.internal\r\n{FORGED}x-dekopon-vm-session: forged-header\r\nauthorization: Bearer vm\r\nTransfer-Encoding: chunked\r\nTrailer: x-dekopon-vm-session, x-dekopon-vm-subject, x-checksum\r\nConnection: close\r\n\r\n2\r\n{{}}\r\n0\r\nx-dekopon-vm-session: forged-trailer\r\nx-dekopon-vm-subject: dekopon:forged-trailer\r\nx-checksum: kept\r\n\r\n"
+            "POST {path} HTTP/1.1\r\nHost: models.vm.internal\r\n{FORGED}x-dekopon-vm-session: forged-header\r\nauthorization: Bearer {GUEST_TOKEN}\r\nTransfer-Encoding: chunked\r\nTrailer: x-dekopon-vm-session, x-dekopon-vm-subject, x-checksum\r\nConnection: close\r\n\r\n2\r\n{{}}\r\n0\r\nx-dekopon-vm-session: forged-trailer\r\nx-dekopon-vm-subject: dekopon:forged-trailer\r\nx-checksum: kept\r\n\r\n"
         )
     };
     // SNI on the gateway's :443.
@@ -831,10 +862,10 @@ async fn models_route_forwards_one_jail_session_and_subject_without_guest_traile
         .connect(ServerName::try_from(models::HOST).unwrap(), stream)
         .await
         .unwrap();
-    assert_eq!(
-        exchange(tls, &request("/v1/messages?mode=verify")).await,
-        (200, "model".into())
-    );
+    let (status, guest_body) = exchange(tls, &request("/v1/messages?mode=verify")).await;
+    assert_eq!(status, 200);
+    assert!(!guest_body.contains(GUEST_TOKEN));
+    assert_eq!(guest_body, "model");
     // Origin-form Host on :80.
     let stream = TcpStream::connect(gateway.proxy.addr).await.unwrap();
     assert_eq!(
@@ -901,14 +932,18 @@ async fn models_route_forwards_one_jail_session_and_subject_without_guest_traile
         assert!(request.trailers.is_none());
         assert_eq!(request.headers[header::HOST], format!("localhost:{port}"));
         // The guest's token is left for dekopon-gatewayd to drop; the jail adds no credential.
-        assert_eq!(request.headers[header::AUTHORIZATION], "Bearer vm");
+        assert_eq!(
+            request.headers[header::AUTHORIZATION],
+            format!("Bearer {GUEST_TOKEN}")
+        );
     }
     assert!(received[..3].iter().all(|r| r.client_cert == first));
     assert_eq!(received[3].client_cert, second);
     assert_ne!(first, second);
     assert_eq!(received.len(), 4);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 4);
 
-    let spans = gateway.proxy.finish().await;
+    let (spans, logs) = gateway.proxy.finish_with_logs().await;
     // Four forwarded requests plus the CONNECT envelope.
     assert_eq!(
         spans
@@ -921,11 +956,56 @@ async fn models_route_forwards_one_jail_session_and_subject_without_guest_traile
         spans.iter().filter(|s| s.name == "egress.connect").count(),
         4
     );
-    assert!(
-        spans.iter().flat_map(|s| &s.attributes).all(|kv| {
-            kv.value != "forged-header".into() && kv.value != "forged-trailer".into()
-        })
+    assert!(spans.iter().flat_map(|s| &s.attributes).all(|kv| {
+        !matches!(&kv.value, opentelemetry::Value::String(text) if text.as_str().contains(GUEST_TOKEN))
+            && kv.value != "forged-header".into() && kv.value != "forged-trailer".into()
+    }));
+    assert!(logs.iter().all(|log| {
+        !log.record.attributes_iter().any(|(_, value)| matches!(value, opentelemetry::logs::AnyValue::String(text) if text.as_str().contains(GUEST_TOKEN)))
+            && !matches!(log.record.body(), Some(opentelemetry::logs::AnyValue::String(text)) if text.as_str().contains(GUEST_TOKEN))
+    }));
+}
+#[tokio::test]
+async fn unmapped_model_subject_is_denied_before_a_model_call() {
+    let pki = ModelPki::new();
+    let dir = tempfile::tempdir().unwrap();
+    pki.client(dir.path());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let peer = tokio::spawn(model_upstream(
+        listener,
+        pki.server(),
+        1,
+        Arc::clone(&calls),
+    ));
+    let route = models::Route::new(
+        &format!("https://localhost:{port}"),
+        "test:unmapped",
+        "019591f2-439b-7000-8000-000000000001",
+        dir.path().to_owned(),
+    )
+    .unwrap();
+    let gateway = Gateway::with_models(
+        local_egress(),
+        [IpAddr::V4(Ipv4Addr::LOCALHOST)].into(),
+        Some(route),
+    )
+    .await;
+    let stream = TcpStream::connect(gateway.proxy.addr).await.unwrap();
+    let body = r#"{"model":"claude-opus"}"#;
+    let request = format!(
+        "POST /v1/messages HTTP/1.1\r\nHost: models.vm.internal\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
     );
+    assert_eq!(exchange(stream, &request).await, (403, "denied".into()));
+    let seen = peer.await.unwrap();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].path, "/v1/messages");
+    assert_eq!(seen[0].headers[models::SUBJECT_HEADER], "test:unmapped");
+    assert!(!seen[0].admitted);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    gateway.proxy.finish().await;
 }
 #[tokio::test]
 async fn models_name_is_refused_without_a_route_and_its_header_never_leaves_for_other_hosts() {

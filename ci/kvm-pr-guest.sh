@@ -39,4 +39,4 @@ docker run --rm --user 0:0 --group-add 1000 --cap-drop ALL \
   --sysctl net.ipv6.conf.default.disable_ipv6=0 \
   --tmpfs /run/vm-runner:rw,gid=1000,mode=2770 \
   -v "$RUNNER_TEMP/images:/images:ro" -v "$PWD:$PWD:ro" -w "$PWD" \
-  -e KVM_GUEST_IMAGE --entrypoint "$(cat "$RUNNER_TEMP/kvm-executable")" vm-runner:kvm --nocapture
+  -e KVM_GUEST_IMAGE -e KVM_PR_GUEST=1 --entrypoint "$(cat "$RUNNER_TEMP/kvm-executable")" vm-runner:kvm --nocapture

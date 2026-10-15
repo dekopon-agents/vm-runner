@@ -58,8 +58,11 @@ async fn jail_vmm_has_no_new_privileges_and_confined_identity_and_egress() {
         serde_yaml_ng::from_str(include_str!("../examples/vm-runner.yaml")).unwrap();
     value["profiles"]["travel"]["image"] = std::env::var("KVM_GUEST_IMAGE").unwrap().into();
     value["profiles"]["travel"]["egress"]["allow"] = json!(["example.com"]);
-    value["shapes"]["proof-1c512m"] = json!({"vcpus":1,"memoryMiB":512,"diskMiB":4096});
-    value["profiles"]["travel"]["shape"] = json!("proof-1c512m");
+    let pr_guest = std::env::var("KVM_PR_GUEST").as_deref() == Ok("1");
+    if pr_guest {
+        value["shapes"]["proof-1c512m"] = json!({"vcpus":1,"memoryMiB":512,"diskMiB":4096});
+        value["profiles"]["travel"]["shape"] = json!("proof-1c512m");
+    }
     value["auth"]["issuers"] = json!([{"issuer":issuer}]);
     let (models, received_models) = model_upstream().await;
     peers.spawn(models);
@@ -136,20 +139,22 @@ async fn jail_vmm_has_no_new_privileges_and_confined_identity_and_egress() {
         let seen = received_models.requests.lock().await.recv().await.unwrap();
         assert_eq!((seen.path.as_str(), seen.subjects.as_slice(), seen.model.as_str(), seen.admitted), ("/v1/messages", ["test:kvm-vm".to_owned()].as_slice(), "claude-opus", true));
         assert_eq!(received_models.upstream_calls(), 1);
-        let result = exec(&api, &token, "pi --no-session --no-tools --no-mcp --provider vm-proxy --model sol --print 'Reply CANNED_SOL_OK exactly'").await;
-        println!("child stdout: {}", result["stdout"]);
-        assert!(result["stdout"].as_str().unwrap().contains("CANNED_SOL_OK"));
-        let seen = received_models.requests.lock().await.recv().await.unwrap();
-        assert_eq!((seen.path.as_str(), seen.subjects.as_slice(), seen.model.as_str(), seen.admitted), ("/v1/responses", ["test:kvm-vm".to_owned()].as_slice(), "sol", true));
-        assert_eq!(seen.authorization.as_deref(), Some("Bearer guest-no-credential"), "child must send only the baked non-secret key");
-        assert_eq!(received_models.upstream_calls(), 2);
+        if pr_guest {
+            let result = exec(&api, &token, "pi --no-session --no-tools --no-mcp --provider vm-proxy --model sol --print 'Reply CANNED_SOL_OK exactly'").await;
+            println!("child stdout: {}", result["stdout"]);
+            assert!(result["stdout"].as_str().unwrap().contains("CANNED_SOL_OK"));
+            let seen = received_models.requests.lock().await.recv().await.unwrap();
+            assert_eq!((seen.path.as_str(), seen.subjects.as_slice(), seen.model.as_str(), seen.admitted), ("/v1/responses", ["test:kvm-vm".to_owned()].as_slice(), "sol", true));
+            assert_eq!(seen.authorization.as_deref(), Some("Bearer guest-no-credential"), "child must send only the baked non-secret key");
+            assert_eq!(received_models.upstream_calls(), 2);
+        }
         let denied = exec(&api, &token, "curl --silent --show-error --http1.1 --max-time 15 -w '\\n%{http_code}' -H 'authorization: Bearer guest-no-credential' -H 'content-type: application/json' -d '{\"model\":\"unlisted\",\"stream\":true,\"input\":\"deny\"}' https://models.vm.internal/v1/responses").await;
         let (body, status) = denied["stdout"].as_str().unwrap().rsplit_once('\n').unwrap();
         assert_eq!(status, "403");
         assert_eq!(serde_json::from_str::<Value>(body).unwrap()["error"]["code"], "permission_denied");
         let seen = received_models.requests.lock().await.recv().await.unwrap();
         assert_eq!((seen.path.as_str(), seen.subjects.as_slice(), seen.model.as_str(), seen.admitted), ("/v1/responses", ["test:kvm-vm".to_owned()].as_slice(), "unlisted", false));
-        assert_eq!(received_models.upstream_calls(), 2, "a model outside the subject's grant must make zero upstream calls");
+        assert_eq!(received_models.upstream_calls(), if pr_guest { 2 } else { 1 }, "a model outside the subject's grant must make zero upstream calls");
         assert!(received_models.requests.lock().await.try_recv().is_err());
         exec(&api, &token, "mkdir -p /artifacts/nested; printf hello > /artifacts/nested/test.txt").await;
         let files: Value = api.get("http://127.0.0.1:8080/artifacts").bearer_auth(&token).send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
@@ -181,6 +186,7 @@ async fn jail_vmm_has_no_new_privileges_and_confined_identity_and_egress() {
         assert_eq!(exec(&api, &token, &script).await["stdout"], "NEGATIVE_OK\n");
         assert!(dropped().await > before, "negative packets must reach tap0's actual nft drop rule");
         assert!(tokio::fs::read_to_string("/run/vm-runner/console/serial.log").await.unwrap().contains("Run /sbin/vm-init as init process"));
+        if pr_guest {
         // A failed encoder must leave the artifact namespace untouched.
         let failure = succeeded(exec_job(&api, &token, "set -eu; d=$(mktemp -d /home/jail/failed-encode.XXXXXX); printf '#!/bin/sh\\necho FORCED_ENCODER_FAILURE >&2\\nexit 42\\n' > \"$d/ffmpeg\"; chmod +x \"$d/ffmpeg\"; code=0; PATH=\"$d:/usr/local/bin:/usr/bin:/bin\" record-cdp rejected || code=$?; rm -rf \"$d\"; test \"$code\" -ne 0; echo ENCODE_FAILED").await);
         assert_eq!(failure["stdout"].as_str().unwrap().lines().last(), Some("ENCODE_FAILED"));
@@ -248,6 +254,7 @@ async fn jail_vmm_has_no_new_privileges_and_confined_identity_and_egress() {
         let after = list_artifacts(&api, &token).await;
         assert_eq!(after.iter().find(|f| f["path"] == "proof.mp4").unwrap()["sha256"], prior_hash);
         assert_eq!(read_artifact(&api, &token, after.iter().find(|f| f["path"] == "proof.mp4").unwrap()).await, movie_bytes);
+        }
         pid
     }).await;
     nix::sys::signal::kill(

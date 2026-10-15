@@ -188,7 +188,7 @@ async fn jail_vmm_has_no_new_privileges_and_confined_identity_and_egress() {
         assert!(tokio::fs::read_to_string("/run/vm-runner/console/serial.log").await.unwrap().contains("Run /sbin/vm-init as init process"));
         if pr_guest {
         // Warm the current proof tab before any capture; browse can report a first-CDP timeout.
-        let proof_page = "browse open 'data:text/html,<title>CDP proof</title><body style=\"background:#174b72;color:white\"><h1>CDP proof</h1></body>'";
+        let proof_page = "browse open 'data:text/html,<title>CDP proof</title><body style=\"background:#174b72;color:white\"><p>CDP proof without heading</p></body>'";
         let mut ready = false;
         for attempt in 1..=6 {
             let response = tokio::time::timeout(Duration::from_secs(20), exec_raw(&api, &token, proof_page)).await.expect("browse readiness attempt exceeded 20 seconds");
@@ -197,9 +197,11 @@ async fn jail_vmm_has_no_new_privileges_and_confined_identity_and_egress() {
             if attempt < 6 { tokio::time::sleep(Duration::from_secs(2)).await; }
         }
         assert!(ready, "browser failed six bounded readiness attempts");
+        assert_eq!(exec(&api, &token, "browse eval \"document.querySelector('h1') === null\"").await["stdout"], "true\n", "proof tab must have no heading");
         // A failed encoder must leave the artifact namespace untouched.
         let failure = succeeded(exec_job(&api, &token, "set -eu; d=$(mktemp -d /home/jail/failed-encode.XXXXXX); printf '#!/bin/sh\\neval \"out=\\${$#}\"\\nprintf junk > \"$out\"\\necho FORCED_ENCODER_FAILURE >&2\\nexit 42\\n' > \"$d/ffmpeg\"; chmod +x \"$d/ffmpeg\"; code=0; PATH=\"$d:/usr/local/bin:/usr/bin:/bin\" record-cdp rejected || code=$?; rm -rf \"$d\"; test \"$code\" -ne 0; echo ENCODE_FAILED").await);
         assert_capture_seconds(&failure);
+        assert_eq!(exec(&api, &token, "browse eval \"Boolean(document.querySelector('[data-cdp-recording]')?.textContent?.startsWith('CDP proof frame '))\"").await["stdout"], "true\n", "the heading-free tab must receive visible timer activity");
         assert!(failure["stdout"].as_str().unwrap().contains("CDP_FRAME_ELAPSED_MS="), "capture must complete before forced encoder failure: {failure}");
         assert_eq!(failure["stdout"].as_str().unwrap().lines().last(), Some("ENCODE_FAILED"));
         assert!(failure["stderr"].as_str().unwrap().contains("FORCED_ENCODER_FAILURE"), "the encode, not capture, must be the failing step: {failure}");

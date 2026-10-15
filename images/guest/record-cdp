@@ -19,9 +19,13 @@ const path = require('node:path');
   const frameElapsed = [];
   const started = performance.now();
   await page.evaluate(() => {
+    const marker = document.createElement('div');
+    marker.dataset.cdpRecording = 'true';
+    marker.style.cssText = 'position:fixed;top:0;left:0;background:#174b72;color:white;z-index:2147483647';
+    (document.body || document.documentElement).append(marker);
     let n = 0;
     window.recordTimer = setInterval(() => {
-      document.querySelector('h1').textContent = `CDP proof frame ${++n}`;
+      marker.textContent = `CDP proof frame ${++n}`;
     }, 1000);
   });
   await new Promise((resolve, reject) => {

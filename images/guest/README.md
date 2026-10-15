@@ -76,8 +76,9 @@ is cleared: only `vm-proxy/sol` via the existing `models.vm.internal` Responses
 route, with a non-secret dummy key. It does not create a grant: absent model
 routing fails closed, and egress still requires the subject's proxy grant.
 
-Inside a jail, `record-cdp proof` opens Chromium through `browse`, captures 30
-1280×720 PNG frames from CDP `Page.startScreencast` (not screenshots), encodes
+Inside a jail, open a tab first (for example, `browse open 'data:text/html,<p>Capture me</p>'`),
+then run `record-cdp proof` to capture the current tab. It does not open a page itself.
+It captures 30 1280×720 PNG frames from CDP `Page.startScreencast` (not screenshots), encodes
 a 30-second H.264 MP4 with faststart in a private `/scratch/recordings` directory
 and probes it. Each finished file is copied into an unnamed `O_TMPFILE` in
 `/artifacts` and only then linked as `/artifacts/proof.mp4` and `/artifacts/proof.png` (the first

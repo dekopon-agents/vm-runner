@@ -141,7 +141,7 @@ async fn jail_vmm_has_no_new_privileges_and_confined_identity_and_egress() {
         assert_eq!(received_models.upstream_calls(), 1);
         if pr_guest {
             assert_eq!(exec(&api, &token, "cat /proc/sys/vm/overcommit_memory").await["stdout"], "1\n", "V8's x64 CodeRange reservation exceeds the 512 MiB guest's RAM; heuristic overcommit refuses it");
-            let pre_pi_script = "printf '#!/bin/sh\\nexec /usr/local/bin/chromium \"$@\" 2>>/tmp/chromium.stderr\\n' > /tmp/chromium-logged; chmod +x /tmp/chromium-logged; BROWSE_CHROMIUM=/tmp/chromium-logged browse open about:blank";
+            let pre_pi_script = "browse open about:blank";
             let attempt = tokio::time::timeout(Duration::from_secs(20), api.post("http://127.0.0.1:8080/exec")
                 .bearer_auth(&token)
                 .json(&json!({"argv":["/bin/sh","-c",pre_pi_script],"deadlineMs":25000}))
@@ -156,7 +156,11 @@ async fn jail_vmm_has_no_new_privileges_and_confined_identity_and_egress() {
                 Ok(Err(error)) => { println!("pre-pi browse open about:blank transport error: {error}"); false }
                 Err(_) => { println!("pre-pi browse open about:blank timed out after 20 s"); false }
             };
-            if !pre_pi_ready { browser_diagnostic(&api, &token).await; }
+            if !pre_pi_ready {
+                stderr_probe_on_failure(&api, &token, "about:blank").await;
+                browser_diagnostic(&api, &token).await;
+            }
+            assert!(pre_pi_ready, "browse must work before the pi child call");
             let result = exec(&api, &token, "pi --no-session --no-tools --no-mcp --provider vm-proxy --model sol --print 'Reply CANNED_SOL_OK exactly'").await;
             println!("child stdout: {}", result["stdout"]);
             assert!(result["stdout"].as_str().unwrap().contains("CANNED_SOL_OK"));
@@ -205,13 +209,16 @@ async fn jail_vmm_has_no_new_privileges_and_confined_identity_and_egress() {
         assert!(tokio::fs::read_to_string("/run/vm-runner/console/serial.log").await.unwrap().contains("Run /sbin/vm-init as init process"));
         if pr_guest {
         // Warm the current proof tab before any capture; browse can report a first-CDP timeout.
-        let proof_page = "printf '#!/bin/sh\\nexec /usr/local/bin/chromium \"$@\" 2>>/tmp/chromium.stderr\\n' > /tmp/chromium-logged; chmod +x /tmp/chromium-logged; BROWSE_CHROMIUM=/tmp/chromium-logged browse open 'data:text/html,<title>CDP proof</title><body style=\"background:#174b72;color:white\"><p>CDP proof without heading</p></body>'";
+        let proof_page = "browse open 'data:text/html,<title>CDP proof</title><body style=\"background:#174b72;color:white\"><p>CDP proof without heading</p></body>'";
         let mut ready = false;
         for attempt in 1..=6 {
             let response = tokio::time::timeout(Duration::from_secs(20), exec_raw(&api, &token, proof_page)).await.expect("browse readiness attempt exceeded 20 seconds");
             println!("browser readiness attempt {attempt}: {response}");
             if response["outcome"] == "executed" && response["exitCode"] == 0 { ready = true; break; }
             if attempt < 6 { tokio::time::sleep(Duration::from_secs(2)).await; }
+        }
+        if !ready {
+            stderr_probe_on_failure(&api, &token, "data:text/html,<title>CDP proof</title><p>CDP proof without heading</p>").await;
         }
         if !ready {
             browser_diagnostic(&api, &token).await;
@@ -437,6 +444,28 @@ async fn exec_job(api: &reqwest::Client, token: &str, script: &str) -> Value {
     })
     .await
     .expect("job did not finish within 120 s of its 202")
+}
+async fn stderr_probe_on_failure(api: &reqwest::Client, token: &str, url: &str) {
+    let script = format!(
+        "printf '#!/bin/sh\\nexec /usr/local/bin/chromium \"$@\" 2>>/tmp/chromium.stderr\\n' > /tmp/chromium-logged; chmod +x /tmp/chromium-logged; BROWSE_CHROMIUM=/tmp/chromium-logged browse open '{url}'"
+    );
+    let attempt = tokio::time::timeout(
+        Duration::from_secs(20),
+        api.post("http://127.0.0.1:8080/exec")
+            .bearer_auth(token)
+            .json(&json!({"argv":["/bin/sh","-c",script],"deadlineMs":25000}))
+            .send(),
+    )
+    .await;
+    match attempt {
+        Ok(Ok(response)) => {
+            let status = response.status();
+            let body: Value = response.json().await.unwrap_or_default();
+            println!("failure-only Chromium stderr probe (HTTP {status}): {body}");
+        }
+        Ok(Err(error)) => println!("failure-only Chromium stderr probe transport error: {error}"),
+        Err(_) => println!("failure-only Chromium stderr probe timed out after 20 s"),
+    }
 }
 const BROWSER_DIAGNOSTIC: &str = r#"
 echo '== memory'

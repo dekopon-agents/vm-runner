@@ -21,6 +21,9 @@ by scratch, mounts `/artifacts` there for uid 1000, installs system/NSS/Node
 trust, and configures eth0 as 10.0.2.2/30 via 10.0.2.1, then execs Debian's `tini` as
 PID 1 with the agent as its only child. Orphans such as `browse`'s detached Chromium
 reparent to tini, which reaps them; the agent waits only for its own execs.
+Init sets `vm.overcommit_memory=1`: in a 512 MiB guest the default heuristic refuses
+any single mapping larger than RAM, which is what V8's x64 CodeRange reservation is, so every
+Chromium renderer would die at startup. Exhaustion becomes an in-guest OOM kill instead of `ENOMEM`.
 The `jail` user's default Node module and browser-cache paths point at the baked
 Playwright installation; no browser download is needed at exec time.
 

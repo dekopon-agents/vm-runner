@@ -140,6 +140,7 @@ async fn jail_vmm_has_no_new_privileges_and_confined_identity_and_egress() {
         assert_eq!((seen.path.as_str(), seen.subjects.as_slice(), seen.model.as_str(), seen.admitted), ("/v1/messages", ["test:kvm-vm".to_owned()].as_slice(), "claude-opus", true));
         assert_eq!(received_models.upstream_calls(), 1);
         if pr_guest {
+            assert_eq!(exec(&api, &token, "cat /proc/sys/vm/overcommit_memory").await["stdout"], "1\n", "V8's x64 CodeRange reservation exceeds the 512 MiB guest's RAM; heuristic overcommit refuses it");
             let pre_pi_script = "printf '#!/bin/sh\\nexec /usr/local/bin/chromium \"$@\" 2>>/tmp/chromium.stderr\\n' > /tmp/chromium-logged; chmod +x /tmp/chromium-logged; BROWSE_CHROMIUM=/tmp/chromium-logged browse open about:blank";
             let attempt = tokio::time::timeout(Duration::from_secs(20), api.post("http://127.0.0.1:8080/exec")
                 .bearer_auth(&token)
@@ -439,7 +440,9 @@ async fn exec_job(api: &reqwest::Client, token: &str, script: &str) -> Value {
 }
 const BROWSER_DIAGNOSTIC: &str = r#"
 echo '== memory'
-grep -E '^(MemTotal|MemFree|MemAvailable|Cached|Shmem|AnonPages|Committed_AS):' /proc/meminfo
+grep -E '^(MemTotal|MemFree|MemAvailable|Cached|Shmem|AnonPages|CommitLimit|Committed_AS):' /proc/meminfo
+echo "overcommit_memory=$(cat /proc/sys/vm/overcommit_memory) overcommit_ratio=$(cat /proc/sys/vm/overcommit_ratio)"
+grep -E '^Max (address space|data size)' /proc/self/limits
 grep -E '^(oom_kill|pgmajfault) ' /proc/vmstat
 df -k /tmp /dev/shm
 echo '== targets'

@@ -254,6 +254,8 @@ async fn jail_vmm_has_no_new_privileges_and_confined_identity_and_egress() {
         };
         assert!(polls > 1, "artifact listing must be sampled during capture and encode");
         println!("encode stdout: {}", result["stdout"]);
+        let peak = result["memoryPeakBytes"].as_u64().expect("recording/encode job must report its cgroup memoryPeakBytes");
+        assert!(peak > 0, "recording/encode job cgroup memoryPeakBytes must be non-zero: {result}");
         assert_capture_seconds(&result);
         assert!(result["stdout"].as_str().unwrap().contains("published /artifacts/proof.mp4"));
         let files = list_artifacts(&api, &token).await;
@@ -437,7 +439,10 @@ async fn exec_job(api: &reqwest::Client, token: &str, script: &str) -> Value {
             assert_eq!(response.status(), 200, "job outcome must be known");
             let view: Value = response.json().await.unwrap();
             if view["state"] != "running" {
-                println!("{script}: job {job} finished: {}", view["outcome"]);
+                println!(
+                    "{script}: job {job} finished: {} memoryPeakBytes={}",
+                    view["outcome"], view["memoryPeakBytes"]
+                );
                 return view;
             }
         }

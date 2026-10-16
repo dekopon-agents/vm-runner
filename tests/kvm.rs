@@ -228,7 +228,7 @@ async fn jail_vmm_has_no_new_privileges_and_confined_identity_and_egress() {
         // A failed encoder must leave the artifact namespace untouched.
         let failure = succeeded(exec_job(&api, &token, "set -eu; d=$(mktemp -d /home/jail/failed-encode.XXXXXX); printf '#!/bin/sh\\neval \"out=\\${$#}\"\\nprintf junk > \"$out\"\\necho FORCED_ENCODER_FAILURE >&2\\nexit 42\\n' > \"$d/ffmpeg\"; chmod +x \"$d/ffmpeg\"; code=0; PATH=\"$d:/usr/local/bin:/usr/bin:/bin\" record-cdp rejected || code=$?; rm -rf \"$d\"; test \"$code\" -ne 0; echo ENCODE_FAILED").await);
         assert_capture_seconds(&failure);
-        assert_eq!(exec(&api, &token, "browse eval \"Boolean(document.querySelector('[data-cdp-recording]')?.textContent?.startsWith('CDP proof frame '))\"").await["stdout"], "true\n", "the heading-free tab must receive visible timer activity");
+        assert_eq!(exec(&api, &token, "browse eval \"document.querySelector('[data-cdp-recording]') === null\"").await["stdout"], "true\n", "record-cdp must remove its frame counter after capture");
         assert!(failure["stdout"].as_str().unwrap().contains("CDP_FRAME_ELAPSED_MS="), "capture must complete before forced encoder failure: {failure}");
         assert_eq!(failure["stdout"].as_str().unwrap().lines().last(), Some("ENCODE_FAILED"));
         assert!(failure["stderr"].as_str().unwrap().contains("FORCED_ENCODER_FAILURE"), "the encode, not capture, must be the failing step: {failure}");

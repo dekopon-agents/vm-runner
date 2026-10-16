@@ -49,7 +49,7 @@ const path = require('node:path');
   await cdp.send('Page.stopScreencast');
   await page.evaluate(() => {
     clearInterval(window.recordTimer);
-    document.querySelector('[data-cdp-recording]')?.remove();
+    document.querySelectorAll('[data-cdp-recording]').forEach((e) => e.remove());
   });
   await cdp.detach();
   await browser.close();

@@ -321,8 +321,9 @@ In the jail, the DNS stub answers `models.vm.internal`. Requests addressed to it
 origin-form Host or CONNECT skip the allowlist and the address policy. They go to `upstream`
 over mTLS, and the jail rereads the Secret files on every connection, so rotation needs no
 restart. Host is rewritten to the upstream authority and the path is unchanged. The jail sets
-`x-dekopon-vm-subject` to the subject. It strips that header from all guest egress (requests,
-trailers and responses), so a guest can never set it. Guests use
+`x-dekopon-vm-subject` to the subject and `x-dekopon-vm-session` to its launch session (the
+`--session` UUIDv7). It strips both headers from all guest egress (requests, trailers and
+responses), so a guest can never set them. Guests use
 `https://models.vm.internal` (Anthropic) or `https://models.vm.internal/v1` (OpenAI); the
 paths dekopon-gatewayd serves are `/v1/messages`, `/v1/messages/count_tokens`, `/v1/responses` and
 `/v1/chat/completions`. `Jails` denies unknown fields and the jail parses the config the

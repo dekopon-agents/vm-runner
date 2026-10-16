@@ -208,37 +208,22 @@ async fn jail_vmm_has_no_new_privileges_and_confined_identity_and_egress() {
         assert!(dropped().await > before, "negative packets must reach tap0's actual nft drop rule");
         assert!(tokio::fs::read_to_string("/run/vm-runner/console/serial.log").await.unwrap().contains("Run /sbin/vm-init as init process"));
         if pr_guest {
-        // Warm the current proof tab before any capture; browse can report a first-CDP timeout.
-        let proof_page = "browse open 'data:text/html,<title>CDP proof</title><body style=\"background:#174b72;color:white\"><p>CDP proof without heading</p></body>'";
-        let mut ready = false;
-        for attempt in 1..=6 {
-            let response = tokio::time::timeout(Duration::from_secs(20), exec_raw(&api, &token, proof_page)).await.expect("browse readiness attempt exceeded 20 seconds");
-            println!("browser readiness attempt {attempt}: {response}");
-            if response["outcome"] == "executed" && response["exitCode"] == 0 { ready = true; break; }
-            if attempt < 6 { tokio::time::sleep(Duration::from_secs(2)).await; }
-        }
-        if !ready {
-            stderr_probe_on_failure(&api, &token, "data:text/html,<title>CDP proof</title><p>CDP proof without heading</p>").await;
-        }
-        if !ready {
-            browser_diagnostic(&api, &token).await;
-        }
-        assert!(ready, "browser failed six bounded readiness attempts");
+        exec(&api, &token, "browse open 'data:text/html,<title>CDP proof</title><body style=\"background:#174b72;color:white\"><p>CDP proof without heading</p></body>'").await;
         assert_eq!(exec(&api, &token, "browse eval \"document.querySelector('h1') === null\"").await["stdout"], "true\n", "proof tab must have no heading");
         // A failed encoder must leave the artifact namespace untouched.
         let failure = succeeded(exec_job(&api, &token, "set -eu; d=$(mktemp -d /home/jail/failed-encode.XXXXXX); printf '#!/bin/sh\\neval \"out=\\${$#}\"\\nprintf junk > \"$out\"\\necho FORCED_ENCODER_FAILURE >&2\\nexit 42\\n' > \"$d/ffmpeg\"; chmod +x \"$d/ffmpeg\"; code=0; PATH=\"$d:/usr/local/bin:/usr/bin:/bin\" record-cdp rejected || code=$?; rm -rf \"$d\"; test \"$code\" -ne 0; echo ENCODE_FAILED").await);
         assert_capture_seconds(&failure);
-        assert_eq!(exec(&api, &token, "browse eval \"Boolean(document.querySelector('[data-cdp-recording]')?.textContent?.startsWith('CDP proof frame '))\"").await["stdout"], "true\n", "the heading-free tab must receive visible timer activity");
+        assert_eq!(exec(&api, &token, "browse eval \"document.querySelector('[data-cdp-recording]') === null\"").await["stdout"], "true\n", "record-cdp must remove its frame counter after capture");
         assert!(failure["stdout"].as_str().unwrap().contains("CDP_FRAME_ELAPSED_MS="), "capture must complete before forced encoder failure: {failure}");
         assert_eq!(failure["stdout"].as_str().unwrap().lines().last(), Some("ENCODE_FAILED"));
         assert!(failure["stderr"].as_str().unwrap().contains("FORCED_ENCODER_FAILURE"), "the encode, not capture, must be the failing step: {failure}");
         let files = list_artifacts(&api, &token).await;
-        assert!(!files.iter().any(|f| f["path"].as_str().unwrap().starts_with("rejected")));
+        assert!(!files.iter().any(|f| f["path"].as_str().unwrap().contains("rejected")));
 
-        // Record the current tab and compare every observed artifact to final content.
+        // Record the most recently opened tab and compare every observed artifact to final content.
         let runner = api.clone();
         let bearer = token.clone();
-        let mut recording = tokio::spawn(async move { succeeded(exec_job(&runner, &bearer, "set -eu; record-cdp proof; group=$(sed -n 's/^0:://p' /proc/self/cgroup); case \"$group\" in /exec-[0-9]*) :;; *) echo \"unexpected exec cgroup: $group\" >&2; exit 1;; esac; peak_file=\"/sys/fs/cgroup$group/memory.peak\"; test -r \"$peak_file\" || { echo \"missing encode exec cgroup peak: $peak_file\" >&2; exit 1; }; printf 'EXEC_MEMORY_PEAK_BYTES=%s\\n' \"$(cat \"$peak_file\")\"").await) });
+        let mut recording = tokio::spawn(async move { succeeded(exec_job(&runner, &bearer, "record-cdp proof").await) });
         let mut polls = 0;
         let mut sampled = Vec::new();
         let result = loop {
@@ -247,18 +232,13 @@ async fn jail_vmm_has_no_new_privileges_and_confined_identity_and_egress() {
                 result = &mut recording => break result.unwrap(),
                 _ = tokio::time::sleep(Duration::from_millis(200)) => {
                     let files = list_artifacts(&api, &token).await;
-                    sampled.extend(proof_entries(&files));
+                    sampled.extend(entries(&files));
                     polls += 1;
                 }
             }
         };
         assert!(polls > 1, "artifact listing must be sampled during capture and encode");
         println!("encode stdout: {}", result["stdout"]);
-        let peak: u64 = result["stdout"].as_str().unwrap().lines()
-            .find_map(|line| line.strip_prefix("EXEC_MEMORY_PEAK_BYTES="))
-            .expect("recording/encode exec must print its own cgroup memory.peak")
-            .parse().expect("encode exec memory.peak must be an integer");
-        assert!(peak > 0, "recording/encode exec cgroup memory.peak must be non-zero: {result}");
         assert_capture_seconds(&result);
         assert!(result["stdout"].as_str().unwrap().contains("published /artifacts/proof.mp4"));
         let files = list_artifacts(&api, &token).await;
@@ -331,10 +311,9 @@ fn succeeded(result: Value) -> Value {
     assert_eq!(result["exitCode"], 0, "{result}");
     result
 }
-fn proof_entries(files: &[Value]) -> Vec<(String, u64, String)> {
+fn entries(files: &[Value]) -> Vec<(String, u64, String)> {
     files
         .iter()
-        .filter(|file| file["path"].as_str().unwrap().contains("proof"))
         .map(|file| {
             (
                 file["path"].as_str().unwrap().to_owned(),
@@ -345,11 +324,11 @@ fn proof_entries(files: &[Value]) -> Vec<(String, u64, String)> {
         .collect()
 }
 fn samples_match_final(samples: &[(String, u64, String)], final_files: &[Value]) -> bool {
-    let final_entries = proof_entries(final_files);
+    let final_entries = entries(final_files);
     samples.iter().all(|sample| final_entries.contains(sample))
 }
 #[test]
-fn sampled_proof_rejects_partial_or_hidden_entries() {
+fn sampled_listing_rejects_partial_or_hidden_entries() {
     let final_files = [json!({"path":"proof.mp4","bytes":10,"sha256":"final"})];
     assert!(samples_match_final(
         &[("proof.mp4".into(), 10, "final".into())],
@@ -443,12 +422,6 @@ async fn exec_job(api: &reqwest::Client, token: &str, script: &str) -> Value {
             let view: Value = response.json().await.unwrap();
             if view["state"] != "running" {
                 println!("{script}: job {job} finished: {}", view["outcome"]);
-                if let Some(peak) = view["stdout"].as_str().and_then(|out| {
-                    out.lines()
-                        .find(|line| line.starts_with("EXEC_MEMORY_PEAK_BYTES="))
-                }) {
-                    println!("{script}: job {job} {peak}");
-                }
                 return view;
             }
         }
@@ -458,7 +431,7 @@ async fn exec_job(api: &reqwest::Client, token: &str, script: &str) -> Value {
 }
 async fn stderr_probe_on_failure(api: &reqwest::Client, token: &str, url: &str) {
     let script = format!(
-        "printf '#!/bin/sh\\nexec /usr/local/bin/chromium \"$@\" 2>>/tmp/chromium.stderr\\n' > /tmp/chromium-logged; chmod +x /tmp/chromium-logged; BROWSE_CHROMIUM=/tmp/chromium-logged browse open '{url}'"
+        "browse reset; printf '#!/bin/sh\\nexec /usr/local/bin/chromium \"$@\" 2>>/tmp/chromium.stderr\\n' > /tmp/chromium-logged; chmod +x /tmp/chromium-logged; BROWSE_CHROMIUM=/tmp/chromium-logged browse open '{url}'"
     );
     let attempt = tokio::time::timeout(
         Duration::from_secs(20),

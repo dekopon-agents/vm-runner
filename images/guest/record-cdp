@@ -47,10 +47,13 @@ const path = require('node:path');
   console.log(`CDP_FRAME_ELAPSED_MS=${frameElapsed.join(',')}`);
   console.log(`CDP_CAPTURE_ELAPSED_MS=${Math.round(performance.now() - started)}`);
   await cdp.send('Page.stopScreencast');
-  await page.evaluate(() => clearInterval(window.recordTimer));
+  await page.evaluate(() => {
+    clearInterval(window.recordTimer);
+    document.querySelector('[data-cdp-recording]')?.remove();
+  });
   await cdp.detach();
   await browser.close();
-})().catch(e => { console.error(e); process.exitCode = 1; });
+})().catch(e => { console.error(e); process.exit(1); });
 JS
 cp "$work/frame00.png" "$work/preview.png"
 grep -E 'MemTotal|MemFree|MemAvailable' /proc/meminfo
@@ -61,9 +64,9 @@ grep -E 'MemTotal|MemFree|MemAvailable' /proc/meminfo
 grep oom_kill /proc/vmstat
 ffprobe -v error -show_entries format=duration,size -show_entries stream=codec_name,width,height -of json "$work/output.mp4"
 python3 - "$work/output.mp4" <<'PY'
-from pathlib import Path
 import sys
-p = Path(sys.argv[1]).read_bytes()
+with open(sys.argv[1], 'rb') as f:
+    p = f.read(1 << 20)
 assert p.index(b'moov') < p.index(b'mdat')
 PY
 python3 - "$work" "$name" <<'PY'

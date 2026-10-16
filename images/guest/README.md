@@ -25,7 +25,8 @@ Init sets `vm.overcommit_memory=1`: in a 512 MiB guest the default heuristic ref
 any single mapping larger than RAM, which is what V8's x64 CodeRange reservation is, so every
 Chromium renderer would die at startup. Exhaustion becomes an in-guest OOM kill instead of `ENOMEM`,
 and the victim can be the guest agent: tini then exits as PID 1, the guest panics and the jail
-resets, losing the browser, scratch and any running exec.
+exits, losing the browser, scratch and any running exec. That session's next exec returns
+`not_executed` with reason `boot_failure`.
 The `jail` user's default Node module and browser-cache paths point at the baked
 Playwright installation; no browser download is needed at exec time.
 
@@ -82,7 +83,8 @@ route, with a non-secret dummy key. It does not create a grant: absent model
 routing fails closed, and egress still requires the subject's proxy grant.
 
 Inside a jail, open a tab first (for example, `browse open 'data:text/html,<p>Capture me</p>'`),
-then run `record-cdp proof` to capture the most recently opened tab. It does not open a page itself.
+then run `record-cdp proof`. It records the last tab `browse tabs` lists, not necessarily browse's
+current tab, and does not open a page itself.
 It captures 30 1280×720 PNG frames from CDP `Page.startScreencast` (not screenshots), encodes
 a 30-second H.264 MP4 with faststart in a private `/scratch/recordings` directory
 and probes it. Each finished file is copied into an unnamed `O_TMPFILE` in

@@ -157,8 +157,8 @@ async fn jail_vmm_has_no_new_privileges_and_confined_identity_and_egress() {
                 Err(_) => { println!("pre-pi browse open about:blank timed out after 20 s"); false }
             };
             if !pre_pi_ready {
-                stderr_probe_on_failure(&api, &token, "about:blank").await;
                 browser_diagnostic(&api, &token).await;
+                stderr_probe_on_failure(&api, &token, "about:blank").await;
             }
             assert!(pre_pi_ready, "browse must work before the pi child call");
             let result = exec(&api, &token, "pi --no-session --no-tools --no-mcp --provider vm-proxy --model sol --print 'Reply CANNED_SOL_OK exactly'").await;
@@ -213,7 +213,7 @@ async fn jail_vmm_has_no_new_privileges_and_confined_identity_and_egress() {
         // A failed encoder must leave the artifact namespace untouched.
         let failure = succeeded(exec_job(&api, &token, "set -eu; d=$(mktemp -d /home/jail/failed-encode.XXXXXX); printf '#!/bin/sh\\neval \"out=\\${$#}\"\\nprintf junk > \"$out\"\\necho FORCED_ENCODER_FAILURE >&2\\nexit 42\\n' > \"$d/ffmpeg\"; chmod +x \"$d/ffmpeg\"; code=0; PATH=\"$d:/usr/local/bin:/usr/bin:/bin\" record-cdp rejected || code=$?; rm -rf \"$d\"; test \"$code\" -ne 0; echo ENCODE_FAILED").await);
         assert_capture_seconds(&failure);
-        assert_eq!(exec(&api, &token, "browse eval \"document.querySelector('[data-cdp-recording]') === null\"").await["stdout"], "true\n", "record-cdp must remove its frame counter after capture");
+        assert_eq!(exec(&api, &token, "browse eval \"typeof window.recordTimer === 'number' && document.querySelector('[data-cdp-recording]') === null\"").await["stdout"], "true\n", "record-cdp must remove its frame counter after capture");
         assert!(failure["stdout"].as_str().unwrap().contains("CDP_FRAME_ELAPSED_MS="), "capture must complete before forced encoder failure: {failure}");
         assert_eq!(failure["stdout"].as_str().unwrap().lines().last(), Some("ENCODE_FAILED"));
         assert!(failure["stderr"].as_str().unwrap().contains("FORCED_ENCODER_FAILURE"), "the encode, not capture, must be the failing step: {failure}");
@@ -431,7 +431,7 @@ async fn exec_job(api: &reqwest::Client, token: &str, script: &str) -> Value {
 }
 async fn stderr_probe_on_failure(api: &reqwest::Client, token: &str, url: &str) {
     let script = format!(
-        "browse reset; printf '#!/bin/sh\\nexec /usr/local/bin/chromium \"$@\" 2>>/tmp/chromium.stderr\\n' > /tmp/chromium-logged; chmod +x /tmp/chromium-logged; BROWSE_CHROMIUM=/tmp/chromium-logged browse open '{url}'"
+        "browse reset; printf '#!/bin/sh\\nexec /usr/local/bin/chromium \"$@\" 2>>/tmp/chromium.stderr\\n' > /tmp/chromium-logged; chmod +x /tmp/chromium-logged; BROWSE_CHROMIUM=/tmp/chromium-logged timeout 8 browse open '{url}'; echo '== chromium stderr'; tail -c 8000 /tmp/chromium.stderr"
     );
     let attempt = tokio::time::timeout(
         Duration::from_secs(20),
@@ -463,8 +463,6 @@ curl -s --max-time 3 http://127.0.0.1:9222/json/list
 echo
 echo '== connectOverCDP with DEBUG=pw:protocol'
 DEBUG=pw:protocol timeout 12 node -e 'require("/opt/playwright/node_modules/playwright").chromium.connectOverCDP("http://127.0.0.1:9222",{timeout:8000}).then(b=>{console.log("CDP_DIAG connected pages="+b.contexts()[0].pages().length);process.exit(0)},e=>{console.log("CDP_DIAG "+e.message);process.exit(1)})' 2>&1 | tail -c 8000
-echo '== chromium stderr'
-tail -c 8000 /tmp/chromium.stderr
 echo '== processes: pid state ppid rss_kB cpu_s cmd type'
 for d in /proc/[0-9]*; do
   s=$(sed 's/^.*) //' "$d/stat" 2>/dev/null) || continue

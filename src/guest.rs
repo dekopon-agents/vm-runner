@@ -3,6 +3,7 @@ use std::{
     io::{self, Read, Seek},
     path::{Component, Path, PathBuf},
     process::Stdio,
+    sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
 
@@ -189,7 +190,9 @@ impl Guest {
                 if let Some((uid, gid)) = self.identity {
                     command.uid(uid).gid(gid);
                 }
-                Ok(Response::Exec(execute(command, stdin, deadline_ms).await?))
+                Ok(Response::Exec(
+                    execute(command, stdin, deadline_ms, Path::new("/sys/fs/cgroup")).await?,
+                ))
             }
             Request::List => self.artifacts(list).await,
             Request::Read { path, offset, len } => {
@@ -385,15 +388,16 @@ impl Output {
     }
 }
 
-// Each spawned pid names one cgroup. Failure to measure is never an exec failure.
 struct ExecCgroup(PathBuf);
 impl ExecCgroup {
-    fn attach(root: &Path, pid: u32) -> Option<Self> {
-        let path = root.join(format!("exec-{pid}"));
+    fn create(root: &Path) -> Option<(Self, std::fs::File)> {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let path = root.join(format!("exec-{id}"));
         std::fs::create_dir(&path).ok()?;
         let group = Self(path);
-        std::fs::write(group.0.join("cgroup.procs"), pid.to_string()).ok()?;
-        Some(group)
+        let procs = std::fs::File::create(group.0.join("cgroup.procs")).ok()?;
+        Some((group, procs))
     }
 
     fn measurements(&self) -> Option<(u64, u64)> {
@@ -450,14 +454,26 @@ async fn execute(
     mut command: Command,
     input: Option<String>,
     deadline_ms: u32,
+    cgroup_root: &Path,
 ) -> Result<Executed, Error> {
     let start = Instant::now();
+    let cgroup = ExecCgroup::create(cgroup_root).map(|(group, procs)| {
+        #[expect(unsafe_code, reason = "pre_exec joins the exec cgroup before execve; the closure only calls write(2) on an fd opened before fork")]
+        // SAFETY: After fork the closure only calls async-signal-safe write(2) through the descriptor opened as root.
+        unsafe {
+            command.pre_exec(move || {
+                rustix::io::write(&procs, b"0")
+                    .map(drop)
+                    .map_err(io::Error::from)
+            });
+        }
+        group
+    });
     let mut child = command.spawn()?;
     let pid = child
         .id()
         .ok_or_else(|| io::Error::other("child has no pid"))?;
     let mut group = ProcessGroup(Some(Pid::from_raw(-(pid as i32))));
-    let cgroup = ExecCgroup::attach(Path::new("/sys/fs/cgroup"), pid);
     let mut stdin = child
         .stdin
         .take()

@@ -78,12 +78,14 @@ async fn exec_delivers_stdin_environment_and_default_home() {
 #[test]
 fn per_command_cgroup_measurements_are_optional_on_failure() {
     let root = tempfile::tempdir().unwrap();
-    assert!(ExecCgroup::attach(&root.path().join("missing"), 123).is_none());
-    let group = ExecCgroup::attach(root.path(), 123).unwrap();
+    assert!(ExecCgroup::create(&root.path().join("missing")).is_none());
+    let (group, mut procs) = ExecCgroup::create(root.path()).unwrap();
+    std::io::Write::write_all(&mut procs, b"0").unwrap();
     assert_eq!(
         std::fs::read_to_string(group.0.join("cgroup.procs")).unwrap(),
-        "123"
+        "0"
     );
+    drop(procs);
     assert_eq!(group.measurements(), None);
     std::fs::write(group.0.join("cpu.stat"), "usage_usec 42\nuser_usec 40\n").unwrap();
     std::fs::write(group.0.join("memory.peak"), "8192\n").unwrap();
@@ -96,10 +98,38 @@ fn per_command_cgroup_measurements_are_optional_on_failure() {
     assert!(!path.exists());
 }
 
+#[tokio::test]
+async fn exec_joins_its_cgroup_in_the_child_before_running() {
+    let root = tempfile::tempdir().unwrap();
+    let mut command = Command::new("/bin/true");
+    command
+        .process_group(0)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let result = execute(command, None, 5000, root.path()).await.unwrap();
+    assert_eq!(result.exit_code, 0);
+    let groups: Vec<_> = std::fs::read_dir(root.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(groups.len(), 1);
+    assert!(
+        groups[0]
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("exec-")
+    );
+    assert_eq!(std::fs::read(groups[0].join("cgroup.procs")).unwrap(), b"0");
+}
+
 #[tokio::test(start_paused = true)]
 async fn cgroup_release_timeout_keeps_measurements_and_stops_at_deadline() {
     let root = tempfile::tempdir().unwrap();
-    let group = ExecCgroup::attach(root.path(), 123).unwrap();
+    let (group, procs) = ExecCgroup::create(root.path()).unwrap();
+    drop(procs);
     let path = group.0.clone();
     std::fs::write(path.join("cpu.stat"), "usage_usec 42\n").unwrap();
     std::fs::write(path.join("memory.peak"), "8192\n").unwrap();
@@ -426,7 +456,7 @@ async fn detached_descendants_survive_and_exec_cgroups_are_reaped() {
             call(
                 &guest,
                 exec(&format!(
-                    "until grep -q \"/exec-$$\\$\" /proc/$$/cgroup; do :; done; \
+                    "sh -c 'cat /proc/self/cgroup'; \
                      setsid sh -c 'exec sleep 30' </dev/null >/dev/null 2>&1 & daemon=$!; \
                      printf '%s' \"$daemon\" > {pid_file}; \
                      until [ \"$(cut -d ' ' -f6 /proc/$daemon/stat)\" = \"$daemon\" ]; do :; done; \
@@ -437,21 +467,21 @@ async fn detached_descendants_survive_and_exec_cgroups_are_reaped() {
         .await
         .expect("exec must not wait for the detached descendant");
         assert_eq!(response["exitCode"], 0, "{response}");
-        let pids: Vec<u32> = response["stdout"]
+        let (membership, pids) = response["stdout"]
             .as_str()
             .unwrap()
+            .split_once('\n')
+            .unwrap();
+        assert!(membership.starts_with("0::/exec-"), "{response}");
+        let pids: Vec<u32> = pids
             .split_whitespace()
             .map(|pid| pid.parse().unwrap())
             .collect();
         assert_eq!(pids.len(), 2, "{response}");
-        let (shell, daemon) = (pids[0], pids[1]);
+        let daemon = pids[1];
         assert!(
             start.elapsed() < Duration::from_secs(3),
             "exec waited on cleanup"
-        );
-        assert!(
-            !root.join(format!("exec-{shell}")).exists(),
-            "per-exec cgroup leaked"
         );
         let stat = fs::read_to_string(format!("/proc/{daemon}/stat"))
             .await

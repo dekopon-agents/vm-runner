@@ -27,8 +27,8 @@ recorded exchanges. At `drip`, session start/end, exchange/request/DNS/connect r
 refusals, failures, firewall drops, and telemetry health remain; per-operation spans
 without a trace parent require `standard`. Guest exec exit code, duration, timeout,
 CPU microseconds and peak memory bytes are **guest-reported** on jail exec spans, not
-controller API fields. CPU and memory are absent for older guests or when per-command
-cgroup v2 measurement is unavailable; execution still succeeds.
+controller API fields. CPU and memory are absent for older guests or when the guest cannot create
+a per-command cgroup; if a created group cannot be joined, the exec fails rather than report an undercount.
 
 ## Controller TLS (C3 config / C4 API)
 

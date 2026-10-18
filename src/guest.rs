@@ -190,7 +190,9 @@ impl Guest {
                 if let Some((uid, gid)) = self.identity {
                     command.uid(uid).gid(gid);
                 }
-                Ok(Response::Exec(execute(command, stdin, deadline_ms).await?))
+                Ok(Response::Exec(
+                    execute(command, stdin, deadline_ms, Path::new("/sys/fs/cgroup")).await?,
+                ))
             }
             Request::List => self.artifacts(list).await,
             Request::Read { path, offset, len } => {
@@ -452,9 +454,10 @@ async fn execute(
     mut command: Command,
     input: Option<String>,
     deadline_ms: u32,
+    cgroup_root: &Path,
 ) -> Result<Executed, Error> {
     let start = Instant::now();
-    let cgroup = ExecCgroup::create(Path::new("/sys/fs/cgroup")).map(|(group, procs)| {
+    let cgroup = ExecCgroup::create(cgroup_root).map(|(group, procs)| {
         #[expect(unsafe_code, reason = "pre_exec joins the exec cgroup before execve; the closure only calls write(2) on an fd opened before fork")]
         // SAFETY: After fork the closure only calls async-signal-safe write(2) through the descriptor opened as root.
         unsafe {

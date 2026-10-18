@@ -98,6 +98,33 @@ fn per_command_cgroup_measurements_are_optional_on_failure() {
     assert!(!path.exists());
 }
 
+#[tokio::test]
+async fn exec_joins_its_cgroup_in_the_child_before_running() {
+    let root = tempfile::tempdir().unwrap();
+    let mut command = Command::new("/bin/true");
+    command
+        .process_group(0)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let result = execute(command, None, 5000, root.path()).await.unwrap();
+    assert_eq!(result.exit_code, 0);
+    let groups: Vec<_> = std::fs::read_dir(root.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(groups.len(), 1);
+    assert!(
+        groups[0]
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("exec-")
+    );
+    assert_eq!(std::fs::read(groups[0].join("cgroup.procs")).unwrap(), b"0");
+}
+
 #[tokio::test(start_paused = true)]
 async fn cgroup_release_timeout_keeps_measurements_and_stops_at_deadline() {
     let root = tempfile::tempdir().unwrap();

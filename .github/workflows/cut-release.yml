@@ -1,0 +1,33 @@
+name: Cut release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tags:
+        description: Space-separated tags to create on one commit
+        type: string
+        required: true
+      sha:
+        description: The commit on main to tag; empty means main's HEAD
+        type: string
+        default: ""
+      dry_run:
+        description: Check and create the tags without pushing them
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  cut:
+    uses: dekopon-agents/provider-workflows/.github/workflows/cut-release.yml@main
+    with:
+      tags: ${{ inputs.tags }}
+      sha: ${{ inputs.sha }}
+      package: vm-runner
+      require_head: true
+      dry_run: ${{ inputs.dry_run }}
+    secrets:
+      DEKOPON_RELEASE_APP_ID: ${{ secrets.DEKOPON_RELEASE_APP_ID }}
+      DEKOPON_RELEASE_APP_KEY: ${{ secrets.DEKOPON_RELEASE_APP_KEY }}

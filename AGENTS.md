@@ -14,8 +14,9 @@ the design; read the section your change touches.
   and [Rust guidelines](https://github.com/dekopon-agents/dekopon/blob/main/AGENTS.md#rust-guidelines)
   apply here. This file adds only what is particular to this repository.
 - Tags, releases and version bumps need the owner's authorization for that version. A PR never
-  pushes `main`. No workflow creates tags; the release workflow publishes from an annotated
-  `v<version>` tag on `main` HEAD.
+  pushes `main`. Tags come only from the `Cut release` workflow (the dekopon-release App, dispatched
+  with the tag names), which creates annotated tags on `main` HEAD and nothing else; the release
+  workflow publishes from the `v<version>` tag and the guest workflow from the `guest-v<version>` tag.
 
 ## Boundaries particular to vm-runner
 

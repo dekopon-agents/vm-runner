@@ -29,7 +29,9 @@ the design; read the section your change touches.
 ## Build and verify
 
 A PR passes `Test (ubuntu-24.04)`, `Test (ubuntu-24.04-arm)`, `Image (…)`, `OTLP conformance`,
-`kvm`, `Guest (…)` and `KVM PR guest` (after successful PR Guest builds, the amd64 PR-built artifact with a local fake) before merge. Run `Test`'s steps before a push (Linux, with `tini` installed):
+`kvm`, `Guest (…)` and `KVM PR guest` (after successful PR Guest builds, the amd64 PR-built artifact with a local fake) before merge.
+`KVM PR guest` requires at least one artifact listing after observing the recording job running
+and before observing its terminal result; every sampled entry must match the final listing. Run `Test`'s steps before a push (Linux, with `tini` installed):
 
 ```console
 cargo fmt --all --check

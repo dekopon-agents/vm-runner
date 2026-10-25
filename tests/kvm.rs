@@ -211,7 +211,7 @@ async fn jail_vmm_has_no_new_privileges_and_confined_identity_and_egress() {
         exec(&api, &token, "browse open 'data:text/html,<title>CDP proof</title><body style=\"background:#174b72;color:white\"><p>CDP proof without heading</p></body>'").await;
         assert_eq!(exec(&api, &token, "browse eval \"document.querySelector('h1') === null\"").await["stdout"], "true\n", "proof tab must have no heading");
         // A failed encoder must leave the artifact namespace untouched.
-        let failure = succeeded(exec_job(&api, &token, "set -eu; d=$(mktemp -d /home/jail/failed-encode.XXXXXX); printf '#!/bin/sh\\neval \"out=\\${$#}\"\\nprintf junk > \"$out\"\\necho FORCED_ENCODER_FAILURE >&2\\nexit 42\\n' > \"$d/ffmpeg\"; chmod +x \"$d/ffmpeg\"; code=0; PATH=\"$d:/usr/local/bin:/usr/bin:/bin\" record-cdp rejected || code=$?; rm -rf \"$d\"; test \"$code\" -ne 0; echo ENCODE_FAILED").await);
+        let failure = succeeded(exec_job(&api, &token, "set -eu; d=$(mktemp -d /home/jail/failed-encode.XXXXXX); printf '#!/bin/sh\\neval \"out=\\${$#}\"\\nprintf junk > \"$out\"\\necho FORCED_ENCODER_FAILURE >&2\\nexit 42\\n' > \"$d/ffmpeg\"; chmod +x \"$d/ffmpeg\"; code=0; PATH=\"$d:/usr/local/bin:/usr/bin:/bin\" record-cdp rejected || code=$?; rm -rf \"$d\"; test \"$code\" -ne 0; echo ENCODE_FAILED", async || {}).await);
         assert_capture_seconds(&failure);
         assert_eq!(exec(&api, &token, "browse eval \"typeof window.recordTimer === 'number' && document.querySelector('[data-cdp-recording]') === null\"").await["stdout"], "true\n", "record-cdp must remove its frame counter after capture");
         assert!(failure["stdout"].as_str().unwrap().contains("CDP_FRAME_ELAPSED_MS="), "capture must complete before forced encoder failure: {failure}");
@@ -221,28 +221,16 @@ async fn jail_vmm_has_no_new_privileges_and_confined_identity_and_egress() {
         assert!(!files.iter().any(|f| f["path"].as_str().unwrap().contains("rejected")));
 
         // Record the most recently opened tab and compare every observed artifact to final content.
-        let runner = api.clone();
-        let bearer = token.clone();
-        let mut recording = tokio::spawn(async move { succeeded(exec_job(&runner, &bearer, "record-cdp proof").await) });
-        let mut polls = 0;
         let mut sampled = Vec::new();
-        let result = loop {
-            tokio::select! {
-                biased;
-                result = &mut recording => break result.unwrap(),
-                _ = tokio::time::sleep(Duration::from_millis(200)) => {
-                    let files = list_artifacts(&api, &token).await;
-                    sampled.extend(entries(&files));
-                    polls += 1;
-                }
-            }
-        };
-        assert!(polls > 1, "artifact listing must be sampled during capture and encode");
+        let result = succeeded(exec_job(&api, &token, "record-cdp proof", async || {
+            sampled.push(list_artifacts(&api, &token).await);
+        }).await);
+        assert!(!sampled.is_empty(), "no artifact listing completed after observing the recording job running and before observing its terminal result");
         println!("encode stdout: {}", result["stdout"]);
         assert_capture_seconds(&result);
         assert!(result["stdout"].as_str().unwrap().contains("published /artifacts/proof.mp4"));
         let files = list_artifacts(&api, &token).await;
-        assert!(samples_match_final(&sampled, &files), "observed partial or unpublished proof entry: {sampled:?}; final: {files:?}");
+        assert!(sampled.iter().all(|sample| samples_match_final(&entries(sample), &files)), "observed partial or unpublished proof entry: {sampled:?}; final: {files:?}");
         let movie = files.iter().find(|f| f["path"] == "proof.mp4").unwrap();
         let png = files.iter().find(|f| f["path"] == "proof.png").unwrap();
         let movie_bytes = read_artifact(&api, &token, movie).await;
@@ -270,7 +258,7 @@ async fn jail_vmm_has_no_new_privileges_and_confined_identity_and_egress() {
         println!("first-frame RGB absolute error sum={error}, pixels={}", first.len());
         assert!(error / (first.len() as u64) < 12, "PNG must match the first video frame despite lossy H.264");
         let prior_hash = movie["sha256"].clone();
-        let duplicate = exec_job(&api, &token, "record-cdp proof").await;
+        let duplicate = exec_job(&api, &token, "record-cdp proof", async || {}).await;
         assert_capture_seconds(&duplicate);
         assert_eq!(duplicate["outcome"], "executed");
         assert_ne!(duplicate["exitCode"], 0, "existing artifact must not be overwritten");
@@ -401,7 +389,12 @@ async fn exec_raw(api: &reqwest::Client, token: &str, script: &str) -> Value {
     assert_eq!(response.status(), 200);
     response.json().await.unwrap()
 }
-async fn exec_job(api: &reqwest::Client, token: &str, script: &str) -> Value {
+async fn exec_job(
+    api: &reqwest::Client,
+    token: &str,
+    script: &str,
+    mut sample: impl AsyncFnMut(),
+) -> Value {
     let response = submit(api, token, script).await;
     let status = response.status();
     let pending: Value = response.json().await.unwrap();
@@ -416,7 +409,6 @@ async fn exec_job(api: &reqwest::Client, token: &str, script: &str) -> Value {
     );
     tokio::time::timeout(Duration::from_secs(120), async {
         loop {
-            tokio::time::sleep(Duration::from_secs(1)).await;
             let response = api.get(&job).bearer_auth(token).send().await.unwrap();
             assert_eq!(response.status(), 200, "job outcome must be known");
             let view: Value = response.json().await.unwrap();
@@ -424,6 +416,8 @@ async fn exec_job(api: &reqwest::Client, token: &str, script: &str) -> Value {
                 println!("{script}: job {job} finished: {}", view["outcome"]);
                 return view;
             }
+            sample().await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
         }
     })
     .await

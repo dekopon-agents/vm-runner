@@ -21,7 +21,7 @@ permissions:
 
 jobs:
   cut:
-    uses: dekopon-agents/provider-workflows/.github/workflows/cut-release.yml@main
+    uses: dekopon-agents/provider-workflows/.github/workflows/cut-release.yml@2033d4c7ef345bdf640204d53a36d4108ffadeba
     with:
       tags: ${{ inputs.tags }}
       sha: ${{ inputs.sha }}

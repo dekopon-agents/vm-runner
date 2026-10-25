@@ -631,9 +631,10 @@ async fn execs_do_not_overlap_and_duration_excludes_waiting_for_the_previous_exe
         ),
     );
     tokio::pin!(first);
+    let started = guest.home.join("started");
     tokio::select! {
         response = &mut first => panic!("first exec ended before release: {response}"),
-        () = wait_for_file(&guest.home.join("started")) => {}
+        () = wait_for_file(&started) => {}
     }
     let mut request = exec("echo second-start >> order; echo second-end >> order");
     request["deadlineMs"] = json!(5000);

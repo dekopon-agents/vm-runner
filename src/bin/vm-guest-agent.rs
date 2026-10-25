@@ -58,10 +58,12 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[tokio::test]
-    async fn a_stalled_frame_does_not_block_another_connection_and_accept_errors_drain_tasks() {
+    async fn stalled_frames_and_responses_do_not_block_other_connections_and_accept_errors_drain_tasks()
+     {
         let (mut slow, slow_server) = tokio::io::duplex(64);
+        let (mut blocked, blocked_server) = tokio::io::duplex(1);
         let (mut ping, ping_server) = tokio::io::duplex(64);
-        let streams = std::sync::Mutex::new([slow_server, ping_server].into_iter());
+        let streams = std::sync::Mutex::new([slow_server, blocked_server, ping_server].into_iter());
         let owner =
             serve_connections(|| {
                 std::future::poll_fn(|_| {
@@ -75,6 +77,8 @@ mod tests {
         let client = async {
             slow.write_all(&[0, 0]).await.unwrap();
             let request = br#"{"op":"ping"}"#;
+            blocked.write_u32(request.len() as u32).await.unwrap();
+            blocked.write_all(request).await.unwrap();
             ping.write_u32(request.len() as u32).await.unwrap();
             ping.write_all(request).await.unwrap();
             let size = ping.read_u32().await.unwrap();
@@ -89,6 +93,7 @@ mod tests {
                 std::io::ErrorKind::UnexpectedEof
             );
             drop(slow);
+            drop(blocked);
         };
         let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
             tokio::join!(owner, client)

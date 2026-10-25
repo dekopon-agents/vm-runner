@@ -1,18 +1,103 @@
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::disallowed_methods))]
 #[cfg(target_os = "linux")]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener =
         tokio_vsock::VsockListener::bind(vsock::VsockAddr::new(vsock::VMADDR_CID_ANY, 1024))?;
-    loop {
-        let (stream, _) = listener.accept().await?;
-        if let Err(error) = vm_runner::guest::serve(stream).await {
-            eprintln!("guest connection failed: {error}");
-        }
-    }
+    serve_connections(|| async { listener.accept().await.map(|(stream, _)| stream) }).await?;
+    Ok(())
 }
 
 #[cfg(not(target_os = "linux"))]
 fn main() {
     eprintln!("linux only");
     std::process::exit(2);
+}
+
+#[cfg(target_os = "linux")]
+async fn serve_connections<S, F, A>(mut accept: A) -> std::io::Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    F: std::future::Future<Output = std::io::Result<S>>,
+    A: FnMut() -> F,
+{
+    const CONNECTION_CAP: usize = 128;
+    let mut connections = tokio::task::JoinSet::new();
+    let error = loop {
+        tokio::select! {
+            result = connections.join_next(), if !connections.is_empty() => {
+                if let Some(Err(error)) = result {
+                    eprintln!("guest connection task failed: {error}");
+                }
+            }
+            accepted = accept(), if connections.len() < CONNECTION_CAP => {
+                match accepted {
+                    Ok(stream) => {
+                        connections.spawn(async move {
+                            if let Err(error) = vm_runner::guest::serve(stream).await {
+                                eprintln!("guest connection failed: {error}");
+                            }
+                        });
+                    }
+                    Err(error) => break error,
+                }
+            }
+        }
+    };
+    while let Some(result) = connections.join_next().await {
+        if let Err(error) = result {
+            eprintln!("guest connection task failed: {error}");
+        }
+    }
+    Err(error)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn a_stalled_frame_does_not_block_another_connection_and_accept_errors_drain_tasks() {
+        let (mut slow, slow_server) = tokio::io::duplex(64);
+        let (mut ping, ping_server) = tokio::io::duplex(64);
+        let streams = std::sync::Mutex::new([slow_server, ping_server].into_iter());
+        let owner =
+            serve_connections(|| {
+                std::future::poll_fn(|_| {
+                    std::task::Poll::Ready(
+                        streams.lock().unwrap().next().ok_or_else(|| {
+                            std::io::Error::from(std::io::ErrorKind::ConnectionAborted)
+                        }),
+                    )
+                })
+            });
+        let client = async {
+            slow.write_all(&[0, 0]).await.unwrap();
+            let request = br#"{"op":"ping"}"#;
+            ping.write_u32(request.len() as u32).await.unwrap();
+            ping.write_all(request).await.unwrap();
+            let size = ping.read_u32().await.unwrap();
+            let mut bytes = vec![0; size as usize];
+            ping.read_exact(&mut bytes).await.unwrap();
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+                serde_json::json!({"ok":true})
+            );
+            assert_eq!(
+                ping.read_u8().await.unwrap_err().kind(),
+                std::io::ErrorKind::UnexpectedEof
+            );
+            drop(slow);
+        };
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::join!(owner, client)
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            result.unwrap_err().kind(),
+            std::io::ErrorKind::ConnectionAborted
+        );
+    }
 }

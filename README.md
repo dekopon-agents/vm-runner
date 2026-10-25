@@ -159,7 +159,9 @@ accepting and drains the bounded workers and final counts before shutting down t
 ## Guest agent
 
 `vm-guest-agent` runs as root inside a Linux guest and serves one length-prefixed JSON request
-per vsock connection on port 1024. Requests are processed sequentially. Exec runs as uid/gid 1000
+per vsock connection on port 1024. Separate connections are served concurrently, with at most 128
+in flight; accepting waits at that bound. Execs run one at a time, alongside listings, reads and
+pings. Exec runs as uid/gid 1000
 with HOME and default cwd `/home/jail`; deadlines kill the process group, and stdout/stderr are
 capped at 64 KiB each while excess output is drained. `/artifacts` must be owned by uid 1000.
 Artifact listing hashes regular files recursively without following symlinks; reads canonicalize

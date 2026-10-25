@@ -12,6 +12,7 @@ fn guest() -> (TempDir, Guest) {
         artifacts: dir.path().join("artifacts"),
         home: dir.path().to_owned(),
         identity: None,
+        exec: Mutex::new(()),
     };
     std::fs::create_dir(&guest.artifacts).unwrap();
     (dir, guest)
@@ -580,4 +581,84 @@ async fn agent_under_init() {
         .await
         .unwrap_or_else(|_| panic!("orphan {orphan} was never reaped"));
     }
+}
+
+async fn wait_for_file(path: &Path) {
+    timeout(Duration::from_secs(10), async {
+        while !fs::try_exists(path).await.unwrap() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn listings_reads_and_pings_finish_while_an_exec_is_running() {
+    let (_dir, guest) = guest();
+    let execution = call(
+        &guest,
+        exec("touch started; while [ ! -f release ]; do sleep 0.01; done; printf done; exit 7"),
+    );
+    tokio::pin!(execution);
+    let response = timeout(Duration::from_secs(10), async {
+        tokio::select! {
+            response = &mut execution => panic!("exec ended before release: {response}"),
+            () = async {
+                wait_for_file(&guest.home.join("started")).await;
+                assert_eq!(call(&guest, json!({"op":"artifacts.list"})).await, json!([]));
+                fs::write(guest.artifacts.join("file"), b"abc").await.unwrap();
+                assert_eq!(call(&guest, json!({"op":"artifacts.read", "path":"file", "offset":0, "len":3})).await,
+                    json!({"data":"YWJj", "eof":true}));
+                assert_eq!(call(&guest, json!({"op":"ping"})).await, json!({"ok":true}));
+            } => {}
+        }
+        fs::write(guest.home.join("release"), b"").await.unwrap();
+        execution.await
+    }).await.unwrap();
+    assert_eq!(response["outcome"], "executed");
+    assert_eq!(response["stdout"], "done");
+    assert_eq!(response["exitCode"], 7);
+}
+
+#[tokio::test]
+async fn execs_do_not_overlap_and_duration_excludes_waiting_for_the_previous_exec() {
+    let (_dir, guest) = guest();
+    let first = call(
+        &guest,
+        exec(
+            "echo first-start >> order; touch started; while [ ! -f release ]; do sleep 0.01; done; echo first-end >> order",
+        ),
+    );
+    tokio::pin!(first);
+    let started = guest.home.join("started");
+    tokio::select! {
+        response = &mut first => panic!("first exec ended before release: {response}"),
+        () = wait_for_file(&started) => {}
+    }
+    let mut request = exec("echo second-start >> order; echo second-end >> order");
+    request["deadlineMs"] = json!(5000);
+    let second = call(&guest, request);
+    tokio::pin!(second);
+    tokio::select! {
+        response = &mut second => panic!("second exec ran before the first ended: {response}"),
+        () = tokio::time::sleep(Duration::from_millis(100)) => {}
+    }
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(60)).await;
+    tokio::time::resume();
+    fs::write(guest.home.join("release"), b"").await.unwrap();
+    let (first, second) = timeout(Duration::from_secs(10), async {
+        tokio::join!(first, second)
+    })
+    .await
+    .unwrap();
+    assert_eq!(first["exitCode"], 0);
+    assert_eq!(second["exitCode"], 0);
+    assert!(second.get("timedOut").is_none());
+    assert!(second["durationMs"].as_u64().unwrap() < 60_000);
+    assert_eq!(
+        fs::read_to_string(guest.home.join("order")).await.unwrap(),
+        "first-start\nfirst-end\nsecond-start\nsecond-end\n"
+    );
 }

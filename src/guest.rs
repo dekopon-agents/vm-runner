@@ -3,7 +3,10 @@ use std::{
     io::{self, Read, Seek},
     path::{Component, Path, PathBuf},
     process::Stdio,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -18,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     process::Command,
+    sync::Mutex,
     time::{Instant, timeout},
 };
 
@@ -127,16 +131,20 @@ struct Guest {
     artifacts: PathBuf,
     home: PathBuf,
     identity: Option<(u32, u32)>,
+    exec: Mutex<()>,
 }
 
 pub async fn serve(stream: impl AsyncRead + AsyncWrite + Unpin) -> Result<(), Error> {
-    Guest {
-        artifacts: "/artifacts".into(),
-        home: "/home/jail".into(),
-        identity: Some((1000, 1000)),
-    }
-    .serve(stream)
-    .await
+    static GUEST: OnceLock<Guest> = OnceLock::new();
+    GUEST
+        .get_or_init(|| Guest {
+            artifacts: "/artifacts".into(),
+            home: "/home/jail".into(),
+            identity: Some((1000, 1000)),
+            exec: Mutex::new(()),
+        })
+        .serve(stream)
+        .await
 }
 
 impl Guest {
@@ -170,6 +178,7 @@ impl Guest {
                 if argv.first().is_none_or(String::is_empty) || deadline_ms > 600_000 {
                     return Err(Error::InvalidExec);
                 }
+                let _exec = self.exec.lock().await;
                 let mut command = Command::new(&argv[0]);
                 command
                     .args(&argv[1..])
@@ -208,7 +217,6 @@ impl Guest {
         operation: impl FnOnce(&Dir) -> Result<Response, Error> + Send + 'static,
     ) -> Result<Response, Error> {
         let path = self.artifacts.clone();
-        // The sequential listener awaits this single worker before admitting another request.
         tokio::task::spawn_blocking(move || {
             let root = Dir::open_ambient_dir(path, cap_std::ambient_authority())?;
             operation(&root)

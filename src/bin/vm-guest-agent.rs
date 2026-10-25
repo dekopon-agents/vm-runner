@@ -44,6 +44,7 @@ where
             }
         }
     };
+    connections.abort_all();
     while let Some(result) = connections.join_next().await {
         if let Err(error) = result {
             eprintln!("guest connection task failed: {error}");
@@ -64,16 +65,15 @@ mod tests {
         let (mut blocked, blocked_server) = tokio::io::duplex(1);
         let (mut ping, ping_server) = tokio::io::duplex(64);
         let streams = std::sync::Mutex::new([slow_server, blocked_server, ping_server].into_iter());
-        let owner =
-            serve_connections(|| {
-                std::future::poll_fn(|_| {
-                    std::task::Poll::Ready(
-                        streams.lock().unwrap().next().ok_or_else(|| {
-                            std::io::Error::from(std::io::ErrorKind::ConnectionAborted)
-                        }),
-                    )
-                })
-            });
+        let finished = tokio::sync::Notify::new();
+        let owner = serve_connections(|| async {
+            let stream = streams.lock().unwrap().next();
+            if let Some(stream) = stream {
+                return Ok(stream);
+            }
+            finished.notified().await;
+            Err(std::io::Error::from(std::io::ErrorKind::ConnectionAborted))
+        });
         let client = async {
             slow.write_all(&[0, 0]).await.unwrap();
             let request = br#"{"op":"ping"}"#;
@@ -94,6 +94,7 @@ mod tests {
             );
             drop(slow);
             drop(blocked);
+            finished.notify_one();
         };
         let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
             tokio::join!(owner, client)
@@ -103,6 +104,33 @@ mod tests {
         assert_eq!(
             result.unwrap_err().kind(),
             std::io::ErrorKind::ConnectionAborted
+        );
+    }
+
+    #[tokio::test]
+    async fn an_accept_error_returns_even_when_a_peer_keeps_a_partial_frame_open() {
+        let (mut peer, server) = tokio::io::duplex(64);
+        peer.write_all(&[0, 0]).await.unwrap();
+        let stream = std::sync::Mutex::new(Some(server));
+        let injected = nix::errno::Errno::EMFILE as i32;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            serve_connections(|| {
+                std::future::ready(
+                    stream
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .ok_or_else(|| std::io::Error::from_raw_os_error(injected)),
+                )
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.unwrap_err().raw_os_error(), Some(injected));
+        assert_eq!(
+            peer.read_u8().await.unwrap_err().kind(),
+            std::io::ErrorKind::UnexpectedEof
         );
     }
 }

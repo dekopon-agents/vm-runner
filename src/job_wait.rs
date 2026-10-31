@@ -44,29 +44,32 @@ impl JobWait {
         request.extensions_mut().insert(wait);
         Ok(Some(wait))
     }
+    fn split_unquoted(value: &[u8], delimiter: u8) -> impl Iterator<Item = &[u8]> {
+        let mut quoted = false;
+        let mut escaped = false;
+        value.split(move |byte| {
+            if escaped {
+                escaped = false;
+                return false;
+            }
+            match *byte {
+                b'\\' if quoted => escaped = true,
+                b'"' => quoted = !quoted,
+                byte if byte == delimiter && !quoted => return true,
+                _ => (),
+            }
+            false
+        })
+    }
     fn preference(request: &Request) -> poem::Result<Option<u32>> {
         for header in request.headers().get_all("Prefer") {
-            let value = header.to_str().map_err(poem::error::BadRequest)?;
-            let mut quoted = false;
-            let mut escaped = false;
-            for preference in value.split(|ch| {
-                if escaped {
-                    escaped = false;
-                    return false;
-                }
-                match ch {
-                    '\\' if quoted => escaped = true,
-                    '"' => quoted = !quoted,
-                    ',' if !quoted => return true,
-                    _ => (),
-                }
-                false
-            }) {
-                let preference = preference.split(';').next().unwrap_or_default();
-                let (name, value) = preference
-                    .split_once('=')
-                    .map_or((preference, None), |(name, value)| (name, Some(value)));
-                if !name.trim().eq_ignore_ascii_case("wait") {
+            for preference in Self::split_unquoted(header.as_bytes(), b',') {
+                let preference = Self::split_unquoted(preference, b';')
+                    .next()
+                    .unwrap_or_default();
+                let mut parts = preference.splitn(2, |byte| *byte == b'=');
+                let name = parts.next().unwrap_or_default().trim_ascii();
+                if !name.eq_ignore_ascii_case(b"wait") {
                     continue;
                 }
                 let invalid = || {
@@ -75,14 +78,19 @@ impl JobWait {
                         StatusCode::BAD_REQUEST,
                     )
                 };
-                let value = value.ok_or_else(invalid)?.trim();
-                if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
-                    return Err(invalid());
-                }
-                let seconds = value.parse::<u32>().map_err(poem::error::BadRequest)?;
-                if !(1..=25).contains(&seconds) {
-                    return Err(invalid());
-                }
+                let value = parts.next().ok_or_else(invalid)?.trim_ascii();
+                let seconds = value
+                    .iter()
+                    .try_fold(0u32, |seconds, byte| {
+                        if !byte.is_ascii_digit() {
+                            return None;
+                        }
+                        seconds
+                            .checked_mul(10)?
+                            .checked_add(u32::from(*byte - b'0'))
+                    })
+                    .filter(|seconds| (1..=25).contains(seconds))
+                    .ok_or_else(invalid)?;
                 return Ok(Some(seconds));
             }
         }

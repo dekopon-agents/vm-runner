@@ -125,6 +125,7 @@ async fn a_read_without_a_wait_preference_is_unchanged() {
     for (query, preference) in [
         ("", None),
         ("", Some("return=minimal")),
+        ("", Some("custom=\"café\"")),
         ("", Some("custom=\"x,wait=99\", respond-async")),
         ("", Some("foo; wait=26")),
         ("?waitMs=25000", None),
@@ -469,4 +470,48 @@ async fn completion_between_progress_reads_returns_the_result_and_keeps_the_cont
     requests.drain().await.unwrap();
     f.tasks.shutdown().await;
     auth.tasks.shutdown().await;
+}
+
+#[tokio::test]
+async fn quoted_opaque_preferences_do_not_reject_a_jail_wait() {
+    let f = Fixture::new().await;
+    f.sender.send_replace(completed());
+    for value in [
+        "custom=\"café\", wait=1".as_bytes(),
+        "wait=1; note=\"café\"".as_bytes(),
+        b"custom=\"\xff\\\",wait=99\", wait=1, wait=26".as_slice(),
+    ] {
+        let response = f
+            .client
+            .get(format!("/jobs/{}", f.id))
+            .header(
+                "Prefer",
+                poem::http::HeaderValue::from_bytes(value).unwrap(),
+            )
+            .send()
+            .await;
+        response.assert_status_is_ok();
+        response.assert_header("Preference-Applied", "wait=1");
+    }
+    f.close().await;
+}
+
+#[tokio::test]
+async fn opaque_bytes_do_not_hide_an_invalid_selected_wait() {
+    let f = Fixture::new().await;
+    for value in [
+        b"wait=\xff; note=\"ok\"".as_slice(),
+        b"custom=\"\xff\", wait=26".as_slice(),
+    ] {
+        f.client
+            .get(format!("/jobs/{}", f.id))
+            .header(
+                "Prefer",
+                poem::http::HeaderValue::from_bytes(value).unwrap(),
+            )
+            .send()
+            .await
+            .assert_status(StatusCode::BAD_REQUEST);
+    }
+    f.close().await;
 }

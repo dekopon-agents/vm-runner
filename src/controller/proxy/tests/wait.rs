@@ -243,6 +243,7 @@ async fn unrelated_preferences_and_wait_ms_queries_leave_controller_reads_unchan
     for (query, preference) in [
         ("", None),
         ("", Some("return=minimal")),
+        ("", Some("custom=\"café\"")),
         ("", Some("custom=\"x,wait=99\", respond-async")),
         ("?waitMs=25000", None),
         ("?waitMs=bad", None),
@@ -264,6 +265,45 @@ async fn unrelated_preferences_and_wait_ms_queries_leave_controller_reads_unchan
         }
     }
     assert!(f.job_waits.lock().unwrap().iter().all(Option::is_none));
+    f.tasks.shutdown().await;
+    auth.tasks.shutdown().await;
+}
+
+#[tokio::test]
+async fn quoted_opaque_preferences_do_not_reject_a_controller_wait() {
+    let mut f = Fixture::new().await;
+    let id = f.session();
+    let ExecResponse::Pending(Json(pending)) =
+        f.controller.exec(SUBJECT, &id, &exec()).await.unwrap()
+    else {
+        panic!("pending")
+    };
+    let mut auth = crate::tests::Fixture::new().await;
+    let client = TestClient::new(f.api_endpoint(&auth).await).default_header(
+        "Authorization",
+        format!("Bearer {}", auth.token(&auth.claims(), "ec")),
+    );
+    f.wait_for_jobs.store(true, Ordering::SeqCst);
+    for value in [
+        "custom=\"café\", wait=1".as_bytes(),
+        "wait=1; note=\"café\"".as_bytes(),
+        b"custom=\"\xff\\\",wait=99\", wait=1, wait=26".as_slice(),
+    ] {
+        let response = client
+            .get(format!("/v1/jobs/{}", pending.job_id))
+            .header(
+                "Prefer",
+                poem::http::HeaderValue::from_bytes(value).unwrap(),
+            )
+            .send()
+            .await;
+        response.assert_status_is_ok();
+        response.assert_header("Preference-Applied", "wait=1");
+    }
+    assert_eq!(
+        *f.job_waits.lock().unwrap(),
+        vec![Some(1), Some(1), Some(1)]
+    );
     f.tasks.shutdown().await;
     auth.tasks.shutdown().await;
 }

@@ -69,6 +69,17 @@ function exec(argv, expectedCode = 0) {
     assert.deepEqual(fs.readdirSync('/scratch/recordings'), recordings);
     assert.deepEqual(fs.readdirSync('/artifacts'), artifacts);
     console.log('record refuses invalid names and seconds before capture and cleans up a failed capture');
+    await exec(['browse', 'open', 'data:text/html,<p>smoke</p>']);
+    await exec(['browse', 'record', 'smoke', '--seconds', '3']);
+    const probe = JSON.parse(await exec(['ffprobe', '-v', 'error', '-show_entries',
+      'stream=codec_name,width,height:format=duration', '-of', 'json', '/artifacts/smoke.mp4']));
+    assert.deepEqual(probe.streams, [{ codec_name: 'h264', width: 1280, height: 720 }]);
+    assert.ok(Math.abs(Number(probe.format.duration) - 3) < 0.1);
+    assert.ok(fs.statSync('/artifacts/smoke.png').size > 0);
+    console.log(`producer/consumer smoke ffprobe=${JSON.stringify(probe)}`);
+    fs.unlinkSync('/artifacts/smoke.mp4');
+    fs.unlinkSync('/artifacts/smoke.png');
+    await exec(['browse', 'open', page('Browse smoke')]);
     await exec(['agent-browser', 'open', page('Agent browser smoke')]);
     const snapshot = await exec(['agent-browser', 'snapshot']);
     assert.match(snapshot, /Agent browser smoke/);

@@ -3,7 +3,7 @@ use crate::{auth::Authenticator, config::Auth, guest};
 use poem::{Endpoint, EndpointExt, IntoResponse, Request, http::StatusCode};
 use poem_openapi::{
     ApiResponse, Object, OpenApi, OpenApiService, Union,
-    param::{Path, Query},
+    param::{Header, Path},
     payload::Json,
 };
 use serde::Deserialize;
@@ -154,9 +154,15 @@ enum ExecResponse {
 #[derive(ApiResponse)]
 enum JobResponse {
     #[oai(status = 200)]
-    View(Json<View>),
+    View(
+        Json<View>,
+        #[oai(header = "Preference-Applied")] Option<String>,
+    ),
     #[oai(status = 202)]
-    Unknown(Json<Unknown>),
+    Unknown(
+        Json<Unknown>,
+        #[oai(header = "Preference-Applied")] Option<String>,
+    ),
 }
 #[derive(Clone)]
 enum Progress {
@@ -343,11 +349,7 @@ impl Api {
         request: &poem::Request,
         state: poem::web::Data<&Arc<State>>,
         id: Path<String>,
-        #[oai(
-            name = "waitMs",
-            validator(minimum(value = "0"), maximum(value = "25000"))
-        )]
-        _wait_ms: Query<Option<u32>>,
+        #[oai(name = "Prefer")] _prefer: Header<Option<String>>,
     ) -> poem::Result<JobResponse> {
         let wait = request
             .extensions()
@@ -365,8 +367,9 @@ impl Api {
                         poem::Error::from_status(StatusCode::NOT_FOUND)
                     })?
             };
+            let applied = wait.map(crate::job_wait::JobWait::applied);
             if let Some(wait) = wait {
-                let deadline = wait.deadline - Duration::from_millis(100).min(Duration::from_millis(wait.requested_ms.into()));
+                let deadline = wait.deadline - Duration::from_millis(100);
                 let _result = tokio::time::timeout_at(deadline, async {
                     loop {
                         match progress.borrow_and_update().clone() {
@@ -381,25 +384,25 @@ impl Api {
             Ok(match value {
                 Progress::Running if wait.is_some() && progress.has_changed().is_err() => {
                     tracing::Span::current().record("vm_runner.job.state", "unknown");
-                    JobResponse::Unknown(unknown(id))
+                    JobResponse::Unknown(unknown(id), applied)
                 }
                 Progress::Running => {
                     tracing::Span::current().record("vm_runner.job.state", "running");
-                    JobResponse::View(Json(View::Running(Running { state: "running".into() })))
+                    JobResponse::View(Json(View::Running(Running { state: "running".into() })), applied)
                 }
                 Progress::Done(result) => {
                     tracing::Span::current().record("vm_runner.job.state", "completed");
-                    JobResponse::View(Json(View::Terminal((*result).clone())))
+                    JobResponse::View(Json(View::Terminal((*result).clone())), applied)
                 }
                 Progress::Unknown => {
                     tracing::Span::current().record("vm_runner.job.state", "unknown");
-                    JobResponse::Unknown(unknown(id))
+                    JobResponse::Unknown(unknown(id), applied)
                 }
             })
         }
         .instrument(tracing::info_span!(target: crate::config::Category::VmExec.target(), "vm_runner.job.get",
             telemetry.detail = crate::telemetry::detail!(crate::config::Category::VmExec),
-            vm_runner.job.wait_ms = wait.map_or(0, |wait| wait.requested_ms),
+            vm_runner.job.wait_ms = wait.map_or(0, |wait| wait.requested_seconds * 1000),
             vm_runner.job.state = "failed"))
         .await
     }

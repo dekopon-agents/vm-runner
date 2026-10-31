@@ -47,12 +47,13 @@ impl Fixture {
             sender,
         }
     }
-    fn read(&self, wait_ms: u32) -> tokio::task::JoinHandle<TestResponse> {
+    fn read(&self, seconds: u32) -> tokio::task::JoinHandle<TestResponse> {
         let client = Arc::clone(&self.client);
         let id = self.id;
         tokio::spawn(async move {
             client
-                .get(format!("/jobs/{id}?waitMs={wait_ms}"))
+                .get(format!("/jobs/{id}"))
+                .header("Prefer", format!("wait={seconds}"))
                 .send()
                 .await
         })
@@ -83,10 +84,10 @@ fn completed() -> Progress {
 }
 
 #[tokio::test]
-async fn a_waiting_read_returns_the_terminal_result_well_before_the_bound() {
+async fn a_prefer_wait_read_returns_the_terminal_result_well_before_the_bound() {
     let f = Fixture::new().await;
     let started = std::time::Instant::now();
-    let read = f.read(25000);
+    let read = f.read(25);
     f.waiting().await;
     f.sender.send_replace(completed());
     let response = tokio::time::timeout(Duration::from_secs(1), read)
@@ -94,16 +95,17 @@ async fn a_waiting_read_returns_the_terminal_result_well_before_the_bound() {
         .unwrap()
         .unwrap();
     response.assert_status_is_ok();
+    response.assert_header("Preference-Applied", "wait=25");
     response.assert_json(json!({"outcome":"executed","exitCode":7,"stdout":"result","stderr":"err","truncated":false})).await;
     assert!(started.elapsed() < Duration::from_secs(1));
     f.close().await;
 }
 
 #[tokio::test]
-async fn a_still_running_read_returns_running_at_the_bound() {
+async fn a_prefer_wait_read_of_a_running_job_returns_at_the_bound() {
     let f = Fixture::new().await;
     tokio::time::pause();
-    let read = f.read(1000);
+    let read = f.read(1);
     f.waiting().await;
     tokio::time::advance(Duration::from_millis(899)).await;
     assert!(!read.is_finished());
@@ -111,48 +113,66 @@ async fn a_still_running_read_returns_running_at_the_bound() {
     tokio::time::resume();
     let response = read.await.unwrap();
     response.assert_status_is_ok();
+    response.assert_header("Preference-Applied", "wait=1");
     response.assert_json(json!({"state":"running"})).await;
     f.close().await;
 }
 
 #[tokio::test]
-async fn a_read_without_a_wait_is_unchanged() {
+async fn a_read_without_a_wait_preference_is_unchanged() {
     let f = Fixture::new().await;
-    for path in [
-        format!("/jobs/{}", f.id),
-        format!("/jobs/{}?waitMs=0", f.id),
+    let mut baseline = None;
+    for (query, preference) in [
+        ("", None),
+        ("", Some("return=minimal")),
+        ("", Some("custom=\"x,wait=99\", respond-async")),
+        ("", Some("foo; wait=26")),
+        ("?waitMs=25000", None),
+        ("?waitMs=bad", None),
     ] {
-        tokio::time::timeout(Duration::from_secs(1), f.client.get(path).send())
+        let mut request = f.client.get(format!("/jobs/{}{query}", f.id));
+        if let Some(preference) = preference {
+            request = request.header("Prefer", preference);
+        }
+        let response = tokio::time::timeout(Duration::from_secs(1), request.send())
             .await
-            .unwrap()
-            .assert_json(json!({"state":"running"}))
-            .await;
+            .unwrap();
+        response.assert_status_is_ok();
+        assert!(!response.0.headers().contains_key("Preference-Applied"));
+        let bytes = response.0.into_body().into_vec().await.unwrap();
+        if let Some(baseline) = &baseline {
+            assert_eq!(&bytes, baseline);
+        } else {
+            baseline = Some(bytes);
+        }
     }
     f.close().await;
 }
 
 #[tokio::test]
-async fn terminal_unknown_and_missing_jobs_do_not_wait() {
+async fn terminal_unknown_and_missing_jobs_do_not_delay_a_wait_preference() {
     let f = Fixture::new().await;
     f.sender.send_replace(completed());
-    tokio::time::timeout(Duration::from_secs(1), f.read(25000))
+    tokio::time::timeout(Duration::from_secs(1), f.read(25))
         .await
         .unwrap()
         .unwrap()
         .assert_status_is_ok();
     f.sender.send_replace(Progress::Unknown);
-    let response = tokio::time::timeout(Duration::from_secs(1), f.read(25000))
+    let response = tokio::time::timeout(Duration::from_secs(1), f.read(25))
         .await
         .unwrap()
         .unwrap();
     response.assert_status(StatusCode::ACCEPTED);
+    response.assert_header("Preference-Applied", "wait=25");
     response
         .assert_json(json!({"outcome":"unknown","jobId":f.id.to_string()}))
         .await;
     tokio::time::timeout(
         Duration::from_secs(1),
         f.client
-            .get(format!("/jobs/{}?waitMs=25000", uuid::Uuid::now_v7()))
+            .get(format!("/jobs/{}", uuid::Uuid::now_v7()))
+            .header("Prefer", "wait=25")
             .send(),
     )
     .await
@@ -166,7 +186,7 @@ async fn a_closed_progress_channel_returns_unknown_without_waiting() {
     let mut f = Fixture::new().await;
     let sender = std::mem::replace(&mut f.sender, watch::channel(Progress::Running).0);
     drop(sender);
-    tokio::time::timeout(Duration::from_secs(1), f.read(25000))
+    tokio::time::timeout(Duration::from_secs(1), f.read(25))
         .await
         .unwrap()
         .unwrap()
@@ -175,21 +195,32 @@ async fn a_closed_progress_channel_returns_unknown_without_waiting() {
 }
 
 #[tokio::test]
-async fn jail_waits_fail_fast_at_capacity_and_reject_invalid_bounds() {
+async fn jail_wait_preferences_fail_fast_at_capacity_and_reject_invalid_bounds() {
     let f = Fixture::new().await;
     let busy = f.requests.admission[1].acquire_many(16).await.unwrap();
-    for value in ["25001", "-1", "4294967296", "no", ""] {
+    for value in [
+        "wait=26",
+        "wait=0",
+        "wait=-1",
+        "wait=4294967296",
+        "wait=no",
+        "wait=",
+        "wait",
+        "wait=1.5",
+        "wait=\"2\"",
+    ] {
         tokio::time::timeout(
             Duration::from_secs(1),
             f.client
-                .get(format!("/jobs/{}?waitMs={value}", f.id))
+                .get(format!("/jobs/{}", f.id))
+                .header("Prefer", value)
                 .send(),
         )
         .await
         .unwrap()
         .assert_status(StatusCode::BAD_REQUEST);
     }
-    tokio::time::timeout(Duration::from_secs(1), f.read(25000))
+    tokio::time::timeout(Duration::from_secs(1), f.read(25))
         .await
         .unwrap()
         .unwrap()
@@ -202,7 +233,7 @@ async fn jail_waits_fail_fast_at_capacity_and_reject_invalid_bounds() {
 async fn cancelled_waits_remain_owned_until_the_request_drain_finishes() {
     let mut f = Fixture::new().await;
     tokio::time::pause();
-    let read = f.read(1000);
+    let read = f.read(1);
     f.waiting().await;
     read.abort();
     assert!(matches!(read.await, Err(error) if error.is_cancelled()));
@@ -220,13 +251,13 @@ async fn cancelled_waits_remain_owned_until_the_request_drain_finishes() {
 }
 
 #[tokio::test]
-async fn jail_authentication_and_setup_consume_the_forwarded_wait_budget() {
+async fn jail_authentication_and_setup_consume_the_forwarded_prefer_wait_budget() {
     let mut f = Fixture::new().await;
     let blocked = Arc::clone(&f.auth.gate).acquire_owned().await.unwrap();
     tokio::time::pause();
     tokio::time::advance(Duration::from_secs(601)).await;
     let started = tokio::time::Instant::now();
-    let read = f.read(25000);
+    let read = f.read(25);
     (&mut f.auth.refresh_started).await.unwrap();
     tokio::time::advance(Duration::from_secs(6)).await;
     drop(blocked);
@@ -243,7 +274,7 @@ async fn jail_authentication_and_setup_consume_the_forwarded_wait_budget() {
 }
 
 #[tokio::test]
-async fn a_controller_and_jail_wait_read_returns_the_fake_guests_terminal_result() {
+async fn a_controller_and_jail_prefer_wait_read_returns_the_fake_guests_terminal_result() {
     let mut auth = crate::tests::Fixture::new().await;
     let mut claims = auth.claims();
     let controller_subject = "system:serviceaccount:runner:controller";
@@ -303,15 +334,17 @@ async fn a_controller_and_jail_wait_read_returns_the_fake_guests_terminal_result
     let started = std::time::Instant::now();
     let response = client
         .get(format!(
-            "{base}/v1/jobs/{}?waitMs=20000",
+            "{base}/v1/jobs/{}",
             pending["jobId"].as_str().unwrap()
         ))
         .bearer_auth(&token)
+        .header("Prefer", "wait=20")
         .send()
         .await
         .unwrap();
     let elapsed = started.elapsed();
     assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["Preference-Applied"], "wait=20");
     let terminal: serde_json::Value = response.json().await.unwrap();
     assert_eq!(
         terminal,
@@ -319,7 +352,7 @@ async fn a_controller_and_jail_wait_read_returns_the_fake_guests_terminal_result
     );
     assert!(elapsed < Duration::from_secs(20));
     println!(
-        "job-wait smoke: exec=202 waitMs=20000 elapsedMs={} result={terminal}",
+        "job-wait smoke: exec=202 Prefer=wait=20 Preference-Applied=wait=20 elapsedMs={} result={terminal}",
         elapsed.as_millis()
     );
     peer.await.unwrap();
@@ -327,4 +360,25 @@ async fn a_controller_and_jail_wait_read_returns_the_fake_guests_terminal_result
     state.drain().await.unwrap();
     f.tasks.shutdown().await;
     auth.tasks.shutdown().await;
+}
+
+#[tokio::test]
+async fn the_first_wait_preference_is_used_across_prefer_header_lines() {
+    let f = Fixture::new().await;
+    f.sender.send_replace(completed());
+    for first in [
+        "return=minimal, WAIT = 02; note=\"a,b\"",
+        "custom=\"comma,wait=99\"",
+    ] {
+        let response = f
+            .client
+            .get(format!("/jobs/{}", f.id))
+            .header("Prefer", first)
+            .header("Prefer", "wait=2, wait=26")
+            .send()
+            .await;
+        response.assert_status_is_ok();
+        response.assert_header("Preference-Applied", "wait=2");
+    }
+    f.close().await;
 }

@@ -191,15 +191,17 @@ impl Fixture {
                         assert_eq!(request.headers()["authorization"], format!("Bearer {}", token.trim()));
                         let mut response = hyper::Response::builder();
                         if request.uri().path().starts_with("/jobs/") {
-                            let wait = url::form_urlencoded::parse(request.uri().query().unwrap_or_default().as_bytes())
-                                .find(|(key, _)| key == "waitMs").map(|(_, value)| value.parse::<u32>().unwrap());
+                            assert!(request.uri().query().is_none());
+                            let wait = request.headers().get("Prefer").map(|value| value.to_str().unwrap().strip_prefix("wait=").unwrap().parse::<u32>().unwrap());
+                            let deadline = tokio::time::Instant::now() + Duration::from_secs(wait.unwrap_or(0).into());
                             waits.lock().unwrap().push(wait);
                             if stalling.load(Ordering::SeqCst) {
                                 let stream = futures_util::stream::pending::<Result<hyper::body::Frame<hyper::body::Bytes>, std::convert::Infallible>>();
                                 return Ok(response.body(http_body_util::StreamBody::new(stream).boxed()).unwrap());
                             }
                             if waiting.load(Ordering::SeqCst) {
-                                tokio::time::sleep(Duration::from_millis(wait.unwrap_or(0).into())).await;
+                                tokio::time::sleep_until(deadline).await;
+                                if let Some(wait) = wait { response = response.header("Preference-Applied", format!("wait={wait}")); }
                                 return Ok(response.body(Full::new(hyper::body::Bytes::from_static(b"{\"state\":\"running\"}")).boxed()).unwrap());
                             }
                         }
@@ -339,14 +341,14 @@ async fn lazy_pods_proxy_exec_and_jobs_only_for_the_owner() {
             .job(SUBJECT, &pending.job_id, None)
             .await
             .unwrap(),
-        JobResponse::Ok(Json(JobStatus::Running(_)))
+        JobResponse::Ok(Json(JobStatus::Running(_)), _)
     ));
     assert!(matches!(
         f.controller
             .job(SUBJECT, &pending.job_id, None)
             .await
             .unwrap(),
-        JobResponse::Ok(Json(JobStatus::Complete(ExecResult::NotExecuted(_))))
+        JobResponse::Ok(Json(JobStatus::Complete(ExecResult::NotExecuted(_))), _)
     ));
     let token_file = &f.controller.config.jails.as_ref().unwrap().token_file;
     let old = tokio::fs::read_to_string(token_file).await.unwrap();

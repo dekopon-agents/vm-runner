@@ -2,7 +2,7 @@ use super::*;
 use crate::job_wait::JobWait;
 use poem_openapi::{
     OpenApi, Union,
-    param::{Path, Query},
+    param::{Header, Path},
 };
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -205,14 +205,17 @@ pub(crate) fn oversized() -> poem::Response {
 #[oai(bad_request_handler = "bad_job_request")]
 enum JobResponse {
     #[oai(status = 200)]
-    Ok(Json<JobStatus>),
+    Ok(
+        Json<JobStatus>,
+        #[oai(header = "Preference-Applied")] Option<String>,
+    ),
     #[oai(status = 400)]
     Invalid(PlainText<String>),
     #[oai(status = 401)]
     Unauthorized(Json<crate::Refusal>),
 }
 fn bad_job_request(_: poem::Error) -> JobResponse {
-    JobResponse::Invalid(PlainText("invalid waitMs".into()))
+    JobResponse::Invalid(PlainText("invalid Prefer wait".into()))
 }
 #[derive(Clone)]
 pub(super) struct Job {
@@ -402,23 +405,31 @@ impl Controller {
             .map_err(|()| Error::Protocol)?
             .extend(["jobs", &job.jail_id]);
         let mut request = self.request(reqwest::Method::GET, url).await?;
+        let mut expected_preference = None;
         if let Some(wait) = wait {
             let remaining = wait
                 .deadline
                 .saturating_duration_since(tokio::time::Instant::now());
             let budget = remaining.saturating_sub(Duration::from_secs(1));
-            let forwarded_ms = u128::from(wait.requested_ms).min(budget.as_millis()) as u32;
-            if forwarded_ms == 0 {
+            let forwarded_seconds = u64::from(wait.requested_seconds).min(budget.as_secs());
+            if forwarded_seconds == 0 {
                 return Err(Error::Http {
                     timeout: true,
                     connect: false,
                 });
             }
-            request = request
-                .query(&[("waitMs", forwarded_ms)])
-                .timeout(remaining);
+            let preference = format!("wait={forwarded_seconds}");
+            expected_preference = Some(preference.clone());
+            request = request.header("Prefer", preference).timeout(remaining);
         }
         let response = request.send().await?;
+        let acknowledged = expected_preference.is_some_and(|expected| {
+            response
+                .headers()
+                .get("Preference-Applied")
+                .is_some_and(|value| value == expected.as_str())
+        });
+        let applied = wait.filter(|_| acknowledged).map(JobWait::applied);
         if response.status().as_u16() == 404 {
             self.jobs.lock().expect("job registry poisoned").remove(id);
             tracing::Span::current().record("vm_runner.job.state", "not_found");
@@ -428,9 +439,10 @@ impl Controller {
             let _: Pending = json(response).await?;
             tracing::Span::current().record("vm_runner.job.state", "unknown");
             self.jobs.lock().expect("job registry poisoned").remove(id);
-            return Ok(JobResponse::Ok(Json(JobStatus::Complete(refused(
-                "unknown",
-            )))));
+            return Ok(JobResponse::Ok(
+                Json(JobStatus::Complete(refused("unknown"))),
+                applied,
+            ));
         }
         let mut status = json(checked(response, 200)?).await?;
         match &mut status {
@@ -442,7 +454,7 @@ impl Controller {
                 tracing::Span::current().record("vm_runner.job.state", "running");
             }
         }
-        Ok(JobResponse::Ok(Json(status)))
+        Ok(JobResponse::Ok(Json(status), applied))
     }
 }
 pub(crate) struct Api;
@@ -492,11 +504,7 @@ impl Api {
         request: &poem::Request,
         state: poem::web::Data<&Arc<crate::State>>,
         #[oai(name = "jobId")] job_id: Path<String>,
-        #[oai(
-            name = "waitMs",
-            validator(minimum(value = "0"), maximum(value = "25000"))
-        )]
-        _wait_ms: Query<Option<u32>>,
+        #[oai(name = "Prefer")] _prefer: Header<Option<String>>,
     ) -> Result<JobResponse, ResponseError> {
         let subject = match state.authenticate(request).await {
             Ok(s) => s,
@@ -505,7 +513,7 @@ impl Api {
         let wait = request.extensions().get::<JobWait>().copied();
         let span = tracing::info_span!(target: crate::config::Category::VmExec.target(), "vm_runner.job.get",
             telemetry.detail = crate::telemetry::detail!(crate::config::Category::VmExec),
-            vm_runner.job.wait_ms = wait.map_or(0, |wait| wait.requested_ms),
+            vm_runner.job.wait_ms = wait.map_or(0, |wait| wait.requested_seconds * 1000),
             vm_runner.job.state = "failed");
         let result = controller(&state)?
             .job(&subject, &job_id, wait)

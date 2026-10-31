@@ -161,13 +161,10 @@ paths:
         required: true
         deprecated: false
         explode: true
-      - name: waitMs
+      - name: Prefer
         schema:
-          type: integer
-          format: uint32
-          maximum: 25000.0
-          minimum: 0.0
-        in: query
+          type: string
+        in: header
         required: false
         deprecated: false
         explode: true
@@ -178,6 +175,11 @@ paths:
             application/json; charset=utf-8:
               schema:
                 $ref: '#/components/schemas/JobStatus'
+          headers:
+            PREFERENCE-APPLIED:
+              deprecated: false
+              schema:
+                type: string
         '400':
           description: ''
           content:
@@ -500,13 +502,10 @@ paths:
         required: true
         deprecated: false
         explode: true
-      - name: waitMs
+      - name: Prefer
         schema:
-          type: integer
-          format: uint32
-          maximum: 25000.0
-          minimum: 0.0
-        in: query
+          type: string
+        in: header
         required: false
         deprecated: false
         explode: true
@@ -517,12 +516,22 @@ paths:
             application/json; charset=utf-8:
               schema:
                 $ref: '#/components/schemas/View'
+          headers:
+            PREFERENCE-APPLIED:
+              deprecated: false
+              schema:
+                type: string
         '202':
           description: ''
           content:
             application/json; charset=utf-8:
               schema:
                 $ref: '#/components/schemas/Unknown'
+          headers:
+            PREFERENCE-APPLIED:
+              deprecated: false
+              schema:
+                type: string
 components:
   schemas:
     Artifact:

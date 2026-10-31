@@ -285,9 +285,9 @@ async fn terminal_unknown_is_terminal_and_polling_does_not_count_as_activity() {
             .job(SUBJECT, &pending.job_id, None)
             .await
             .unwrap(),
-        JobResponse::Ok(Json(JobStatus::Running(_)))
+        JobResponse::Ok(Json(JobStatus::Running(_)), _)
     ));
-    let JobResponse::Ok(Json(JobStatus::Complete(ExecResult::NotExecuted(unknown)))) = f
+    let JobResponse::Ok(Json(JobStatus::Complete(ExecResult::NotExecuted(unknown))), _) = f
         .controller
         .job(SUBJECT, &pending.job_id, None)
         .await

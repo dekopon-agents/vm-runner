@@ -161,6 +161,16 @@ paths:
         required: true
         deprecated: false
         explode: true
+      - name: waitMs
+        schema:
+          type: integer
+          format: uint32
+          maximum: 25000.0
+          minimum: 0.0
+        in: query
+        required: false
+        deprecated: false
+        explode: true
       responses:
         '200':
           description: ''
@@ -168,6 +178,12 @@ paths:
             application/json; charset=utf-8:
               schema:
                 $ref: '#/components/schemas/JobStatus'
+        '400':
+          description: ''
+          content:
+            text/plain; charset=utf-8:
+              schema:
+                type: string
         '401':
           description: ''
           content:
@@ -482,6 +498,16 @@ paths:
           type: string
         in: path
         required: true
+        deprecated: false
+        explode: true
+      - name: waitMs
+        schema:
+          type: integer
+          format: uint32
+          maximum: 25000.0
+          minimum: 0.0
+        in: query
+        required: false
         deprecated: false
         explode: true
       responses:

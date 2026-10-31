@@ -281,11 +281,17 @@ async fn terminal_unknown_is_terminal_and_polling_does_not_count_as_activity() {
         .active = active;
     let patches = f.patches.load(Ordering::SeqCst);
     assert!(matches!(
-        f.controller.job(SUBJECT, &pending.job_id).await.unwrap(),
+        f.controller
+            .job(SUBJECT, &pending.job_id, None)
+            .await
+            .unwrap(),
         JobResponse::Ok(Json(JobStatus::Running(_)))
     ));
-    let JobResponse::Ok(Json(JobStatus::Complete(ExecResult::NotExecuted(unknown)))) =
-        f.controller.job(SUBJECT, &pending.job_id).await.unwrap()
+    let JobResponse::Ok(Json(JobStatus::Complete(ExecResult::NotExecuted(unknown)))) = f
+        .controller
+        .job(SUBJECT, &pending.job_id, None)
+        .await
+        .unwrap()
     else {
         panic!("terminal unknown")
     };
@@ -298,7 +304,7 @@ async fn terminal_unknown_is_terminal_and_polling_does_not_count_as_activity() {
             .contains_key(&pending.job_id)
     );
     assert!(matches!(
-        f.controller.job(SUBJECT, &pending.job_id).await,
+        f.controller.job(SUBJECT, &pending.job_id, None).await,
         Err(Error::NotFound)
     ));
     assert_eq!(f.controller.sessions.lock().unwrap()[&id].active, active);

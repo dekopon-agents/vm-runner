@@ -1,4 +1,5 @@
 use super::*;
+mod wait;
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 

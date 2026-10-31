@@ -242,9 +242,12 @@ async fn jail_vmm_has_no_new_privileges_and_confined_identity_and_egress() {
         assert_eq!(after.iter().find(|f| f["path"] == "proof.mp4").unwrap()["sha256"], prior_hash);
         assert_eq!(read_artifact(&api, &token, after.iter().find(|f| f["path"] == "proof.mp4").unwrap()).await, proof.bytes);
 
-        exec(&api, &token, "browse open 'data:text/html,<title>Selected green tab</title><body style=\"background:%2311cc33\">Selected green tab</body>'").await;
-        exec(&api, &token, "browse open --tab 'data:text/html,<title>Last purple tab</title><body style=\"background:%23cc11cc\">Last purple tab</body>'").await;
-        exec(&api, &token, "browse tab 0").await;
+        exec(&api, &token, r#"browse <<'BROWSE'
+open 'data:text/html,<title>Selected green tab</title><body style="background:%2311cc33">Selected green tab</body>'
+open --tab 'data:text/html,<title>Last purple tab</title><body style="background:%23cc11cc">Last purple tab</body>'
+tab 0
+BROWSE"#).await;
+        assert_eq!(exec(&api, &token, "browse eval 'getComputedStyle(document.body).backgroundColor'").await["stdout"], "\"rgb(17, 204, 51)\"\n", "browse must select the green tab before recording");
         let mut sampled = Vec::new();
         succeeded(exec_job(&api, &token, "browse record current", 1000, async || {
             sampled.push(list_artifacts(&api, &token).await);

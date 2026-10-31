@@ -67,6 +67,7 @@ const path = require('node:path');
       }
     }
     if (!page) throw new Error(target ? `no CDP target ${target}` : 'no CDP tab to record');
+    await page.bringToFront();
     await page.setViewportSize({width:1280, height:720});
     cdp = await page.context().newCDPSession(page);
     await cdp.send('Page.enable');

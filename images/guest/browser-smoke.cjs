@@ -54,7 +54,7 @@ function exec(argv, expectedCode = 0) {
     assert.deepEqual(fs.readdirSync('/artifacts'), artifacts);
     assert.equal(await exec(['browse', 'eval', "typeof window.recordTimer === 'undefined'"]), 'true\n');
     const failedCapture = await exec(['sh', '-c', `
-      record-cdp --seconds 1 capture-failed &
+      browse record capture-failed --seconds 1 &
       recorder=$!
       while :; do
         for work in /scratch/recordings/.record.*; do
@@ -67,7 +67,7 @@ function exec(argv, expectedCode = 0) {
       wait "$recorder" || code=$?
       test "$code" -eq 1
     `]);
-    assert.match(failedCapture, /EISDIR/);
+    assert.match(failedCapture, /^error: record-cdp exited 1: record-cdp: EISDIR:[^\n]+\n$/);
     assert.equal(await exec(['browse', 'eval', "typeof window.recordTimer === 'number' && document.querySelector('[data-cdp-recording]') === null"]), 'true\n');
     assert.deepEqual(fs.readdirSync('/scratch/recordings'), recordings);
     assert.deepEqual(fs.readdirSync('/artifacts'), artifacts);

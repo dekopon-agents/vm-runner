@@ -114,7 +114,11 @@ const path = require('node:path');
     }
     await browser.close().catch(() => {});
   }
-})().catch(e => { console.error(e); process.exit(1); });
+})().catch(e => {
+  console.error(e);
+  console.error(`record-cdp: ${String(e?.message ?? e).split('\n')[0]}`);
+  process.exit(1);
+});
 JS
 cp "$work/frame00.png" "$work/preview.png"
 grep -E 'MemTotal|MemFree|MemAvailable' /proc/meminfo

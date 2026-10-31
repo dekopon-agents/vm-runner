@@ -233,6 +233,7 @@ impl Requests {
         if let Some(controller) = &self.controller {
             let _executed = controller.execution.acquire().await?;
             let _read = controller.reads.acquire().await?;
+            let _waited = controller.waits.acquire().await?;
         }
         let _reaped = self.reaper_drain.acquire().await?;
         if let Ok(mut rollups) = self.rollups.lock() {
@@ -298,24 +299,26 @@ fn endpoint(
         .around(move |ep, mut req| {
             let state = std::sync::Arc::clone(&state);
             let rollups = std::sync::Arc::clone(&rollups);
-            // Slow C4 operations never own API admission. GETs have their own worker
-            // so a cold boot or long exec cannot block job/artifact reads.
-            // Poem matches literal path segments before percent-decoding captured parameters.
-            let admission = match &state.controller {
-                Some(controller)
-                    if req.uri().path().starts_with("/v1/sessions/")
-                        || req.uri().path().starts_with("/v1/jobs/") =>
-                {
-                    std::sync::Arc::clone(if req.method() == poem::http::Method::GET {
-                        &controller.reads
-                    } else {
-                        &controller.execution
-                    })
-                }
-                _ => std::sync::Arc::clone(&admission),
-            };
+            let admission = std::sync::Arc::clone(&admission);
             async move {
                 let wait = job_wait::JobWait::prepare(&mut req, Origin::Controller)?;
+                // Slow C4 operations never own API admission. GETs have their own worker
+                // so a cold boot or long exec cannot block job/artifact reads.
+                // Poem matches literal path segments before percent-decoding captured parameters.
+                let admission = match &state.controller {
+                    Some(controller) if wait.is_some() => std::sync::Arc::clone(&controller.waits),
+                    Some(controller)
+                        if req.uri().path().starts_with("/v1/sessions/")
+                            || req.uri().path().starts_with("/v1/jobs/") =>
+                    {
+                        std::sync::Arc::clone(if req.method() == poem::http::Method::GET {
+                            &controller.reads
+                        } else {
+                            &controller.execution
+                        })
+                    }
+                    _ => admission,
+                };
                 // Admit before creating the span so cancellation cannot queue an unbounded export.
                 let permit = job_wait::JobWait::admit(wait, admission).await?;
                 let runtime = tokio::runtime::Handle::current();

@@ -27,6 +27,7 @@ pub(crate) struct Fixture {
     pod_read_delay: Arc<AtomicUsize>,
     pod_read_started: Arc<tokio::sync::Notify>,
     job_waits: Arc<Mutex<Vec<Option<u32>>>>,
+    job_read_hold: Arc<Mutex<Option<tokio::sync::oneshot::Receiver<()>>>>,
     wait_for_jobs: Arc<std::sync::atomic::AtomicBool>,
     stall_job_body: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -151,6 +152,8 @@ impl Fixture {
         let listing = Arc::clone(&artifact_list);
         let job_waits = Arc::new(Mutex::new(Vec::new()));
         let waits = Arc::clone(&job_waits);
+        let job_read_hold = Arc::new(Mutex::new(None::<tokio::sync::oneshot::Receiver<()>>));
+        let hold = Arc::clone(&job_read_hold);
         let wait_for_jobs = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let waiting = Arc::clone(&wait_for_jobs);
         let stall_job_body = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -167,6 +170,7 @@ impl Fixture {
         } else {
             tasks.spawn(async move {
             let jobs = Arc::new(AtomicUsize::new(0));
+            let mut connections = tokio::task::JoinSet::new();
             loop {
                 let (stream, _) = listener.accept().await.unwrap();
                 let token_file = token_file.clone();
@@ -175,6 +179,7 @@ impl Fixture {
                 let health = Arc::clone(&health);
                 let listing = Arc::clone(&listing);
                 let waits = Arc::clone(&waits);
+                let hold = Arc::clone(&hold);
                 let waiting = Arc::clone(&waiting);
                 let stalling = Arc::clone(&stalling);
                 let service = hyper::service::service_fn(move |request: hyper::Request<hyper::body::Incoming>| {
@@ -184,6 +189,7 @@ impl Fixture {
                     let health = Arc::clone(&health);
                     let listing = Arc::clone(&listing);
                     let waits = Arc::clone(&waits);
+                    let hold = Arc::clone(&hold);
                     let waiting = Arc::clone(&waiting);
                     let stalling = Arc::clone(&stalling);
                     async move {
@@ -200,7 +206,8 @@ impl Fixture {
                                 return Ok(response.body(http_body_util::StreamBody::new(stream).boxed()).unwrap());
                             }
                             if waiting.load(Ordering::SeqCst) {
-                                tokio::time::sleep_until(deadline).await;
+                                let held = if wait.is_some() { hold.lock().unwrap().take() } else { None };
+                                if let Some(held) = held { held.await.unwrap(); } else { tokio::time::sleep_until(deadline).await; }
                                 if let Some(wait) = wait { response = response.header("Preference-Applied", format!("wait={wait}")); }
                                 return Ok(response.body(Full::new(hyper::body::Bytes::from_static(b"{\"state\":\"running\"}")).boxed()).unwrap());
                             }
@@ -244,7 +251,9 @@ impl Fixture {
                         Ok::<_, std::convert::Infallible>(response.body(Full::new(hyper::body::Bytes::from(body)).boxed()).unwrap())
                     }
                 });
-                let _disconnected = hyper::server::conn::http1::Builder::new().keep_alive(false).serve_connection(hyper_util::rt::TokioIo::new(stream), service).await;
+                connections.spawn(async move {
+                    let _disconnected = hyper::server::conn::http1::Builder::new().keep_alive(false).serve_connection(hyper_util::rt::TokioIo::new(stream), service).await;
+                });
             }
         });
         }
@@ -268,6 +277,7 @@ impl Fixture {
             pod_read_delay,
             pod_read_started,
             job_waits,
+            job_read_hold,
             wait_for_jobs,
             stall_job_body,
         }

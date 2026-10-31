@@ -19,8 +19,8 @@ pub(crate) struct Fixture {
     ec: EncodingKey,
     rsa: EncodingKey,
     calls: Arc<AtomicUsize>,
-    gate: Arc<tokio::sync::Semaphore>,
-    refresh_started: tokio::sync::oneshot::Receiver<()>,
+    pub(crate) gate: Arc<tokio::sync::Semaphore>,
+    pub(crate) refresh_started: tokio::sync::oneshot::Receiver<()>,
     pub(crate) tasks: tokio::task::JoinSet<()>,
 }
 impl Fixture {

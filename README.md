@@ -90,6 +90,7 @@ reserved pod on first use, then proxies C7. It returns a terminal result (200), 
 controller job ID (202) for `GET /v1/jobs/{jobId}`. Sessions and jobs are subject-scoped;
 stdout/stderr are capped at 64 KiB each. The job map is capped at 64 per session and 1024
 globally; a full map refuses exec before dispatch. `deadlineMs` must be 1000–25000.
+`GET /v1/jobs/{jobId}?waitMs=N` waits up to 25000 ms for completion; omit `waitMs` or use 0 for an immediate read.
 A jail's terminal unknown job returns 200 `not_executed` with reason `unknown` and removes
 the controller handle. Polling never refreshes session activity. Terminal boot failure retires
 the reservation; transport/health errors return 502 `not_executed` without destroying it.

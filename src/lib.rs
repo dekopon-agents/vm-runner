@@ -7,6 +7,7 @@ pub mod egress;
 pub mod guest;
 #[cfg(unix)]
 pub mod jail;
+mod job_wait;
 mod request_rollups;
 pub mod telemetry;
 mod tls;
@@ -314,11 +315,9 @@ fn endpoint(
                 _ => std::sync::Arc::clone(&admission),
             };
             async move {
+                let wait = job_wait::JobWait::prepare(&mut req, Origin::Controller)?;
                 // Admit before creating the span so cancellation cannot queue an unbounded export.
-                let permit = admission
-                    .acquire_owned()
-                    .await
-                    .map_err(poem::error::InternalServerError)?;
+                let permit = job_wait::JobWait::admit(wait, admission).await?;
                 let runtime = tokio::runtime::Handle::current();
                 let dispatch = tracing::dispatcher::get_default(Clone::clone);
                 // The worker owns the entire request so cancellation cannot export on Tokio.
@@ -330,7 +329,7 @@ fn endpoint(
                         let health = path == "/healthz" && req.method() == poem::http::Method::GET;
                         runtime.block_on(
                             async move {
-                                let result = async {
+                                let result = job_wait::JobWait::complete(wait, async {
                                     if req.uri().path() != "/healthz"
                                         || req.method() != poem::http::Method::GET
                                     {
@@ -364,7 +363,7 @@ fn endpoint(
                                         }
                                     }
                                     ep.call(req).await
-                                }
+                                })
                                 .await;
                                 if !health {
                                     record_request(&rollups, &result, &path);
@@ -420,16 +419,14 @@ pub(crate) fn traced(
         capacity,
         rollups: std::sync::Arc::clone(&rollups),
     };
-    let endpoint = endpoint.map_to_response().around(move |ep, req| {
+    let endpoint = endpoint.map_to_response().around(move |ep, mut req| {
         let rollups = std::sync::Arc::clone(&rollups);
         let admission =
             std::sync::Arc::clone(&admission[usize::from(req.method() == poem::http::Method::GET)]);
         async move {
+            let wait = job_wait::JobWait::prepare(&mut req, Origin::Jail)?;
             // Admit before creating the span so cancellation cannot queue an unbounded export.
-            let permit = admission
-                .acquire_owned()
-                .await
-                .map_err(poem::error::InternalServerError)?;
+            let permit = job_wait::JobWait::admit(wait, admission).await?;
             let runtime = tokio::runtime::Handle::current();
             let dispatch = tracing::dispatcher::get_default(Clone::clone);
             // The worker owns the entire request so cancellation cannot export on Tokio.
@@ -441,7 +438,7 @@ pub(crate) fn traced(
                     let health = path == "/healthz" && req.method() == poem::http::Method::GET;
                     runtime.block_on(
                         async move {
-                            let result = ep.call(req).await;
+                            let result = job_wait::JobWait::complete(wait, ep.call(req)).await;
                             if !health {
                                 record_request(&rollups, &result, &path);
                             }

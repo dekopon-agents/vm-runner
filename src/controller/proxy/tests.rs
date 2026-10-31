@@ -1,6 +1,7 @@
 #![cfg(unix)]
 use super::*;
 mod resilience;
+mod wait;
 use base64::{
     Engine,
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
@@ -10,9 +11,9 @@ use serde_json::{Value, json};
 use std::sync::atomic::{AtomicUsize, Ordering};
 pub(super) const SUBJECT: &str = "system:serviceaccount:dekopon:default";
 type Captures = Arc<Mutex<Vec<Value>>>;
-pub(super) struct Fixture {
+pub(crate) struct Fixture {
     pub(super) controller: Arc<Controller>,
-    pub(super) tasks: tokio::task::JoinSet<()>,
+    pub(crate) tasks: tokio::task::JoinSet<()>,
     pub(super) artifact_list: Arc<Mutex<String>>,
     _files: tempfile::TempDir,
     captured: Captures,
@@ -23,16 +24,41 @@ pub(super) struct Fixture {
     health_status: Arc<AtomicUsize>,
     patches: Arc<AtomicUsize>,
     pod_status: Arc<Mutex<Option<Value>>>,
+    pod_read_delay: Arc<AtomicUsize>,
+    pod_read_started: Arc<tokio::sync::Notify>,
+    job_waits: Arc<Mutex<Vec<Option<u32>>>>,
+    wait_for_jobs: Arc<std::sync::atomic::AtomicBool>,
+    stall_job_body: Arc<std::sync::atomic::AtomicBool>,
 }
 impl Fixture {
     pub(super) async fn new() -> Self {
+        Self::setup(None).await
+    }
+    pub(crate) async fn with_jail(
+        endpoint: poem::endpoint::BoxEndpoint<'static, poem::Response>,
+        token: String,
+        auth: crate::config::Auth,
+    ) -> Self {
+        Self::setup(Some((endpoint, token, auth))).await
+    }
+    async fn setup(
+        jail: Option<(
+            poem::endpoint::BoxEndpoint<'static, poem::Response>,
+            String,
+            crate::config::Auth,
+        )>,
+    ) -> Self {
         let files = tempfile::tempdir().unwrap();
         let token = format!("{}.{}.AA", URL_SAFE_NO_PAD.encode(r#"{"alg":"RS256"}"#), URL_SAFE_NO_PAD.encode(json!({"sub":"system:serviceaccount:runner:controller","iss":"https://kubernetes.default.svc","aud":["vm-runner-jail"]}).to_string()));
+        let token = jail.as_ref().map_or(token, |(_, token, _)| token.clone());
         let token_file = files.path().join("token");
         tokio::fs::write(&token_file, &token).await.unwrap();
         let mut config: Config =
             serde_yaml_ng::from_str(include_str!("../../../examples/vm-runner.yaml")).unwrap();
         config.jails = Some(serde_json::from_value(json!({"namespace":"jails","image":format!("runner@sha256:{}", "a".repeat(64)),"imageCacheHostPath":"/var/cache/images","controllerAudience":"vm-runner-jail","controllerSubject":"system:serviceaccount:runner:controller","tokenFile":token_file})).unwrap());
+        if let Some((_, _, auth)) = &jail {
+            config.auth = auth.clone();
+        }
         let captured = Arc::new(Mutex::new(Vec::new()));
         let captures = Arc::clone(&captured);
         let (service, mut mock) = tower_test::mock::pair::<
@@ -50,6 +76,10 @@ impl Fixture {
         let patch_count = Arc::clone(&patches);
         let pod_status = Arc::new(Mutex::new(None::<Value>));
         let current_status = Arc::clone(&pod_status);
+        let pod_read_delay = Arc::new(AtomicUsize::new(0));
+        let read_delay = Arc::clone(&pod_read_delay);
+        let pod_read_started = Arc::new(tokio::sync::Notify::new());
+        let read_started = Arc::clone(&pod_read_started);
         tasks.spawn(async move {
             let mut pod = Value::Null;
             let mut deleted = false;
@@ -93,6 +123,11 @@ impl Fixture {
                     }
                     "GET" if deleted => { status = 404; json!({"kind":"Status","apiVersion":"v1","code":404,"status":"Failure","reason":"NotFound","message":"gone"}) }
                     "GET" => {
+                        let delay = read_delay.load(Ordering::SeqCst);
+                        if delay > 0 {
+                            read_started.notify_one();
+                            tokio::time::sleep(Duration::from_millis(delay as u64)).await;
+                        }
                         if let Some(status) = &*current_status.lock().unwrap() {
                             pod["status"] = status.clone();
                         }
@@ -114,7 +149,23 @@ impl Fixture {
             json!([{"path":"nested/a file%.bin","bytes":6,"sha256":"a".repeat(64)}]).to_string(),
         ));
         let listing = Arc::clone(&artifact_list);
-        tasks.spawn(async move {
+        let job_waits = Arc::new(Mutex::new(Vec::new()));
+        let waits = Arc::clone(&job_waits);
+        let wait_for_jobs = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let waiting = Arc::clone(&wait_for_jobs);
+        let stall_job_body = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stalling = Arc::clone(&stall_job_body);
+        if let Some((endpoint, _, _)) = jail {
+            tasks.spawn(async move {
+                poem::Server::new_with_acceptor(
+                    poem::listener::TcpAcceptor::from_tokio(listener).unwrap(),
+                )
+                .run(endpoint)
+                .await
+                .unwrap();
+            });
+        } else {
+            tasks.spawn(async move {
             let jobs = Arc::new(AtomicUsize::new(0));
             loop {
                 let (stream, _) = listener.accept().await.unwrap();
@@ -123,16 +174,35 @@ impl Fixture {
                 let jobs = Arc::clone(&jobs);
                 let health = Arc::clone(&health);
                 let listing = Arc::clone(&listing);
+                let waits = Arc::clone(&waits);
+                let waiting = Arc::clone(&waiting);
+                let stalling = Arc::clone(&stalling);
                 let service = hyper::service::service_fn(move |request: hyper::Request<hyper::body::Incoming>| {
                     let token_file = token_file.clone();
                     let counter = Arc::clone(&counter);
                     let jobs = Arc::clone(&jobs);
                     let health = Arc::clone(&health);
                     let listing = Arc::clone(&listing);
+                    let waits = Arc::clone(&waits);
+                    let waiting = Arc::clone(&waiting);
+                    let stalling = Arc::clone(&stalling);
                     async move {
                         let token = tokio::fs::read_to_string(token_file).await.unwrap();
                         assert_eq!(request.headers()["authorization"], format!("Bearer {}", token.trim()));
                         let mut response = hyper::Response::builder();
+                        if request.uri().path().starts_with("/jobs/") {
+                            let wait = url::form_urlencoded::parse(request.uri().query().unwrap_or_default().as_bytes())
+                                .find(|(key, _)| key == "waitMs").map(|(_, value)| value.parse::<u32>().unwrap());
+                            waits.lock().unwrap().push(wait);
+                            if stalling.load(Ordering::SeqCst) {
+                                let stream = futures_util::stream::pending::<Result<hyper::body::Frame<hyper::body::Bytes>, std::convert::Infallible>>();
+                                return Ok(response.body(http_body_util::StreamBody::new(stream).boxed()).unwrap());
+                            }
+                            if waiting.load(Ordering::SeqCst) {
+                                tokio::time::sleep(Duration::from_millis(wait.unwrap_or(0).into())).await;
+                                return Ok(response.body(Full::new(hyper::body::Bytes::from_static(b"{\"state\":\"running\"}")).boxed()).unwrap());
+                            }
+                        }
                         if request.uri().path() == "/artifacts/stall" {
                             let stream = futures_util::stream::pending::<Result<hyper::body::Frame<hyper::body::Bytes>, std::convert::Infallible>>();
                             return Ok(response.header("sha256", "a".repeat(64)).header("Content-Length", 6).body(http_body_util::StreamBody::new(stream).boxed()).unwrap());
@@ -175,6 +245,7 @@ impl Fixture {
                 let _disconnected = hyper::server::conn::http1::Builder::new().keep_alive(false).serve_connection(hyper_util::rt::TokioIo::new(stream), service).await;
             }
         });
+        }
         let mut controller = Controller::new(Arc::new(config), Client::new(service, "jails"))
             .await
             .unwrap();
@@ -192,9 +263,35 @@ impl Fixture {
             patches,
             pod_status,
             artifact_list,
+            pod_read_delay,
+            pod_read_started,
+            job_waits,
+            wait_for_jobs,
+            stall_job_body,
         }
     }
-    pub(super) fn session(&self) -> String {
+    pub(crate) async fn api_endpoint(
+        &self,
+        fixture: &crate::tests::Fixture,
+    ) -> poem::endpoint::BoxEndpoint<'static, poem::Response> {
+        use poem::EndpointExt;
+        crate::endpoint(
+            Arc::new(crate::State {
+                auth: crate::Authenticator::new(fixture.config.auth.clone())
+                    .await
+                    .unwrap(),
+                config: Arc::clone(&self.controller.config),
+                controller: Some(Arc::clone(&self.controller)),
+            }),
+            Arc::new(tokio::sync::Semaphore::new(1)),
+            Arc::new(Mutex::new(crate::RequestRollups::new(
+                crate::Origin::Controller,
+            ))),
+        )
+        .map_to_response()
+        .boxed()
+    }
+    pub(crate) fn session(&self) -> String {
         let Created::New(Json(session)) = self
             .controller
             .create(
@@ -234,15 +331,21 @@ async fn lazy_pods_proxy_exec_and_jobs_only_for_the_owner() {
     };
     assert_ne!(pending.job_id, "remote-id");
     assert!(matches!(
-        f.controller.job("other", &pending.job_id).await,
+        f.controller.job("other", &pending.job_id, None).await,
         Err(Error::NotFound)
     ));
     assert!(matches!(
-        f.controller.job(SUBJECT, &pending.job_id).await.unwrap(),
+        f.controller
+            .job(SUBJECT, &pending.job_id, None)
+            .await
+            .unwrap(),
         JobResponse::Ok(Json(JobStatus::Running(_)))
     ));
     assert!(matches!(
-        f.controller.job(SUBJECT, &pending.job_id).await.unwrap(),
+        f.controller
+            .job(SUBJECT, &pending.job_id, None)
+            .await
+            .unwrap(),
         JobResponse::Ok(Json(JobStatus::Complete(ExecResult::NotExecuted(_))))
     ));
     let token_file = &f.controller.config.jails.as_ref().unwrap().token_file;

@@ -83,15 +83,30 @@ route, with a non-secret dummy key. It does not create a grant: absent model
 routing fails closed, and egress still requires the subject's proxy grant.
 
 Inside a jail, open a tab first (for example, `browse open 'data:text/html,<p>Capture me</p>'`),
-then run `record-cdp proof`. It records the last tab `browse tabs` lists, not necessarily browse's
-current tab, and does not open a page itself.
-It captures 30 1280×720 PNG frames from CDP `Page.startScreencast` (not screenshots), encodes
-a 30-second H.264 MP4 with faststart in a private `/scratch/recordings` directory
-and probes it. Each finished file is copied into an unnamed `O_TMPFILE` in
+then run `browse record proof` to record the current tab (the `*` in `browse tabs`) for
+10 seconds. `browse record proof --seconds 3` selects a shorter duration; the range is 1–30.
+NAME has no `.mp4` suffix and must keep NAME.mp4 within the provider's 128-character flat-name limit.
+`record-cdp --help` describes the lower-level tool: `record-cdp proof` still records the last
+tab for 30 seconds, and `record-cdp --seconds 3 proof` selects a duration.
+Both commands capture one 1280×720 PNG frame per second from CDP `Page.startScreencast`,
+with a visible frame counter to keep static pages updating. They encode
+an H.264 MP4 with faststart in a private `/scratch/recordings` directory
+and probe it. Each finished file is copied into an unnamed `O_TMPFILE` in
 `/artifacts` and only then linked as `/artifacts/proof.mp4` and `/artifacts/proof.png` (the first
 captured frame), so listing and reads never see a partial file and an existing name is never
 replaced.
-It prints `/proc/meminfo` and `oom_kill /proc/vmstat` before and after encoding,
+Both print `/proc/meminfo` and `oom_kill /proc/vmstat` before and after encoding,
 and ffprobe duration/size/codec.
-A failed encode does not publish an MP4. Do not attach the file until the exec
-has completed, or assume Stop reclaims a still-running child promptly.
+A failed encode publishes nothing. A recording longer than the exec deadline returns a job;
+poll it to completion before attaching the files. Do not assume Stop reclaims a still-running
+child promptly.
+
+## Limits in a 512 MiB jail
+
+Use `browse record` for video within the existing browser. On `pw-1c512m` (one vCPU,
+512 MiB), a second Playwright context with `recordVideo` produced 12 KB of blank frames;
+a 40-screenshot loop took more than 3.5 minutes. Both reached the pod's 640 Mi
+`memory.peak` limit. Do not use either approach for video. Given the shipped tool's name,
+`record-cdp` produced a 30.0-second 1280×720 H.264 MP4 in 78 seconds. Capture plus encoding
+takes longer than the resulting video's playback duration; poll the job instead of starting
+another recorder.

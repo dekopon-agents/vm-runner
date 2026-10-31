@@ -24,6 +24,7 @@ browse text [SELECTOR]     visible text of the page or of SELECTOR
 browse eval JS             evaluate an expression in the page and print the JSON result
 browse wait MS             wait MS milliseconds (at most 20000)
 browse shot NAME           screenshot to /artifacts/NAME
+browse record NAME [--seconds N]  video of the current tab; 1–30 seconds (default 10)
 browse tabs | tab N        list tabs, or switch to tab N
 browse reset               stop the browser and delete its profile (cookies, tabs); the next call starts clean
 
@@ -31,6 +32,10 @@ With no arguments, commands are read from stdin, one per line (quote arguments w
 spaces), and run in order in one call. Output is capped at ${MAX_OUT} characters per command.
 Page loads are bounded so single commands finish well inside a 25 s exec; a load that times
 out still reports the page as it stands. Long batches may outlive the exec: poll the job.
+A recording longer than the exec's deadline returns a job to poll before attaching its files.
+Use browse record (record-cdp) for video, not a second browser context, Playwright
+recordVideo, or a screenshot loop: those can exhaust a 512 MiB jail.
+Record NAME has no .mp4 suffix; NAME.mp4 must be a flat file name of at most 128 characters.
 Playwright scripts can attach to the same browser:
   const b = await chromium.connectOverCDP('${ENDPOINT}'); const page = b.contexts()[0].pages()[0];
 `;
@@ -171,6 +176,30 @@ async function run(state, argv) {
       if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(name)) throw new Error('shot NAME must be a flat file name');
       await page.screenshot({ path: `${ARTIFACTS}/${name}` });
       return `saved ${ARTIFACTS}/${name}`;
+    }
+    case 'record': {
+      if (args.length !== 1 && !(args.length === 3 && args[1] === '--seconds')) {
+        throw new Error('usage: record NAME [--seconds N]');
+      }
+      const [name, , seconds = '10'] = args;
+      if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,123}$/.test(name) || name.endsWith('.mp4')) {
+        throw new Error('record NAME must be a flat file stem of at most 124 characters, without .mp4');
+      }
+      if (!/^(?:[1-9]|[12][0-9]|30)$/.test(seconds)) throw new Error('record --seconds must be an integer from 1 to 30');
+      const child = spawn('record-cdp', ['--target', await targetId(page), '--seconds', seconds, name], {
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      let output = '';
+      for (const stream of [child.stdout, child.stderr]) {
+        stream.on('data', (chunk) => { output = (output + chunk).slice(0, MAX_OUT); });
+      }
+      return new Promise((resolve, reject) => {
+        child.on('error', reject);
+        child.on('close', (code) => {
+          if (code === 0) resolve(output.trimEnd());
+          else reject(new Error(`record-cdp exited ${code}: ${output.trimEnd()}`));
+        });
+      });
     }
     case 'tabs':
       return (await Promise.all(state.context.pages().map(async (p, i) =>

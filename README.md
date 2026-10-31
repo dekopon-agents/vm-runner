@@ -191,6 +191,9 @@ selected by that npm version's postinstall), on both amd64 and arm64. Both tools
 `/usr/local/bin/chromium`, the baked Playwright Chromium; no `agent-browser install`
 or runtime browser download is needed.
 
+Use `browse record NAME [--seconds N]` for a video of browse's current tab; see the
+[CDP video recipe and jail limits](images/guest/README.md#cdp-video-recipe).
+
 ```sh
 browse open 'data:text/html,<h1>Local page</h1>'
 browse snapshot
@@ -212,7 +215,8 @@ isolation policy changes are required, and TLS verification remains enabled.
 
 The image build runs a uid-1000, cleared-environment smoke test using only static
 data URLs. It checks open/snapshot/close across separate exec groups, kills each
-client group on exit, and verifies browse and AB coexist without sharing pages.
+client group on exit, and verifies browse and AB coexist without sharing pages. It also checks
+recording argument refusals before capture and marker cleanup after capture failure.
 `verify.sh` checks the exported ext4 contains both CLIs, AB's native binary and the
 Chromium target. Dual-arch guest PR CI is the full image gate. **An image build is
 not Firecracker/KVM proof**: guest boot, trusted-CA egress and real execs still need

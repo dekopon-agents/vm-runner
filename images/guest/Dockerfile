@@ -64,9 +64,10 @@ COPY --chmod=0755 browse /usr/local/bin/browse
 COPY --chmod=0755 record-cdp /usr/local/bin/record-cdp
 COPY browser-smoke.cjs /tmp/browser-smoke.cjs
 # Match the guest agent's cleared environment and identity, not Docker ENV defaults.
-RUN setpriv --reuid=1000 --regid=1000 --clear-groups \
+RUN install -d -o 1000 -g 1000 -m 0700 /scratch/recordings \
+    && setpriv --reuid=1000 --regid=1000 --clear-groups \
     env -i HOME=/home/jail PATH=/usr/local/bin:/usr/bin:/bin node /tmp/browser-smoke.cjs \
-    && rm /tmp/browser-smoke.cjs \
+    && rm /tmp/browser-smoke.cjs && rmdir /scratch/recordings \
     && rm -rf /home/jail/.agent-browser /home/jail/.agent-browser-profile
 COPY toolkit-smoke.sh /tmp/toolkit-smoke.sh
 RUN --network=none setpriv --reuid=1000 --regid=1000 --clear-groups \

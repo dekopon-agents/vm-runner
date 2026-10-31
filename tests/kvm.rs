@@ -211,7 +211,7 @@ async fn jail_vmm_has_no_new_privileges_and_confined_identity_and_egress() {
         exec(&api, &token, "browse open 'data:text/html,<title>CDP proof</title><body style=\"background:#174b72;color:white\"><p>CDP proof without heading</p></body>'").await;
         assert_eq!(exec(&api, &token, "browse eval \"document.querySelector('h1') === null\"").await["stdout"], "true\n", "proof tab must have no heading");
         // A failed encoder must leave the artifact namespace untouched.
-        let failure = succeeded(exec_job(&api, &token, "set -eu; d=$(mktemp -d /home/jail/failed-encode.XXXXXX); printf '#!/bin/sh\\neval \"out=\\${$#}\"\\nprintf junk > \"$out\"\\necho FORCED_ENCODER_FAILURE >&2\\nexit 42\\n' > \"$d/ffmpeg\"; chmod +x \"$d/ffmpeg\"; code=0; PATH=\"$d:/usr/local/bin:/usr/bin:/bin\" record-cdp rejected || code=$?; rm -rf \"$d\"; test \"$code\" -ne 0; echo ENCODE_FAILED", async || {}).await);
+        let failure = succeeded(exec_job(&api, &token, "set -eu; d=$(mktemp -d /home/jail/failed-encode.XXXXXX); printf '#!/bin/sh\\neval \"out=\\${$#}\"\\nprintf junk > \"$out\"\\necho FORCED_ENCODER_FAILURE >&2\\nexit 42\\n' > \"$d/ffmpeg\"; chmod +x \"$d/ffmpeg\"; code=0; PATH=\"$d:/usr/local/bin:/usr/bin:/bin\" record-cdp rejected || code=$?; rm -rf \"$d\"; test \"$code\" -ne 0; echo ENCODE_FAILED", 25000, async || {}).await);
         assert_capture_seconds(&failure);
         assert_eq!(exec(&api, &token, "browse eval \"typeof window.recordTimer === 'number' && document.querySelector('[data-cdp-recording]') === null\"").await["stdout"], "true\n", "record-cdp must remove its frame counter after capture");
         assert!(failure["stdout"].as_str().unwrap().contains("CDP_FRAME_ELAPSED_MS="), "capture must complete before forced encoder failure: {failure}");
@@ -222,7 +222,7 @@ async fn jail_vmm_has_no_new_privileges_and_confined_identity_and_egress() {
 
         // Record the most recently opened tab and compare every observed artifact to final content.
         let mut sampled = Vec::new();
-        let result = succeeded(exec_job(&api, &token, "record-cdp proof", async || {
+        let result = succeeded(exec_job(&api, &token, "record-cdp proof", 25000, async || {
             sampled.push(list_artifacts(&api, &token).await);
         }).await);
         assert!(!sampled.is_empty(), "no artifact listing completed after observing the recording job running and before observing its terminal result");
@@ -231,41 +231,30 @@ async fn jail_vmm_has_no_new_privileges_and_confined_identity_and_egress() {
         assert!(result["stdout"].as_str().unwrap().contains("published /artifacts/proof.mp4"));
         let files = list_artifacts(&api, &token).await;
         assert!(sampled.iter().all(|sample| samples_match_final(&entries(sample), &files)), "observed partial or unpublished proof entry: {sampled:?}; final: {files:?}");
-        let movie = files.iter().find(|f| f["path"] == "proof.mp4").unwrap();
-        let png = files.iter().find(|f| f["path"] == "proof.png").unwrap();
-        let movie_bytes = read_artifact(&api, &token, movie).await;
-        let png_bytes = read_artifact(&api, &token, png).await;
-        let dir = tempfile::tempdir().unwrap();
-        let mp4_path = dir.path().join("proof.mp4");
-        let png_path = dir.path().join("proof.png");
-        tokio::fs::write(&mp4_path, &movie_bytes).await.unwrap();
-        tokio::fs::write(&png_path, &png_bytes).await.unwrap();
-        let probe = Command::new("ffprobe").args(["-v", "error", "-show_entries", "stream=codec_name,width,height:format=duration,size", "-of", "json"]).arg(&mp4_path).output().await.unwrap();
-        assert!(probe.status.success());
-        let measured: Value = serde_json::from_slice(&probe.stdout).unwrap();
-        println!("MP4 actual bytes={} sha256={} ffprobe={measured}", movie_bytes.len(), movie["sha256"]);
-        assert_eq!(measured["streams"][0]["codec_name"], "h264");
-        assert_eq!(measured["streams"][0]["width"], 1280);
-        assert_eq!(measured["streams"][0]["height"], 720);
-        assert!((measured["format"]["duration"].as_str().unwrap().parse::<f64>().unwrap() - 30.0).abs() < 0.1);
-        assert_eq!(measured["format"]["size"].as_str().unwrap().parse::<usize>().unwrap(), movie_bytes.len());
-        assert!(movie_bytes.len() <= 8 * 1024 * 1024, "MP4 must fit the attachment limit");
-        let first = decoded_rgb(&mp4_path).await;
-        let preview = decoded_rgb(&png_path).await;
-        assert_eq!(first.len(), 1280 * 720 * 3);
-        assert_eq!(first.len(), preview.len());
-        let error: u64 = first.iter().zip(&preview).map(|(a, b)| u64::from(a.abs_diff(*b))).sum();
-        println!("first-frame RGB absolute error sum={error}, pixels={}", first.len());
-        assert!(error / (first.len() as u64) < 12, "PNG must match the first video frame despite lossy H.264");
-        let prior_hash = movie["sha256"].clone();
-        let duplicate = exec_job(&api, &token, "record-cdp proof", async || {}).await;
+        let proof = assert_recording(&api, &token, "proof", 30.0).await;
+        let prior_hash = proof.movie["sha256"].clone();
+        let duplicate = exec_job(&api, &token, "record-cdp proof", 25000, async || {}).await;
         assert_capture_seconds(&duplicate);
         assert_eq!(duplicate["outcome"], "executed");
         assert_ne!(duplicate["exitCode"], 0, "existing artifact must not be overwritten");
         assert!(duplicate["stderr"].as_str().unwrap().contains("FileExistsError"), "the existing name, not capture, must cause refusal: {duplicate}");
         let after = list_artifacts(&api, &token).await;
         assert_eq!(after.iter().find(|f| f["path"] == "proof.mp4").unwrap()["sha256"], prior_hash);
-        assert_eq!(read_artifact(&api, &token, after.iter().find(|f| f["path"] == "proof.mp4").unwrap()).await, movie_bytes);
+        assert_eq!(read_artifact(&api, &token, after.iter().find(|f| f["path"] == "proof.mp4").unwrap()).await, proof.bytes);
+
+        exec(&api, &token, "browse open 'data:text/html,<title>Selected green tab</title><body style=\"background:%2311cc33\">Selected green tab</body>'").await;
+        exec(&api, &token, "browse open --tab 'data:text/html,<title>Last purple tab</title><body style=\"background:%23cc11cc\">Last purple tab</body>'").await;
+        exec(&api, &token, "browse tab 0").await;
+        let mut sampled = Vec::new();
+        succeeded(exec_job(&api, &token, "browse record current", 1000, async || {
+            sampled.push(list_artifacts(&api, &token).await);
+        }).await);
+        assert!(!sampled.is_empty(), "browse record must expose a running job before its terminal result");
+        let files = list_artifacts(&api, &token).await;
+        assert!(sampled.iter().all(|sample| samples_match_final(&entries(sample), &files)), "observed partial or unpublished browse recording: {sampled:?}; final: {files:?}");
+        let selected = assert_recording(&api, &token, "current", 10.0).await;
+        let pixel = (719 * 1280 + 1279) * 3;
+        assert_eq!(&selected.preview[pixel..pixel + 3], &[0x11, 0xcc, 0x33], "recording must show the selected green tab, not the last purple tab");
         }
         pid
     }).await;
@@ -298,6 +287,101 @@ fn succeeded(result: Value) -> Value {
     assert_eq!(result["outcome"], "executed", "{result}");
     assert_eq!(result["exitCode"], 0, "{result}");
     result
+}
+struct Recording {
+    movie: Value,
+    bytes: Vec<u8>,
+    preview: Vec<u8>,
+}
+async fn assert_recording(
+    api: &reqwest::Client,
+    token: &str,
+    name: &str,
+    seconds: f64,
+) -> Recording {
+    let files = list_artifacts(api, token).await;
+    let movie = files
+        .iter()
+        .find(|f| f["path"] == format!("{name}.mp4"))
+        .unwrap();
+    let png = files
+        .iter()
+        .find(|f| f["path"] == format!("{name}.png"))
+        .unwrap();
+    let movie_bytes = read_artifact(api, token, movie).await;
+    let png_bytes = read_artifact(api, token, png).await;
+    let dir = tempfile::tempdir().unwrap();
+    let mp4_path = dir.path().join(format!("{name}.mp4"));
+    let png_path = dir.path().join(format!("{name}.png"));
+    tokio::fs::write(&mp4_path, &movie_bytes).await.unwrap();
+    tokio::fs::write(&png_path, &png_bytes).await.unwrap();
+    let probe = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=codec_name,width,height:format=duration,size",
+            "-of",
+            "json",
+        ])
+        .arg(&mp4_path)
+        .output()
+        .await
+        .unwrap();
+    assert!(probe.status.success());
+    let measured: Value = serde_json::from_slice(&probe.stdout).unwrap();
+    println!(
+        "MP4 actual bytes={} sha256={} ffprobe={measured}",
+        movie_bytes.len(),
+        movie["sha256"]
+    );
+    assert_eq!(measured["streams"][0]["codec_name"], "h264");
+    assert_eq!(measured["streams"][0]["width"], 1280);
+    assert_eq!(measured["streams"][0]["height"], 720);
+    assert!(
+        (measured["format"]["duration"]
+            .as_str()
+            .unwrap()
+            .parse::<f64>()
+            .unwrap()
+            - seconds)
+            .abs()
+            < 0.1
+    );
+    assert_eq!(
+        measured["format"]["size"]
+            .as_str()
+            .unwrap()
+            .parse::<usize>()
+            .unwrap(),
+        movie_bytes.len()
+    );
+    assert!(
+        movie_bytes.len() <= 8 * 1024 * 1024,
+        "MP4 must fit the attachment limit"
+    );
+    let first = decoded_rgb(&mp4_path).await;
+    let preview = decoded_rgb(&png_path).await;
+    assert_eq!(first.len(), 1280 * 720 * 3);
+    assert_eq!(first.len(), preview.len());
+    let error: u64 = first
+        .iter()
+        .zip(&preview)
+        .map(|(a, b)| u64::from(a.abs_diff(*b)))
+        .sum();
+    println!(
+        "first-frame RGB absolute error sum={error}, pixels={}",
+        first.len()
+    );
+    assert!(
+        error / (first.len() as u64) < 12,
+        "PNG must match the first video frame despite lossy H.264"
+    );
+    Recording {
+        movie: movie.clone(),
+        bytes: movie_bytes,
+        preview,
+    }
 }
 fn entries(files: &[Value]) -> Vec<(String, u64, String)> {
     files
@@ -376,16 +460,21 @@ fn assert_capture_seconds(result: &Value) {
         "30 frames must span at least 30 seconds: {elapsed}ms"
     );
 }
-async fn submit(api: &reqwest::Client, token: &str, script: &str) -> reqwest::Response {
+async fn submit(
+    api: &reqwest::Client,
+    token: &str,
+    script: &str,
+    deadline_ms: u32,
+) -> reqwest::Response {
     api.post("http://127.0.0.1:8080/exec")
         .bearer_auth(token)
-        .json(&json!({"argv":["/bin/sh","-c",script],"deadlineMs":25000}))
+        .json(&json!({"argv":["/bin/sh","-c",script],"deadlineMs":deadline_ms}))
         .send()
         .await
         .unwrap()
 }
 async fn exec_raw(api: &reqwest::Client, token: &str, script: &str) -> Value {
-    let response = submit(api, token, script).await;
+    let response = submit(api, token, script, 25000).await;
     assert_eq!(response.status(), 200);
     response.json().await.unwrap()
 }
@@ -393,14 +482,15 @@ async fn exec_job(
     api: &reqwest::Client,
     token: &str,
     script: &str,
+    deadline_ms: u32,
     mut sample: impl AsyncFnMut(),
 ) -> Value {
-    let response = submit(api, token, script).await;
+    let response = submit(api, token, script, deadline_ms).await;
     let status = response.status();
     let pending: Value = response.json().await.unwrap();
     assert_eq!(
         status, 202,
-        "a 30-second recording must outlive the 25-second response deadline: {pending}"
+        "recording must outlive its {deadline_ms} ms response deadline: {pending}"
     );
     assert_eq!(pending["outcome"], "unknown", "{pending}");
     let job = format!(
@@ -472,7 +562,7 @@ for d in /proc/[0-9]*; do
 done
 "#;
 async fn browser_diagnostic(api: &reqwest::Client, token: &str) {
-    let response = submit(api, token, BROWSER_DIAGNOSTIC).await;
+    let response = submit(api, token, BROWSER_DIAGNOSTIC, 25000).await;
     let status = response.status();
     let mut view: Value = response.json().await.unwrap_or_default();
     if status == 202 {

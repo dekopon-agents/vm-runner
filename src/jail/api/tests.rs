@@ -5,6 +5,12 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 const CONTROLLER: &str = "system:serviceaccount:test:controller";
 
+pub(super) struct ProgressReadHook {
+    pub(super) waiting: tokio::sync::oneshot::Sender<()>,
+    pub(super) observed: tokio::sync::oneshot::Sender<()>,
+    pub(super) resume: tokio::sync::oneshot::Receiver<()>,
+}
+
 #[test]
 fn guest_exec_fields_are_recorded_but_not_returned_to_controller() {
     use opentelemetry::trace::TracerProvider as _;
@@ -412,6 +418,7 @@ async fn job_capacity_refuses_active_work_and_evicts_only_non_running_records() 
         ready: Arc::new(AtomicBool::new(false)),
         jobs: Mutex::new(jobs),
         transfers: Arc::new(tokio::sync::Semaphore::new(4)),
+        progress_read_hook: Mutex::new(None),
     };
     let input = || ExecInput {
         argv: vec!["true".into()],

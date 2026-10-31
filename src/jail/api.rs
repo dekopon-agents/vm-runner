@@ -184,6 +184,8 @@ pub(super) struct State {
     ready: Arc<AtomicBool>,
     jobs: Mutex<Jobs>,
     transfers: Arc<tokio::sync::Semaphore>,
+    #[cfg(test)]
+    progress_read_hook: Mutex<Option<tests::ProgressReadHook>>,
 }
 impl State {
     pub(super) fn mark_ready(&self) {
@@ -367,6 +369,11 @@ impl Api {
                         poem::Error::from_status(StatusCode::NOT_FOUND)
                     })?
             };
+            #[cfg(test)]
+            let hook = state.progress_read_hook.lock().unwrap().take().map(|hook| {
+                hook.waiting.send(()).unwrap();
+                (hook.observed, hook.resume)
+            });
             let applied = wait.map(crate::job_wait::JobWait::applied);
             if let Some(wait) = wait {
                 let deadline = wait.deadline - Duration::from_millis(100);
@@ -380,9 +387,15 @@ impl Api {
                     }
                 }).await;
             }
+            let closed = progress.has_changed().is_err();
+            #[cfg(test)]
+            if let Some((observed, resume)) = hook {
+                observed.send(()).unwrap();
+                resume.await.unwrap();
+            }
             let value = progress.borrow().clone();
             Ok(match value {
-                Progress::Running if wait.is_some() && progress.has_changed().is_err() => {
+                Progress::Running if wait.is_some() && closed => {
                     tracing::Span::current().record("vm_runner.job.state", "unknown");
                     JobResponse::Unknown(unknown(id), applied)
                 }
@@ -424,6 +437,8 @@ pub(super) async fn endpoint(
         ready: Arc::new(AtomicBool::new(false)),
         jobs: Mutex::new(Jobs::default()),
         transfers: Arc::new(tokio::sync::Semaphore::new(4)),
+        #[cfg(test)]
+        progress_read_hook: Mutex::new(None),
     });
     let endpoint: poem::endpoint::BoxEndpoint<'static, poem::Response> = OpenApiService::new(
         (crate::Health(Some(Arc::clone(&state.ready))), Api),

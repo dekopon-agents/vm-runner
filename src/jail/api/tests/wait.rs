@@ -382,3 +382,91 @@ async fn the_first_wait_preference_is_used_across_prefer_header_lines() {
     }
     f.close().await;
 }
+
+#[tokio::test]
+async fn completion_between_progress_reads_returns_the_result_and_keeps_the_controller_handle() {
+    let mut auth = crate::tests::Fixture::new().await;
+    let controller_subject = "system:serviceaccount:runner:controller";
+    let mut claims = auth.claims();
+    claims["sub"] = json!(controller_subject);
+    claims["aud"] = json!(["vm-runner-jail"]);
+    let token = auth.token(&claims, "ec");
+    let dir = tempfile::tempdir().unwrap();
+    let listener = tokio::net::UnixListener::bind(dir.path().join("guest.sock")).unwrap();
+    let (endpoint, requests, state) = endpoint(
+        auth.config.auth.clone(),
+        controller_subject.into(),
+        Arc::new(Guest::new(dir.path().join("guest.sock"))),
+    )
+    .await
+    .unwrap();
+    state.mark_ready();
+    let mut f = crate::controller::proxy::tests::Fixture::with_jail(
+        endpoint.boxed(),
+        token,
+        auth.config.auth.clone(),
+    )
+    .await;
+    let client = Arc::new(TestClient::new(f.api_endpoint(&auth).await).default_header(
+        "Authorization",
+        format!("Bearer {}", auth.token(&auth.claims(), "ec")),
+    ));
+    let terminal = json!({"outcome":"executed","exitCode":7,"stdout":"raced result","stderr":"","truncated":false});
+    let result = terminal.clone();
+    let (finish, finished) = tokio::sync::oneshot::channel();
+    let peer = tokio::spawn(async move {
+        let (mut stream, _) = request(listener.accept().await.unwrap().0).await;
+        finished.await.unwrap();
+        guest::write_frame(&mut stream, &result).await.unwrap();
+    });
+    let session = f.session();
+    let pending = client
+        .post(format!("/v1/sessions/{session}/exec"))
+        .body_json(&json!({"argv":["echo","ok"],"deadlineMs":1000}))
+        .send()
+        .await;
+    pending.assert_status(StatusCode::ACCEPTED);
+    let pending: serde_json::Value = pending.0.into_body().into_json().await.unwrap();
+    let path = format!("/v1/jobs/{}", pending["jobId"].as_str().unwrap());
+    let (waiting, at_wait) = tokio::sync::oneshot::channel();
+    let (observed, at_observation) = tokio::sync::oneshot::channel();
+    let (resume, resumed) = tokio::sync::oneshot::channel();
+    *state.progress_read_hook.lock().unwrap() = Some(ProgressReadHook {
+        waiting,
+        observed,
+        resume: resumed,
+    });
+    tokio::time::pause();
+    let reader = Arc::clone(&client);
+    let read_path = path.clone();
+    let read = tokio::spawn(async move {
+        reader
+            .get(read_path)
+            .header("Prefer", "wait=1")
+            .send()
+            .await
+    });
+    at_wait.await.unwrap();
+    tokio::time::advance(Duration::from_millis(901)).await;
+    at_observation.await.unwrap();
+    finish.send(()).unwrap();
+    peer.await.unwrap();
+    state.drain().await.unwrap();
+    assert!(
+        state.jobs.lock().unwrap().entries[0]
+            .progress
+            .has_changed()
+            .is_err()
+    );
+    resume.send(()).unwrap();
+    let response = read.await.unwrap();
+    response.assert_status_is_ok();
+    let result: serde_json::Value = response.0.into_body().into_json().await.unwrap();
+    tokio::time::resume();
+    let retained = client.get(&path).send().await;
+    assert_eq!((&result, retained.0.status()), (&terminal, StatusCode::OK));
+    retained.assert_json(terminal).await;
+    requests.drain().await.unwrap();
+    f.tasks.shutdown().await;
+    auth.tasks.shutdown().await;
+}

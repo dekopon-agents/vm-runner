@@ -34,6 +34,9 @@ function exec(argv, expectedCode = 0) {
   assert.equal(process.getuid(), 1000);
   const page = title => `data:text/html,${encodeURIComponent(`<title>${title}</title><h1>${title}</h1><button>Local action</button>`)}`;
   try {
+    const help = await exec(['browse', '--help']);
+    assert.match(help, /\/artifacts\/NAME\.mp4/);
+    assert.match(help, /\/artifacts\/NAME\.png/);
     await exec(['browse', 'open', page('Browse smoke')]);
     const artifacts = fs.readdirSync('/artifacts');
     const recordings = fs.readdirSync('/scratch/recordings');
@@ -77,8 +80,20 @@ function exec(argv, expectedCode = 0) {
     assert.ok(Math.abs(Number(probe.format.duration) - 3) < 0.1);
     assert.ok(fs.statSync('/artifacts/smoke.png').size > 0);
     console.log(`producer/consumer smoke ffprobe=${JSON.stringify(probe)}`);
+    assert.match(await exec(['browse', 'record', 'smoke', '--seconds', '1'], 1), /record output already exists: \/artifacts\/smoke\.mp4/);
     fs.unlinkSync('/artifacts/smoke.mp4');
     fs.unlinkSync('/artifacts/smoke.png');
+    await exec(['browse', 'shot', 'clash.png']);
+    assert.match(await exec(['browse', 'record', 'clash', '--seconds', '1'], 1), /record output already exists: \/artifacts\/clash\.png/);
+    assert.equal(fs.existsSync('/artifacts/clash.mp4'), false);
+    fs.unlinkSync('/artifacts/clash.png');
+    const missingParent = fs.mkdtempSync('/home/jail/record-error.');
+    const missingArtifacts = `${missingParent}/artifacts`;
+    const failedPublish = await exec(['env', `BROWSE_ARTIFACTS=${missingArtifacts}`, 'browse', 'record', 'rejected', '--seconds', '1'], 1);
+    assert.match(failedPublish, /^error: record-cdp exited 1: FileNotFoundError:[^\n]+\n$/);
+    assert.ok(failedPublish.includes(missingArtifacts));
+    fs.rmdirSync(missingParent);
+    console.log('record names existing outputs and reports the final stderr line after a publish failure');
     await exec(['browse', 'open', page('Browse smoke')]);
     await exec(['agent-browser', 'open', page('Agent browser smoke')]);
     const snapshot = await exec(['agent-browser', 'snapshot']);

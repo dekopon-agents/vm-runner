@@ -54,7 +54,8 @@ label (first 16 hex characters), the subject allowlist, configured profile and j
 Inconsistent or foreign pods are ignored; duplicate subject/name pods keep the oldest
 `creationTimestamp`, and the rest are deleted.
 Authenticated `POST /v1/sessions {"profile":"travel","name":"default"}` reserves a lazy
-session (201), or returns the same subject/name session (200). Names are lowercase
+session (201), or returns the same subject/name session (200); both name its `sessionId` in an
+`x-dekopon-vm-session` response header too. Names are lowercase
 alphanumeric with internal/trailing hyphens, at most 63 characters; omitted names are
 `default`. Changing the profile for an existing name returns `409 session_profile_conflict`.
 Admission applies the authenticated subject's `maxSessions` quota. Every ten seconds the

@@ -71,22 +71,36 @@ pub(crate) struct Conflict {
 enum ConflictCode {
     SessionProfileConflict,
 }
-#[derive(ApiResponse)]
-pub(crate) enum Created {
-    #[oai(status = 201)]
-    New(Json<SessionBody>),
-    #[oai(status = 200)]
-    Existing(Json<SessionBody>),
-    #[oai(status = 409)]
-    Conflict(Json<Conflict>),
-    #[oai(status = 400)]
-    Refused(Json<NotExecuted>),
-    #[oai(status = 401)]
-    Unauthorized(Json<crate::Refusal>),
-    #[oai(status = 503)]
-    Unavailable(PlainText<&'static str>),
+macro_rules! created {
+    ($session:literal) => {
+        pub(crate) const SESSION_HEADER: &str = $session;
+        #[derive(ApiResponse)]
+        pub(crate) enum Created {
+            #[oai(status = 201)]
+            New(Json<SessionBody>, #[oai(header = $session)] String),
+            #[oai(status = 200)]
+            Existing(Json<SessionBody>, #[oai(header = $session)] String),
+            #[oai(status = 409)]
+            Conflict(Json<Conflict>),
+            #[oai(status = 400)]
+            Refused(Json<NotExecuted>),
+            #[oai(status = 401)]
+            Unauthorized(Json<crate::Refusal>),
+            #[oai(status = 503)]
+            Unavailable(PlainText<&'static str>),
+        }
+    };
 }
+created!("x-dekopon-vm-session");
 impl Created {
+    fn new(body: SessionBody) -> Self {
+        let id = body.session_id.clone();
+        Self::New(Json(body), id)
+    }
+    fn existing(body: SessionBody) -> Self {
+        let id = body.session_id.clone();
+        Self::Existing(Json(body), id)
+    }
     fn refused(reason: Failure) -> Self {
         Self::Refused(Json(NotExecuted {
             outcome: NotExecutedOutcome::NotExecuted,
@@ -377,7 +391,7 @@ impl Controller {
         {
             return Ok(if existing.body.profile == request.profile {
                 existing.active = now();
-                Created::Existing(Json(existing.body.clone()))
+                Created::existing(existing.body.clone())
             } else {
                 Created::Conflict(Json(Conflict {
                     error: ConflictCode::SessionProfileConflict,
@@ -445,7 +459,7 @@ impl Controller {
             vm_runner.shape.vcpu.count = i64::from(shape.vcpus.get()),
             vm_runner.shape.memory.bytes = i64::from(shape.memory.get()) * 1_048_576,
         }, "session started");
-        Ok(Created::New(Json(body)))
+        Ok(Created::new(body))
     }
     pub(crate) fn health(&self) {
         let count = self

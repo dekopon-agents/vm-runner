@@ -90,7 +90,8 @@ NAME has no `.mp4` suffix and must keep NAME.mp4 within the provider's 128-chara
 tab for 30 seconds, and `record-cdp --seconds 3 proof` selects a duration.
 Both commands capture one 1280×720 PNG frame per second from CDP `Page.startScreencast`,
 with a visible frame counter to keep static pages updating. They encode
-an H.264 MP4 with faststart in a private `/scratch/recordings` directory
+an H.264 MP4 with faststart and x264's `zerolatency` tune (no lookahead or B-frame
+buffering) in a private `/scratch/recordings` directory
 and probe it. Each finished file is copied into an unnamed `O_TMPFILE` in
 `/artifacts` and only then linked as `/artifacts/proof.mp4` and `/artifacts/proof.png` (the first
 captured frame), so listing and reads never see a partial file and an existing name is never
@@ -110,3 +111,20 @@ a 40-screenshot loop took more than 3.5 minutes. Both reached the pod's 640 Mi
 `record-cdp` produced a 30.0-second 1280×720 H.264 MP4 in 78 seconds. Capture plus encoding
 takes longer than the resulting video's playback duration; poll the job instead of starting
 another recorder.
+
+For an offline memory regression check, run a built guest-stage image as `$guest_image`:
+
+```sh
+docker run --rm --init --network none --cpus 1 --memory 512m --memory-swap 512m \
+  --user 1000:1000 --workdir /home/jail \
+  --tmpfs /artifacts:uid=1000,gid=1000,mode=0755 \
+  --tmpfs /scratch/recordings:uid=1000,gid=1000,mode=0700 \
+  --mount "type=bind,src=$PWD/images/guest/recording-memory-smoke.sh,dst=/tmp/recording-memory-smoke.sh,readonly" \
+  --entrypoint /usr/bin/env "$guest_image" \
+  -i HOME=/home/jail PATH=/usr/local/bin:/usr/bin:/bin sh /tmp/recording-memory-smoke.sh
+```
+
+This cgroup v2 check records the selected of two tabs for the default 10 seconds,
+requires no OOM kills (even if the encoder survives one), and checks the codec,
+dimensions, duration, selected-page pixels and first-frame preview. The KVM gate
+still proves the PR-built image in a 512 MiB guest.

@@ -124,7 +124,7 @@ cp "$work/frame00.png" "$work/preview.png"
 grep -E 'MemTotal|MemFree|MemAvailable' /proc/meminfo
 grep oom_kill /proc/vmstat
 ffmpeg -hide_banner -loglevel error -framerate 1 -i "$work/frame%02d.png" \
-    -c:v libx264 -threads 1 -pix_fmt yuv420p -r 30 -movflags +faststart "$work/output.mp4"
+    -c:v libx264 -tune zerolatency -threads 1 -pix_fmt yuv420p -r 30 -movflags +faststart "$work/output.mp4"
 grep -E 'MemTotal|MemFree|MemAvailable' /proc/meminfo
 grep oom_kill /proc/vmstat
 ffprobe -v error -show_entries format=duration,size -show_entries stream=codec_name,width,height -of json "$work/output.mp4"

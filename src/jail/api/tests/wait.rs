@@ -1,0 +1,517 @@
+use super::*;
+use poem::{
+    EndpointExt,
+    test::{TestClient, TestResponse},
+};
+
+type Client = TestClient<poem::endpoint::BoxEndpoint<'static, poem::Response>>;
+struct Fixture {
+    client: Arc<Client>,
+    auth: crate::tests::Fixture,
+    requests: crate::TracedRequests,
+    state: Arc<State>,
+    id: uuid::Uuid,
+    sender: watch::Sender<Progress>,
+}
+impl Fixture {
+    async fn new() -> Self {
+        let auth = crate::tests::Fixture::new().await;
+        let mut claims = auth.claims();
+        claims["sub"] = json!(CONTROLLER);
+        claims["aud"] = json!(["vm-runner-jail"]);
+        let token = auth.token(&claims, "ec");
+        let (endpoint, requests, state) = endpoint(
+            auth.config.auth.clone(),
+            CONTROLLER.into(),
+            Arc::new(Guest::new("/absent.sock".into())),
+        )
+        .await
+        .unwrap();
+        let id = uuid::Uuid::now_v7();
+        let (sender, progress) = watch::channel(Progress::Running);
+        state
+            .jobs
+            .lock()
+            .unwrap()
+            .entries
+            .push_back(Job { id, progress });
+        Self {
+            client: Arc::new(
+                TestClient::new(endpoint.boxed())
+                    .default_header("Authorization", format!("Bearer {token}")),
+            ),
+            auth,
+            requests,
+            state,
+            id,
+            sender,
+        }
+    }
+    fn read(&self, seconds: u32) -> tokio::task::JoinHandle<TestResponse> {
+        let client = Arc::clone(&self.client);
+        let id = self.id;
+        tokio::spawn(async move {
+            client
+                .get(format!("/jobs/{id}"))
+                .header("Prefer", format!("wait={seconds}"))
+                .send()
+                .await
+        })
+    }
+    async fn waiting(&self) {
+        let started = std::time::Instant::now();
+        while self.sender.receiver_count() < 2 {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "read did not reach watch progress"
+            );
+            tokio::task::yield_now().await;
+        }
+    }
+    async fn close(mut self) {
+        self.requests.drain().await.unwrap();
+        self.state.drain().await.unwrap();
+        self.auth.tasks.shutdown().await;
+    }
+}
+fn completed() -> Progress {
+    Progress::Done(Arc::new(Terminal::Executed(Executed {
+        exit_code: 7,
+        stdout: "result".into(),
+        stderr: "err".into(),
+        truncated: false,
+    })))
+}
+
+#[tokio::test]
+async fn a_prefer_wait_read_returns_the_terminal_result_well_before_the_bound() {
+    let f = Fixture::new().await;
+    let started = std::time::Instant::now();
+    let read = f.read(25);
+    f.waiting().await;
+    f.sender.send_replace(completed());
+    let response = tokio::time::timeout(Duration::from_secs(1), read)
+        .await
+        .unwrap()
+        .unwrap();
+    response.assert_status_is_ok();
+    response.assert_header("Preference-Applied", "wait=25");
+    response.assert_json(json!({"outcome":"executed","exitCode":7,"stdout":"result","stderr":"err","truncated":false})).await;
+    assert!(started.elapsed() < Duration::from_secs(1));
+    f.close().await;
+}
+
+#[tokio::test]
+async fn a_prefer_wait_read_of_a_running_job_returns_at_the_bound() {
+    let f = Fixture::new().await;
+    tokio::time::pause();
+    let read = f.read(1);
+    f.waiting().await;
+    tokio::time::advance(Duration::from_millis(899)).await;
+    assert!(!read.is_finished());
+    tokio::time::advance(Duration::from_millis(1)).await;
+    tokio::time::resume();
+    let response = read.await.unwrap();
+    response.assert_status_is_ok();
+    response.assert_header("Preference-Applied", "wait=1");
+    response.assert_json(json!({"state":"running"})).await;
+    f.close().await;
+}
+
+#[tokio::test]
+async fn a_read_without_a_wait_preference_is_unchanged() {
+    let f = Fixture::new().await;
+    let mut baseline = None;
+    for (query, preference) in [
+        ("", None),
+        ("", Some("return=minimal")),
+        ("", Some("custom=\"café\"")),
+        ("", Some("custom=\"x,wait=99\", respond-async")),
+        ("", Some("foo; wait=26")),
+        ("?waitMs=25000", None),
+        ("?waitMs=bad", None),
+    ] {
+        let mut request = f.client.get(format!("/jobs/{}{query}", f.id));
+        if let Some(preference) = preference {
+            request = request.header("Prefer", preference);
+        }
+        let response = tokio::time::timeout(Duration::from_secs(1), request.send())
+            .await
+            .unwrap();
+        response.assert_status_is_ok();
+        assert!(!response.0.headers().contains_key("Preference-Applied"));
+        let bytes = response.0.into_body().into_vec().await.unwrap();
+        if let Some(baseline) = &baseline {
+            assert_eq!(&bytes, baseline);
+        } else {
+            baseline = Some(bytes);
+        }
+    }
+    f.close().await;
+}
+
+#[tokio::test]
+async fn terminal_unknown_and_missing_jobs_do_not_delay_a_wait_preference() {
+    let f = Fixture::new().await;
+    f.sender.send_replace(completed());
+    tokio::time::timeout(Duration::from_secs(1), f.read(25))
+        .await
+        .unwrap()
+        .unwrap()
+        .assert_status_is_ok();
+    f.sender.send_replace(Progress::Unknown);
+    let response = tokio::time::timeout(Duration::from_secs(1), f.read(25))
+        .await
+        .unwrap()
+        .unwrap();
+    response.assert_status(StatusCode::ACCEPTED);
+    response.assert_header("Preference-Applied", "wait=25");
+    response
+        .assert_json(json!({"outcome":"unknown","jobId":f.id.to_string()}))
+        .await;
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        f.client
+            .get(format!("/jobs/{}", uuid::Uuid::now_v7()))
+            .header("Prefer", "wait=25")
+            .send(),
+    )
+    .await
+    .unwrap()
+    .assert_status(StatusCode::NOT_FOUND);
+    f.close().await;
+}
+
+#[tokio::test]
+async fn a_closed_progress_channel_returns_unknown_without_waiting() {
+    let mut f = Fixture::new().await;
+    let sender = std::mem::replace(&mut f.sender, watch::channel(Progress::Running).0);
+    drop(sender);
+    tokio::time::timeout(Duration::from_secs(1), f.read(25))
+        .await
+        .unwrap()
+        .unwrap()
+        .assert_status(StatusCode::ACCEPTED);
+    f.close().await;
+}
+
+#[tokio::test]
+async fn jail_wait_preferences_fail_fast_at_capacity_and_reject_invalid_bounds() {
+    let f = Fixture::new().await;
+    let busy = f.requests.admission[1].acquire_many(16).await.unwrap();
+    for value in [
+        "wait=26",
+        "wait=0",
+        "wait=-1",
+        "wait=4294967296",
+        "wait=no",
+        "wait=",
+        "wait",
+        "wait=1.5",
+        "wait=\"2\"",
+    ] {
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            f.client
+                .get(format!("/jobs/{}", f.id))
+                .header("Prefer", value)
+                .send(),
+        )
+        .await
+        .unwrap()
+        .assert_status(StatusCode::BAD_REQUEST);
+    }
+    tokio::time::timeout(Duration::from_secs(1), f.read(25))
+        .await
+        .unwrap()
+        .unwrap()
+        .assert_status(StatusCode::SERVICE_UNAVAILABLE);
+    drop(busy);
+    f.close().await;
+}
+
+#[tokio::test]
+async fn cancelled_waits_remain_owned_until_the_request_drain_finishes() {
+    let mut f = Fixture::new().await;
+    tokio::time::pause();
+    let read = f.read(1);
+    f.waiting().await;
+    read.abort();
+    assert!(matches!(read.await, Err(error) if error.is_cancelled()));
+    let drain = tokio::spawn(f.requests.drain());
+    tokio::task::yield_now().await;
+    assert!(!drain.is_finished());
+    tokio::time::advance(Duration::from_secs(1)).await;
+    tokio::time::resume();
+    tokio::time::timeout(Duration::from_secs(1), drain)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    f.auth.tasks.shutdown().await;
+}
+
+#[tokio::test]
+async fn jail_authentication_and_setup_consume_the_forwarded_prefer_wait_budget() {
+    let mut f = Fixture::new().await;
+    let blocked = Arc::clone(&f.auth.gate).acquire_owned().await.unwrap();
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(601)).await;
+    let started = tokio::time::Instant::now();
+    let read = f.read(25);
+    (&mut f.auth.refresh_started).await.unwrap();
+    tokio::time::advance(Duration::from_secs(6)).await;
+    drop(blocked);
+    f.waiting().await;
+    tokio::time::advance(Duration::from_millis(18900)).await;
+    tokio::time::resume();
+    read.await
+        .unwrap()
+        .assert_json(json!({"state":"running"}))
+        .await;
+    assert!(started.elapsed() >= Duration::from_millis(24900));
+    assert!(started.elapsed() < Duration::from_secs(25));
+    f.close().await;
+}
+
+#[tokio::test]
+async fn a_controller_and_jail_prefer_wait_read_returns_the_fake_guests_terminal_result() {
+    let mut auth = crate::tests::Fixture::new().await;
+    let mut claims = auth.claims();
+    let controller_subject = "system:serviceaccount:runner:controller";
+    claims["sub"] = json!(controller_subject);
+    claims["aud"] = json!(["vm-runner-jail"]);
+    let token = auth.token(&claims, "ec");
+    let dir = tempfile::tempdir().unwrap();
+    let listener = tokio::net::UnixListener::bind(dir.path().join("guest.sock")).unwrap();
+    let (endpoint, requests, state) = endpoint(
+        auth.config.auth.clone(),
+        controller_subject.into(),
+        Arc::new(Guest::new(dir.path().join("guest.sock"))),
+    )
+    .await
+    .unwrap();
+    state.mark_ready();
+    let mut f = crate::controller::proxy::tests::Fixture::with_jail(
+        endpoint.boxed(),
+        token,
+        auth.config.auth.clone(),
+    )
+    .await;
+    let controller = f.api_endpoint(&auth).await;
+    let listener_controller = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener_controller.local_addr().unwrap());
+    f.tasks.spawn(async move {
+        poem::Server::new_with_acceptor(
+            poem::listener::TcpAcceptor::from_tokio(listener_controller).unwrap(),
+        )
+        .run(controller)
+        .await
+        .unwrap();
+    });
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .unwrap();
+    let token = auth.token(&auth.claims(), "ec");
+    let peer = tokio::spawn(async move {
+        let (mut stream, frame) = request(listener.accept().await.unwrap().0).await;
+        assert_eq!(frame["argv"], json!(["echo", "ok"]));
+        assert_eq!(frame["deadlineMs"], 600000);
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        guest::write_frame(&mut stream, &json!({"outcome":"executed","exitCode":7,"stdout":"smoke result","stderr":"","truncated":false})).await.unwrap();
+    });
+    let id = f.session();
+    let pending = client
+        .post(format!("{base}/v1/sessions/{id}/exec"))
+        .bearer_auth(&token)
+        .json(&json!({"argv":["echo","ok"],"deadlineMs":1000}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(pending.status(), StatusCode::ACCEPTED);
+    let pending: serde_json::Value = pending.json().await.unwrap();
+    let started = std::time::Instant::now();
+    let response = client
+        .get(format!(
+            "{base}/v1/jobs/{}",
+            pending["jobId"].as_str().unwrap()
+        ))
+        .bearer_auth(&token)
+        .header("Prefer", "wait=20")
+        .send()
+        .await
+        .unwrap();
+    let elapsed = started.elapsed();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["Preference-Applied"], "wait=20");
+    let terminal: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(
+        terminal,
+        json!({"outcome":"executed","exitCode":7,"stdout":"smoke result","stderr":"","truncated":false})
+    );
+    assert!(elapsed < Duration::from_secs(20));
+    println!(
+        "job-wait smoke: exec=202 Prefer=wait=20 Preference-Applied=wait=20 elapsedMs={} result={terminal}",
+        elapsed.as_millis()
+    );
+    peer.await.unwrap();
+    requests.drain().await.unwrap();
+    state.drain().await.unwrap();
+    f.tasks.shutdown().await;
+    auth.tasks.shutdown().await;
+}
+
+#[tokio::test]
+async fn the_first_wait_preference_is_used_across_prefer_header_lines() {
+    let f = Fixture::new().await;
+    f.sender.send_replace(completed());
+    for first in [
+        "return=minimal, WAIT = 02; note=\"a,b\"",
+        "custom=\"comma,wait=99\"",
+    ] {
+        let response = f
+            .client
+            .get(format!("/jobs/{}", f.id))
+            .header("Prefer", first)
+            .header("Prefer", "wait=2, wait=26")
+            .send()
+            .await;
+        response.assert_status_is_ok();
+        response.assert_header("Preference-Applied", "wait=2");
+    }
+    f.close().await;
+}
+
+#[tokio::test]
+async fn completion_between_progress_reads_returns_the_result_and_keeps_the_controller_handle() {
+    let mut auth = crate::tests::Fixture::new().await;
+    let controller_subject = "system:serviceaccount:runner:controller";
+    let mut claims = auth.claims();
+    claims["sub"] = json!(controller_subject);
+    claims["aud"] = json!(["vm-runner-jail"]);
+    let token = auth.token(&claims, "ec");
+    let dir = tempfile::tempdir().unwrap();
+    let listener = tokio::net::UnixListener::bind(dir.path().join("guest.sock")).unwrap();
+    let (endpoint, requests, state) = endpoint(
+        auth.config.auth.clone(),
+        controller_subject.into(),
+        Arc::new(Guest::new(dir.path().join("guest.sock"))),
+    )
+    .await
+    .unwrap();
+    state.mark_ready();
+    let mut f = crate::controller::proxy::tests::Fixture::with_jail(
+        endpoint.boxed(),
+        token,
+        auth.config.auth.clone(),
+    )
+    .await;
+    let client = Arc::new(TestClient::new(f.api_endpoint(&auth).await).default_header(
+        "Authorization",
+        format!("Bearer {}", auth.token(&auth.claims(), "ec")),
+    ));
+    let terminal = json!({"outcome":"executed","exitCode":7,"stdout":"raced result","stderr":"","truncated":false});
+    let result = terminal.clone();
+    let (finish, finished) = tokio::sync::oneshot::channel();
+    let peer = tokio::spawn(async move {
+        let (mut stream, _) = request(listener.accept().await.unwrap().0).await;
+        finished.await.unwrap();
+        guest::write_frame(&mut stream, &result).await.unwrap();
+    });
+    let session = f.session();
+    let pending = client
+        .post(format!("/v1/sessions/{session}/exec"))
+        .body_json(&json!({"argv":["echo","ok"],"deadlineMs":1000}))
+        .send()
+        .await;
+    pending.assert_status(StatusCode::ACCEPTED);
+    let pending: serde_json::Value = pending.0.into_body().into_json().await.unwrap();
+    let path = format!("/v1/jobs/{}", pending["jobId"].as_str().unwrap());
+    let (waiting, at_wait) = tokio::sync::oneshot::channel();
+    let (observed, at_observation) = tokio::sync::oneshot::channel();
+    let (resume, resumed) = tokio::sync::oneshot::channel();
+    *state.progress_read_hook.lock().unwrap() = Some(ProgressReadHook {
+        waiting,
+        observed,
+        resume: resumed,
+    });
+    tokio::time::pause();
+    let reader = Arc::clone(&client);
+    let read_path = path.clone();
+    let read = tokio::spawn(async move {
+        reader
+            .get(read_path)
+            .header("Prefer", "wait=1")
+            .send()
+            .await
+    });
+    at_wait.await.unwrap();
+    tokio::time::advance(Duration::from_millis(901)).await;
+    at_observation.await.unwrap();
+    finish.send(()).unwrap();
+    peer.await.unwrap();
+    state.drain().await.unwrap();
+    assert!(
+        state.jobs.lock().unwrap().entries[0]
+            .progress
+            .has_changed()
+            .is_err()
+    );
+    resume.send(()).unwrap();
+    let response = read.await.unwrap();
+    response.assert_status_is_ok();
+    let result: serde_json::Value = response.0.into_body().into_json().await.unwrap();
+    tokio::time::resume();
+    let retained = client.get(&path).send().await;
+    assert_eq!((&result, retained.0.status()), (&terminal, StatusCode::OK));
+    retained.assert_json(terminal).await;
+    requests.drain().await.unwrap();
+    f.tasks.shutdown().await;
+    auth.tasks.shutdown().await;
+}
+
+#[tokio::test]
+async fn quoted_opaque_preferences_do_not_reject_a_jail_wait() {
+    let f = Fixture::new().await;
+    f.sender.send_replace(completed());
+    for value in [
+        "custom=\"café\", wait=1".as_bytes(),
+        "wait=1; note=\"café\"".as_bytes(),
+        b"custom=\"\xff\\\",wait=99\", wait=1, wait=26".as_slice(),
+    ] {
+        let response = f
+            .client
+            .get(format!("/jobs/{}", f.id))
+            .header(
+                "Prefer",
+                poem::http::HeaderValue::from_bytes(value).unwrap(),
+            )
+            .send()
+            .await;
+        response.assert_status_is_ok();
+        response.assert_header("Preference-Applied", "wait=1");
+    }
+    f.close().await;
+}
+
+#[tokio::test]
+async fn opaque_bytes_do_not_hide_an_invalid_selected_wait() {
+    let f = Fixture::new().await;
+    for value in [
+        b"wait=\xff; note=\"ok\"".as_slice(),
+        b"custom=\"\xff\", wait=26".as_slice(),
+    ] {
+        f.client
+            .get(format!("/jobs/{}", f.id))
+            .header(
+                "Prefer",
+                poem::http::HeaderValue::from_bytes(value).unwrap(),
+            )
+            .send()
+            .await
+            .assert_status(StatusCode::BAD_REQUEST);
+    }
+    f.close().await;
+}

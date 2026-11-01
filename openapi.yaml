@@ -35,12 +35,24 @@ paths:
             application/json; charset=utf-8:
               schema:
                 $ref: '#/components/schemas/SessionBody'
+          headers:
+            X-DEKOPON-VM-SESSION:
+              required: true
+              deprecated: false
+              schema:
+                type: string
         '200':
           description: ''
           content:
             application/json; charset=utf-8:
               schema:
                 $ref: '#/components/schemas/SessionBody'
+          headers:
+            X-DEKOPON-VM-SESSION:
+              required: true
+              deprecated: false
+              schema:
+                type: string
         '409':
           description: ''
           content:

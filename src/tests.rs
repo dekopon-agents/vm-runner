@@ -1,4 +1,5 @@
 use super::*;
+use crate::controller::SESSION_HEADER;
 mod controller_contracts;
 mod controller_resilience;
 use aws_lc_rs::{
@@ -178,7 +179,7 @@ async fn authenticated_oversized_session_id_is_exported_once_and_capped() {
     fixture.tasks.shutdown().await;
 }
 #[tokio::test]
-async fn session_route_authenticates_and_returns_named_create_or_get_statuses() {
+async fn session_route_authenticates_and_names_the_session_in_a_header_only_on_create_or_get() {
     let mut fixture = Fixture::new().await;
     let token = fixture.token(&fixture.claims(), "ec");
     fixture.config.jails = Some(
@@ -234,15 +235,18 @@ async fn session_route_authenticates_and_returns_named_create_or_get_statuses() 
         .send()
         .await;
     malformed.assert_status(StatusCode::UNAUTHORIZED);
+    assert!(!malformed.0.headers().contains_key(SESSION_HEADER));
     malformed
         .assert_json(json!({"error":"unauthorized", "reason":"malformed"}))
         .await;
-    client
+    let response = client
         .post("/v1/sessions")
         .body_json(&json!({"profile":"travel"}))
         .send()
-        .await
-        .assert_status(StatusCode::UNAUTHORIZED);
+        .await;
+    response.assert_status(StatusCode::UNAUTHORIZED);
+    assert!(!response.0.headers().contains_key(SESSION_HEADER));
+    let mut named = Vec::new();
     for status in [StatusCode::CREATED, StatusCode::OK] {
         let response = client
             .post("/v1/sessions")
@@ -251,14 +255,27 @@ async fn session_route_authenticates_and_returns_named_create_or_get_statuses() 
             .send()
             .await;
         response.assert_status(status);
-        response
-            .json()
-            .await
-            .value()
-            .object()
-            .get("name")
-            .assert_string("default");
+        let header: Vec<_> = response
+            .0
+            .headers()
+            .get_all(SESSION_HEADER)
+            .iter()
+            .collect();
+        let [header] = header[..] else {
+            panic!("{header:?}");
+        };
+        let header = header.to_str().unwrap().to_owned();
+        let body = response.json().await;
+        let body = body.value().object();
+        body.get("name").assert_string("default");
+        body.get("sessionId").assert_string(&header);
+        assert_eq!(
+            uuid::Uuid::parse_str(&header).unwrap().get_version(),
+            Some(uuid::Version::SortRand)
+        );
+        named.push(header);
     }
+    assert_eq!(named[0], named[1]);
     let response = client
         .post("/v1/sessions")
         .header("Authorization", format!("Bearer {token}"))
@@ -266,6 +283,7 @@ async fn session_route_authenticates_and_returns_named_create_or_get_statuses() 
         .send()
         .await;
     response.assert_status(StatusCode::CONFLICT);
+    assert!(!response.0.headers().contains_key(SESSION_HEADER));
     response
         .assert_json(json!({"error":"session_profile_conflict"}))
         .await;
@@ -276,6 +294,7 @@ async fn session_route_authenticates_and_returns_named_create_or_get_statuses() 
         .send()
         .await;
     response.assert_status(StatusCode::BAD_REQUEST);
+    assert!(!response.0.headers().contains_key(SESSION_HEADER));
     response
         .assert_json(json!({"outcome":"not_executed", "reason":"bad_name"}))
         .await;

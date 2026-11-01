@@ -304,7 +304,7 @@ impl Fixture {
         .boxed()
     }
     pub(crate) fn session(&self) -> String {
-        let Created::New(Json(session)) = self
+        let Created::New(Json(session), _) = self
             .controller
             .create(
                 SUBJECT,
@@ -527,7 +527,7 @@ async fn per_session_job_cap_still_admits_another_session() {
     };
     assert_eq!(refused.reason, "job_capacity");
     assert_eq!(f.calls.load(Ordering::SeqCst), 0);
-    let Created::New(Json(other)) = f
+    let Created::New(Json(other), _) = f
         .controller
         .create(
             SUBJECT,

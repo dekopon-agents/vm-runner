@@ -106,7 +106,7 @@ async fn controller_telemetry_round_trips_into_strict_jail_config() {
         )
     );
     let controller = controller.unwrap();
-    let Created::New(Json(body)) = controller
+    let Created::New(Json(body), _) = controller
         .create(SUBJECT_VALUE, create("travel", None))
         .unwrap()
     else {
@@ -349,7 +349,7 @@ async fn cold_boot_records_created_uid_even_if_secret_fails_and_on_success() {
         let (mut controller, mut mock, _files) = cold_setup().await;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         controller.jail_port = listener.local_addr().unwrap().port();
-        let Created::New(Json(body)) = controller
+        let Created::New(Json(body), _) = controller
             .create(SUBJECT_VALUE, create("travel", None))
             .unwrap()
         else {
@@ -555,7 +555,7 @@ async fn session_lifecycle_and_health_are_typed_logs_with_detail() {
             opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new(&provider),
         ));
     let id = tracing::dispatcher::with_default(&dispatch, || {
-        let Created::New(Json(session)) = controller
+        let Created::New(Json(session), _) = controller
             .create(SUBJECT_VALUE, create("travel", None))
             .unwrap()
         else {
@@ -629,7 +629,7 @@ async fn session_lifecycle_and_health_are_typed_logs_with_detail() {
 #[tokio::test]
 async fn named_sessions_are_lazy_subject_scoped_and_profile_consistent() {
     let (controller, _mock) = setup(vec![]).await;
-    let Created::New(Json(first)) = controller
+    let Created::New(Json(first), _) = controller
         .create(SUBJECT_VALUE, create("travel", None))
         .unwrap()
     else {
@@ -642,7 +642,7 @@ async fn named_sessions_are_lazy_subject_scoped_and_profile_consistent() {
             .get_version_num(),
         7
     );
-    let Created::Existing(Json(same)) = controller
+    let Created::Existing(Json(same), _) = controller
         .create(SUBJECT_VALUE, create("travel", Some("default")))
         .unwrap()
     else {
@@ -660,7 +660,7 @@ async fn named_sessions_are_lazy_subject_scoped_and_profile_consistent() {
         controller
             .create(SUBJECT_VALUE, create("travel", None))
             .unwrap(),
-        Created::Existing(_)
+        Created::Existing(..)
     ));
     assert!(controller.sessions.lock().unwrap()[&first.session_id].active > 1);
     assert!(matches!(
@@ -676,7 +676,7 @@ async fn named_sessions_are_lazy_subject_scoped_and_profile_consistent() {
                 create("travel", None)
             )
             .unwrap(),
-        Created::New(_)
+        Created::New(..)
     ));
     assert!(
         controller
@@ -711,7 +711,7 @@ async fn quota_and_bad_profile_refusals_preserve_the_registry() {
     ));
     assert!(matches!(
         controller.create(subject, create("travel", None)).unwrap(),
-        Created::New(_)
+        Created::New(..)
     ));
     assert!(matches!(
         controller
@@ -881,7 +881,7 @@ async fn rebuild_keeps_the_oldest_named_session_and_deletes_duplicates_in_any_li
             }
         );
         let controller = controller.unwrap();
-        let Created::Existing(Json(session)) = controller
+        let Created::Existing(Json(session), _) = controller
             .create(SUBJECT_VALUE, create("travel", None))
             .unwrap()
         else {
@@ -1005,7 +1005,7 @@ async fn terminating_pods_count_toward_quota_but_never_satisfy_create_or_get_unt
     let mut terminating = pod();
     terminating["metadata"]["deletionTimestamp"] = json!("2026-09-26T00:00:00Z");
     let (controller, mut mock) = setup(vec![terminating.clone()]).await;
-    let Created::New(Json(new)) = controller
+    let Created::New(Json(new), _) = controller
         .create(SUBJECT_VALUE, create("travel", None))
         .unwrap()
     else {
@@ -1031,7 +1031,7 @@ async fn terminating_pods_count_toward_quota_but_never_satisfy_create_or_get_unt
         controller
             .create(SUBJECT_VALUE, create("travel", Some("second")))
             .unwrap(),
-        Created::New(_)
+        Created::New(..)
     ));
 }
 #[test]

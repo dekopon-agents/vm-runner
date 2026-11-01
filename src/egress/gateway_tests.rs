@@ -986,6 +986,68 @@ async fn models_name_is_refused_without_a_route_and_its_header_never_leaves_for_
             .any(|s| attribute(s, "egress.decision", "refused:not_allowed"))
     );
 }
+#[tokio::test]
+async fn upstream_session_and_subject_response_headers_never_reach_the_guest() {
+    let gateway = Gateway::new(local_egress()).await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let peer = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let received = Arc::clone(&requests);
+        hyper::server::conn::http1::Builder::new()
+            .keep_alive(false)
+            .serve_connection(
+                TokioIo::new(stream),
+                service_fn(move |req: Request<Incoming>| {
+                    received
+                        .lock()
+                        .unwrap()
+                        .push((req.uri().clone(), req.headers().clone()));
+                    async {
+                        let mut response =
+                            Response::new(Full::new(Bytes::from_static(b"upstream")));
+                        for name in [models::SESSION_HEADER, models::SUBJECT_HEADER] {
+                            response
+                                .headers_mut()
+                                .insert(name, header::HeaderValue::from_static("upstream-forged"));
+                        }
+                        Ok::<_, Infallible>(response)
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+        std::mem::take(&mut *requests.lock().unwrap())
+    });
+    let mut stream = TcpStream::connect(gateway.proxy.addr).await.unwrap();
+    stream
+        .write_all(
+            format!(
+                "GET /path?q=1 HTTP/1.1\r\nHost: localhost:{port}\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).await.unwrap();
+    let (head, body) = response.split_once("\r\n\r\n").unwrap();
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(body, "upstream");
+    let head = head.to_ascii_lowercase();
+    assert!(!head.contains(models::SESSION_HEADER), "{head}");
+    assert!(!head.contains(models::SUBJECT_HEADER), "{head}");
+    assert!(!head.contains("upstream-forged"), "{head}");
+    let requests = peer.await.unwrap();
+    let [(uri, headers)] = &requests[..] else {
+        panic!("{requests:?}");
+    };
+    assert_eq!(uri, "/path?q=1");
+    assert!(!headers.contains_key(models::SESSION_HEADER));
+    assert!(!headers.contains_key(models::SUBJECT_HEADER));
+    gateway.proxy.finish().await;
+}
 #[test]
 fn models_upstream_is_an_https_origin_and_subject_is_namespace_name() {
     assert_eq!(

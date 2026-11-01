@@ -216,6 +216,7 @@ pub(crate) struct Controller {
     jobs: Mutex<HashMap<String, proxy::Job>>,
     pub(super) execution: Arc<tokio::sync::Semaphore>,
     pub(super) reads: Arc<tokio::sync::Semaphore>,
+    pub(super) waits: Arc<tokio::sync::Semaphore>,
     downloads: Arc<tokio::sync::Semaphore>,
 }
 pub(super) fn now() -> u64 {
@@ -360,6 +361,7 @@ impl Controller {
             jobs: Mutex::new(HashMap::new()),
             execution: Arc::new(tokio::sync::Semaphore::new(1)),
             reads: Arc::new(tokio::sync::Semaphore::new(1)),
+            waits: Arc::new(tokio::sync::Semaphore::new(1)),
             downloads: Arc::new(tokio::sync::Semaphore::new(1)),
         })
     }

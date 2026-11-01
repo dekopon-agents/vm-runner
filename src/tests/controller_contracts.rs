@@ -107,3 +107,23 @@ fn non_digest_images_are_config_conflicts_together_with_other_errors() {
         "a".repeat(64)
     )));
 }
+
+#[tokio::test]
+async fn shutdown_waits_for_the_dedicated_job_wait_lane_to_drain() {
+    let (controller, _mock) = controller::tests::setup(vec![]).await;
+    let controller = Arc::new(controller);
+    let busy = Arc::clone(&controller.waits).acquire_owned().await.unwrap();
+    let requests = Requests {
+        admission: Arc::new(tokio::sync::Semaphore::new(1)),
+        reaper_drain: Arc::new(tokio::sync::Semaphore::new(1)),
+        controller: Some(controller),
+        rollups: Arc::new(std::sync::Mutex::new(RequestRollups::new(
+            Origin::Controller,
+        ))),
+    };
+    let drain = requests.drain();
+    tokio::pin!(drain);
+    assert!(futures_util::poll!(drain.as_mut()).is_pending());
+    drop(busy);
+    drain.await.unwrap();
+}

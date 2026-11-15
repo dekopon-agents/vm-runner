@@ -31,9 +31,17 @@ struct Proxy {
 }
 fn local_egress() -> Egress {
     serde_yaml_ng::from_str(
-        "allow: [localhost]\ndns: runner\nallowPrivate: [127.0.0.0/8, '::1/128']",
+        "allow: [http://localhost, https://localhost]\ndns: runner\nallowPrivate: [127.0.0.0/8, '::1/128']",
     )
     .unwrap()
+}
+fn local_egress_for_port(port: u16) -> Egress {
+    let mut egress = local_egress();
+    egress.allow.extend([
+        format!("http://localhost:{port}"),
+        format!("https://localhost:{port}"),
+    ]);
+    egress
 }
 impl Proxy {
     async fn new(roots: RootCertStore) -> Self {
@@ -42,11 +50,11 @@ impl Proxy {
     async fn configured(roots: RootCertStore, egress: Egress) -> Self {
         Self::configured_with_omit(roots, egress, Default::default()).await
     }
-    async fn drip(roots: RootCertStore) -> Self {
+    async fn drip(roots: RootCertStore, egress: Egress) -> Self {
         let exporter = InMemorySpanExporter::default();
         Self::with_listeners(
             roots,
-            local_egress(),
+            egress,
             exporter.clone(),
             exporter,
             None,
@@ -264,9 +272,9 @@ async fn allowed_https_strips_trace_headers_and_exports_exactly_one_final_status
     .unwrap();
     let mut roots = RootCertStore::empty();
     roots.add(cert.cert.der().clone()).unwrap();
-    let proxy = Proxy::new(roots).await;
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
+    let proxy = Proxy::configured(roots, local_egress_for_port(port)).await;
     let peer = tokio::spawn(upstream(listener, Some(Arc::new(server))));
     let tunnel = proxy.tunnel(port).await;
     let tls = TlsConnector::from(Arc::clone(&proxy.tls))
@@ -477,9 +485,9 @@ async fn tls_host_must_agree_with_sni_and_connect_authority() {
 }
 #[tokio::test]
 async fn connect_post_is_parsed_and_stripped_or_refused_by_inner_host() {
-    let proxy = Proxy::new(RootCertStore::empty()).await;
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
+    let proxy = Proxy::configured(RootCertStore::empty(), local_egress_for_port(port)).await;
     let peer = tokio::spawn(upstream(listener, None));
     for (host, status) in [("other.invalid", 403), ("localhost", 200)] {
         let tunnel = proxy.tunnel(port).await;
@@ -501,9 +509,9 @@ async fn connect_post_is_parsed_and_stripped_or_refused_by_inner_host() {
 }
 #[tokio::test]
 async fn plain_http_preserves_validated_host_and_streams_bodies() {
-    let proxy = Proxy::new(RootCertStore::empty()).await;
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
+    let proxy = Proxy::configured(RootCertStore::empty(), local_egress_for_port(port)).await;
     let peer = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
         hyper::server::conn::http1::Builder::new()
@@ -604,9 +612,9 @@ async fn failed_tls_handshake_records_known_sni() {
 }
 #[tokio::test]
 async fn truncated_upstream_body_is_body_error_after_the_streamed_bytes() {
-    let proxy = Proxy::new(RootCertStore::empty()).await;
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
+    let proxy = Proxy::configured(RootCertStore::empty(), local_egress_for_port(port)).await;
     let (headers_seen, release) = tokio::sync::oneshot::channel();
     let peer = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.unwrap();
@@ -654,9 +662,9 @@ async fn truncated_upstream_body_is_body_error_after_the_streamed_bytes() {
 }
 #[tokio::test]
 async fn truncated_guest_post_is_request_body_error_with_one_failure_log() {
-    let proxy = Proxy::new(RootCertStore::empty()).await;
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
+    let proxy = Proxy::configured(RootCertStore::empty(), local_egress_for_port(port)).await;
     let peer = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
         hyper::server::conn::http1::Builder::new()
@@ -705,9 +713,9 @@ async fn truncated_guest_post_is_request_body_error_with_one_failure_log() {
 }
 #[tokio::test]
 async fn client_cancellation_after_response_bytes_records_abandoned_response_body() {
-    let proxy = Proxy::new(RootCertStore::empty()).await;
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
+    let proxy = Proxy::configured(RootCertStore::empty(), local_egress_for_port(port)).await;
     let peer = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.unwrap();
         let mut request = Vec::new();
@@ -774,7 +782,7 @@ async fn cancelled_upstream_request_exports_abandoned_without_a_status() {
     async {
         let engine = Engine {
             ca: Ca::new().unwrap().0,
-            egress: local_egress(),
+            egress: local_egress_for_port(port),
             tls: client_config(RootCertStore::empty()).unwrap(),
             omit: Default::default(),
             rollups: Arc::new(Mutex::new(Rollups::new())),
@@ -863,11 +871,11 @@ fn request_trailers_cannot_reintroduce_trace_headers() {
 }
 #[tokio::test]
 async fn allowed_name_resolving_to_loopback_is_refused_and_spanned_before_connect() {
-    let mut egress = local_egress();
-    egress.allow_private.clear();
-    let proxy = Proxy::configured(RootCertStore::empty(), egress).await;
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
+    let mut egress = local_egress_for_port(port);
+    egress.allow_private.clear();
+    let proxy = Proxy::configured(RootCertStore::empty(), egress).await;
     let stream = TcpStream::connect(proxy.addr).await.unwrap();
     assert_eq!(exchange(stream, &format!("GET http://localhost:{port}/ HTTP/1.1\r\nHost: localhost:{port}\r\nConnection: close\r\n\r\n")).await,
         (403, "egress refused: localhost".into()));
@@ -953,7 +961,8 @@ fn private_cidr_exception_is_narrow_and_applies_to_vetted_socket_addresses() {
 }
 #[test]
 fn egress_defaults_match_browser_limits_and_invalid_settings_fail_at_parse_boundary() {
-    let egress: Egress = serde_yaml_ng::from_str("allow: [localhost]\ndns: runner").unwrap();
+    let egress: Egress =
+        serde_yaml_ng::from_str("allow: [https://localhost]\ndns: runner").unwrap();
     assert!(egress.allow_private.is_empty());
     assert_eq!(egress.idle_seconds.get(), 90);
     assert_eq!(egress.max_connection_seconds.get(), 1800);
@@ -967,7 +976,7 @@ fn egress_defaults_match_browser_limits_and_invalid_settings_fail_at_parse_bound
     ] {
         assert!(
             serde_yaml_ng::from_str::<Egress>(&format!(
-                "allow: [localhost]\ndns: runner\n{invalid}"
+                "allow: [https://localhost]\ndns: runner\n{invalid}"
             ))
             .is_err(),
             "{invalid}"
@@ -1263,9 +1272,9 @@ fn worker_unwind_records_one_abandoned_exchange() {
 }
 #[tokio::test]
 async fn drip_keeps_failure_and_rollup_logs_without_an_exchange_span() {
-    let proxy = Proxy::drip(RootCertStore::empty()).await;
     let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = upstream.local_addr().unwrap().port();
+    let proxy = Proxy::drip(RootCertStore::empty(), local_egress_for_port(port)).await;
     let peer = tokio::spawn(async move {
         drop(upstream.accept().await.unwrap());
     });
@@ -1322,9 +1331,9 @@ async fn connect_is_its_own_completed_tunnel_record_without_zero_status() {
 }
 #[tokio::test]
 async fn client_error_completes_and_emits_a_failure_log() {
-    let proxy = Proxy::new(RootCertStore::empty()).await;
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
+    let proxy = Proxy::configured(RootCertStore::empty(), local_egress_for_port(port)).await;
     let peer = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
         hyper::server::conn::http1::Builder::new()
@@ -1499,13 +1508,62 @@ async fn query_noise_only_inspects_first_sixty_four_pairs() {
 }
 #[test]
 fn suffix_allowlist_respects_label_boundaries_and_attributes_are_byte_bounded() {
-    let allow = vec!["*.example.com".into()];
+    let allow = vec!["https://*.example.com".into()];
     assert!(allowed("A.Example.Com.", &allow));
     assert!(!allowed("example.com", &allow));
     assert!(!allowed("badexample.com", &allow));
     let value = cut(&"é".repeat(3000));
     assert!(value.len() <= 4096);
     assert!(value.ends_with("…[truncated]"));
+}
+#[test]
+fn allow_entries_bind_each_origin_to_its_scheme_and_port() {
+    let allow = vec!["https://*.example.com:8443".into()];
+    assert!(allowed("api.example.com", &allow));
+    assert!(allowed_destination(
+        "api.example.com",
+        "https",
+        8443,
+        &allow
+    ));
+    assert!(!allowed_destination(
+        "api.example.com",
+        "http",
+        8443,
+        &allow
+    ));
+    assert!(!allowed_destination(
+        "api.example.com",
+        "https",
+        443,
+        &allow
+    ));
+    assert!(!allowed_destination("example.com", "https", 8443, &allow));
+    let default_port = vec!["https://example.com".into()];
+    assert!(allowed_destination(
+        "example.com",
+        "https",
+        443,
+        &default_port
+    ));
+    assert!(!allowed_destination(
+        "example.com",
+        "http",
+        80,
+        &default_port
+    ));
+    assert!(!allowed_destination(
+        "example.com",
+        "https",
+        80,
+        &default_port
+    ));
+    assert!(!allowed_destination(
+        "example.com",
+        "https",
+        443,
+        &["example.com".into()]
+    ));
 }
 
 #[test]
@@ -1519,4 +1577,49 @@ fn minted_leaf_names_its_host_and_chains_to_a_distinct_ca_subject() {
     assert_ne!(leaf_cert.subject(), leaf_cert.issuer());
     let eku = leaf_cert.extended_key_usage().unwrap().unwrap().value;
     assert!(eku.server_auth);
+}
+
+#[tokio::test]
+async fn a_request_received_inside_tls_is_never_forwarded_in_cleartext() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let proxy = Proxy::configured(RootCertStore::empty(), local_egress_for_port(port)).await;
+    let peer = tokio::spawn(upstream(listener, None));
+    let tunnel = proxy.tunnel(port).await;
+    let tls = TlsConnector::from(Arc::clone(&proxy.tls))
+        .connect(ServerName::try_from("localhost").unwrap(), tunnel)
+        .await
+        .unwrap();
+    let (status, body) = exchange(
+        tls,
+        &format!("GET http://localhost:{port}/session HTTP/1.1\r\nHost: localhost:{port}\r\nCookie: sessionKey=placeholder\r\nConnection: close\r\n\r\n"),
+    )
+    .await;
+    assert_eq!((status, body.as_str()), (403, "egress refused: localhost"));
+    let cleartext = tokio::time::timeout(Duration::from_millis(100), peer).await;
+    assert!(
+        cleartext.is_err(),
+        "plaintext upstream received a request: {cleartext:?}"
+    );
+    let _spans = proxy.finish().await;
+}
+
+#[tokio::test]
+async fn an_allowed_host_does_not_authorize_an_unlisted_port() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let proxy = Proxy::new(RootCertStore::empty()).await;
+    let peer = tokio::spawn(upstream(listener, None));
+    let stream = TcpStream::connect(proxy.addr).await.unwrap();
+    let (status, body) = exchange(
+        stream,
+        &format!("GET http://localhost:{port}/private HTTP/1.1\r\nHost: localhost:{port}\r\nCookie: sessionKey=placeholder\r\nConnection: close\r\n\r\n"),
+    ).await;
+    assert_eq!((status, body.as_str()), (403, "egress refused: localhost"));
+    let received = tokio::time::timeout(Duration::from_millis(100), peer).await;
+    assert!(
+        received.is_err(),
+        "unlisted port received a request: {received:?}"
+    );
+    let _spans = proxy.finish().await;
 }

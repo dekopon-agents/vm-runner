@@ -12,8 +12,8 @@ provides the contracted `otel-traces-v0_7` index; 0.9.1 uses `otel-traces-v0_9`.
 `otlp_conformance.py` uses Python 3.11+ and its standard library. It starts one
 loopback HTTP upstream, then runs the real `vm-runnerd egress` command once per
 backend: OpenObserve HTTP/protobuf with a Basic header file, then Quickwit gRPC.
-Each invocation has a fresh UUIDv7 session and forwards one request. It verifies
-the upstream body and trace-header stripping, gracefully stops the proxy, and
+Each invocation has a fresh UUIDv7 session and forwards one request to an explicit HTTP origin.
+It verifies the upstream body and trace-header stripping, gracefully stops the proxy, and
 checks all C2 jail resource and request attributes in backend search results.
 Session and trace-id searches must identify the same span; missing-session and
 missing-trace controls must return no hits. Quickwit resource filtering works;

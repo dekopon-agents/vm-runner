@@ -57,7 +57,7 @@ async fn jail_vmm_has_no_new_privileges_and_confined_identity_and_egress() {
     let mut value: Value =
         serde_yaml_ng::from_str(include_str!("../examples/vm-runner.yaml")).unwrap();
     value["profiles"]["travel"]["image"] = std::env::var("KVM_GUEST_IMAGE").unwrap().into();
-    value["profiles"]["travel"]["egress"]["allow"] = json!(["example.com"]);
+    value["profiles"]["travel"]["egress"]["allow"] = json!(["https://example.com"]);
     let pr_guest = std::env::var("KVM_PR_GUEST").as_deref() == Ok("1");
     if pr_guest {
         value["shapes"]["proof-1c512m"] = json!({"vcpus":1,"memoryMiB":512,"diskMiB":4096});

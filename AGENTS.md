@@ -22,7 +22,7 @@ the design; read the section your change touches.
 
 - Identity is launcher metadata or a verified bearer JWT, never something the guest sends.
 - Egress fails closed: every resolved address is global unicast unless a profile's
-  `egress.allowPrivate` names it, the host allow-list still applies, and unsupported protocols are
+  `egress.allowPrivate` names it, the origin allow-list still applies, and unsupported protocols are
   refused. The proxy injects no credentials and strips W3C trace headers.
 - The guest holds no credential. The image pins every download by version and per-arch sha256.
 

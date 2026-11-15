@@ -56,7 +56,7 @@ profiles:
     browser: headless
     idleSeconds: 60
     maxSeconds: 120
-    egress: {{allow: [localhost], dns: runner}}
+    egress: {{allow: [http://localhost], dns: runner}}
 quotas: {{default: {{maxSessions: 1}}, subjects: {{}}}}
 telemetry:
   otlp: {{protocol: http, endpoint: 'http://{endpoint}/v1/traces'}}

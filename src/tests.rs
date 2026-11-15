@@ -307,7 +307,13 @@ fn config_reports_all_conflicts_together() {
         .replace("maxSeconds: 1800", "maxSeconds: 1")
         .replace("maxConnections: 128", "maxConnections: 256");
     let mut config: Config = serde_yaml_ng::from_str(&yaml).unwrap();
-    let invalid = ["www.google.com:443", "https://x", "*.bücher.example"];
+    let invalid = [
+        "localhost",
+        "www.google.com:443",
+        "ftp://x",
+        "https://x:65536",
+        "*.bücher.example",
+    ];
     config.profiles.0[0]
         .1
         .egress
@@ -316,7 +322,7 @@ fn config_reports_all_conflicts_together() {
     let conflicts = config.conflicts();
     for host in invalid {
         assert!(
-            conflicts.contains(&config::Conflict::Wildcard(host.into())),
+            conflicts.contains(&config::Conflict::EgressAllow("travel".into(), host.into())),
             "{conflicts:?}"
         );
     }

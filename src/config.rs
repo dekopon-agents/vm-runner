@@ -393,7 +393,9 @@ pub enum Conflict {
     Shape(String),
     #[error("empty allow list: {0}")]
     EmptyAllow(String),
-    #[error("egress allow entry in profile {0} must be http://host[:port] or https://host[:port]: {1}")]
+    #[error(
+        "egress allow entry in profile {0} must be http://host[:port] or https://host[:port]: {1}"
+    )]
     EgressAllow(String, String),
     #[error("idleSeconds and maxSeconds must be at least 60, with idleSeconds <= maxSeconds: {0}")]
     Lifetime(String),

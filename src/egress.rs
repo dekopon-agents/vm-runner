@@ -1,5 +1,5 @@
 use crate::{
-    config::{Config, Egress},
+    config::{AllowScheme, Config, Egress, allow_entry},
     telemetry,
 };
 use http_body_util::{BodyExt, Full, combinators::UnsyncBoxBody};
@@ -190,17 +190,34 @@ fn same_host(a: &str, b: &str) -> bool {
     a.trim_end_matches('.')
         .eq_ignore_ascii_case(b.trim_end_matches('.'))
 }
-fn allowed(host: &str, allow: &[String]) -> bool {
+fn host_matches(host: &str, pattern: &str) -> bool {
     let host = host.trim_end_matches('.').to_ascii_lowercase();
-    allow.iter().any(|pattern| {
-        let pattern = pattern.trim_end_matches('.').to_ascii_lowercase();
-        match pattern.strip_prefix("*.") {
-            Some(suffix) => host
-                .strip_suffix(suffix)
-                .is_some_and(|prefix| prefix.ends_with('.') && prefix.len() > 1),
-            None => host == pattern,
-        }
-    })
+    let pattern = pattern.trim_end_matches('.').to_ascii_lowercase();
+    match pattern.strip_prefix("*.") {
+        Some(suffix) => host
+            .strip_suffix(suffix)
+            .is_some_and(|prefix| prefix.ends_with('.') && prefix.len() > 1),
+        None => host == pattern,
+    }
+}
+fn allowed(host: &str, allow: &[String]) -> bool {
+    allow
+        .iter()
+        .filter_map(|entry| allow_entry(entry))
+        .any(|entry| host_matches(host, entry.host))
+}
+fn allowed_destination(host: &str, scheme: &str, port: u16, allow: &[String]) -> bool {
+    allow
+        .iter()
+        .filter_map(|entry| allow_entry(entry))
+        .any(|entry| {
+            let permitted = match entry.scheme {
+                None => matches!((scheme, port), ("http", 80) | ("https", 443)),
+                Some(AllowScheme::Http) => scheme == "http" && port == entry.port.unwrap_or(80),
+                Some(AllowScheme::Https) => scheme == "https" && port == entry.port.unwrap_or(443),
+            };
+            permitted && host_matches(host, entry.host)
+        })
 }
 fn port(authority: &hyper::http::uri::Authority, default: u16) -> Result<u16, Refusal> {
     let host_port = authority.as_str().rsplit('@').next().unwrap_or("");
@@ -221,7 +238,7 @@ fn port(authority: &hyper::http::uri::Authority, default: u16) -> Result<u16, Re
 fn destination(
     req: &Request<Incoming>,
     tunnel: Option<&Tunnel>,
-    allowed: impl Fn(&str) -> bool,
+    allowed: impl Fn(&str, &str, u16) -> bool,
 ) -> Result<Uri, Refusal> {
     let connect = req.method() == hyper::Method::CONNECT;
     if connect && tunnel.is_some() {
@@ -252,6 +269,9 @@ fn destination(
     if !matches!(scheme, "http" | "https") {
         return Err(Refusal::Protocol);
     }
+    if tunnel.is_some_and(|t| t.sni.is_some()) && scheme != "https" {
+        return Err(Refusal::Protocol);
+    }
     let default = if scheme == "https" { 443 } else { 80 };
     let destination_port = port(authority, default)?;
     if hosts.next().is_some()
@@ -267,7 +287,7 @@ fn destination(
     {
         return Err(Refusal::HostMismatch);
     }
-    if !allowed(authority.host()) {
+    if !allowed(authority.host(), scheme, destination_port) {
         return Err(Refusal::NotAllowed);
     }
     Uri::builder()
@@ -607,8 +627,10 @@ impl Engine {
         );
         exchange.headers(req.headers(), HeaderSide::Request, &self.omit.headers);
         let head = req.method() == hyper::Method::HEAD;
-        let decision = destination(&req, tunnel, |host| {
-            allowed(host, &self.egress.allow) || self.routes_models(host)
+        let decision = destination(&req, tunnel, |host, scheme, port| {
+            allowed_destination(host, scheme, port, &self.egress.allow)
+                || (self.routes_models(host)
+                    && matches!((scheme, port), ("http", 80) | ("https", 443)))
         });
         let (response, outcome, error) = match decision {
             Err(reason) => {

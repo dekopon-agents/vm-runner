@@ -219,9 +219,9 @@ async fn gateway_ports_classify_http_tls_and_refuse_non_protocol_streams() {
 }
 #[tokio::test]
 async fn gateway_origin_form_forwards_by_host_and_strips_trace_context() {
-    let gateway = Gateway::new(local_egress()).await;
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
+    let gateway = Gateway::new(local_egress_for_port(port)).await;
     let peer = tokio::spawn(upstream(listener, None));
     let stream = TcpStream::connect(gateway.proxy.addr).await.unwrap();
     assert_eq!(exchange(stream, &format!("GET / HTTP/1.1\r\nHost: localhost:{port}\r\ntraceparent: sentinel\r\ntracestate: sentinel\r\nConnection: close\r\n\r\n")).await,
@@ -938,7 +938,9 @@ async fn models_route_forwards_one_jail_session_and_subject_without_guest_traile
 }
 #[tokio::test]
 async fn models_name_is_refused_without_a_route_and_its_header_never_leaves_for_other_hosts() {
-    let gateway = Gateway::new(local_egress()).await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let gateway = Gateway::new(local_egress_for_port(port)).await;
     let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     socket
         .send_to(&query("models.vm.internal.", RecordType::A), gateway.udp)
@@ -961,8 +963,6 @@ async fn models_name_is_refused_without_a_route_and_its_header_never_leaves_for_
         .await,
         (403, "egress refused: models.vm.internal".into())
     );
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
     let peer = tokio::spawn(upstream(listener, None));
     let stream = TcpStream::connect(gateway.proxy.addr).await.unwrap();
     assert_eq!(
@@ -988,9 +988,9 @@ async fn models_name_is_refused_without_a_route_and_its_header_never_leaves_for_
 }
 #[tokio::test]
 async fn upstream_session_and_subject_response_headers_never_reach_the_guest() {
-    let gateway = Gateway::new(local_egress()).await;
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
+    let gateway = Gateway::new(local_egress_for_port(port)).await;
     let peer = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
         let requests = Arc::new(Mutex::new(Vec::new()));

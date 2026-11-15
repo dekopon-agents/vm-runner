@@ -21,10 +21,10 @@ profiles:
     maxSeconds: 1800
     egress:
       allow:
-        - www.google.com
-        - "*.google.com"
-        - "*.gstatic.com"
-        - "*.googleapis.com"
+        - https://www.google.com
+        - "https://*.google.com"
+        - "https://*.gstatic.com"
+        - "https://*.googleapis.com"
       dns: runner
       allowPrivate: []
       idleSeconds: 90

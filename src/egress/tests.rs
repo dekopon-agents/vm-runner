@@ -31,7 +31,7 @@ struct Proxy {
 }
 fn local_egress() -> Egress {
     serde_yaml_ng::from_str(
-        "allow: [localhost]\ndns: runner\nallowPrivate: [127.0.0.0/8, '::1/128']",
+        "allow: [http://localhost, https://localhost]\ndns: runner\nallowPrivate: [127.0.0.0/8, '::1/128']",
     )
     .unwrap()
 }
@@ -961,7 +961,8 @@ fn private_cidr_exception_is_narrow_and_applies_to_vetted_socket_addresses() {
 }
 #[test]
 fn egress_defaults_match_browser_limits_and_invalid_settings_fail_at_parse_boundary() {
-    let egress: Egress = serde_yaml_ng::from_str("allow: [localhost]\ndns: runner").unwrap();
+    let egress: Egress =
+        serde_yaml_ng::from_str("allow: [https://localhost]\ndns: runner").unwrap();
     assert!(egress.allow_private.is_empty());
     assert_eq!(egress.idle_seconds.get(), 90);
     assert_eq!(egress.max_connection_seconds.get(), 1800);
@@ -975,7 +976,7 @@ fn egress_defaults_match_browser_limits_and_invalid_settings_fail_at_parse_bound
     ] {
         assert!(
             serde_yaml_ng::from_str::<Egress>(&format!(
-                "allow: [localhost]\ndns: runner\n{invalid}"
+                "allow: [https://localhost]\ndns: runner\n{invalid}"
             ))
             .is_err(),
             "{invalid}"
@@ -1507,7 +1508,7 @@ async fn query_noise_only_inspects_first_sixty_four_pairs() {
 }
 #[test]
 fn suffix_allowlist_respects_label_boundaries_and_attributes_are_byte_bounded() {
-    let allow = vec!["*.example.com".into()];
+    let allow = vec!["https://*.example.com".into()];
     assert!(allowed("A.Example.Com.", &allow));
     assert!(!allowed("example.com", &allow));
     assert!(!allowed("badexample.com", &allow));
@@ -1538,11 +1539,31 @@ fn allow_entries_bind_each_origin_to_its_scheme_and_port() {
         &allow
     ));
     assert!(!allowed_destination("example.com", "https", 8443, &allow));
-    let shorthand = vec!["example.com".into()];
-    assert!(allowed_destination("example.com", "http", 80, &shorthand));
-    assert!(allowed_destination("example.com", "https", 443, &shorthand));
-    assert!(!allowed_destination("example.com", "http", 443, &shorthand));
-    assert!(!allowed_destination("example.com", "https", 80, &shorthand));
+    let default_port = vec!["https://example.com".into()];
+    assert!(allowed_destination(
+        "example.com",
+        "https",
+        443,
+        &default_port
+    ));
+    assert!(!allowed_destination(
+        "example.com",
+        "http",
+        80,
+        &default_port
+    ));
+    assert!(!allowed_destination(
+        "example.com",
+        "https",
+        80,
+        &default_port
+    ));
+    assert!(!allowed_destination(
+        "example.com",
+        "https",
+        443,
+        &["example.com".into()]
+    ));
 }
 
 #[test]
@@ -1558,65 +1579,18 @@ fn minted_leaf_names_its_host_and_chains_to_a_distinct_ca_subject() {
     assert!(eku.server_auth);
 }
 
-type Seen = (String, String, hyper::HeaderMap);
-
-async fn recording_upstream(listener: TcpListener, respond: fn() -> Response<Full<Bytes>>) -> Seen {
-    let (stream, _) = listener.accept().await.unwrap();
-    let seen = Arc::new(Mutex::new(None));
-    let slot = Arc::clone(&seen);
-    hyper::server::conn::http1::Builder::new()
-        .keep_alive(false)
-        .serve_connection(
-            TokioIo::new(stream),
-            service_fn(move |req: Request<Incoming>| {
-                *slot.lock().unwrap() = Some((
-                    req.method().to_string(),
-                    req.uri().to_string(),
-                    req.headers().clone(),
-                ));
-                async move { Ok::<_, Infallible>(respond()) }
-            }),
-        )
-        .await
-        .unwrap();
-    seen.lock().unwrap().take().unwrap()
-}
-fn plain() -> Response<Full<Bytes>> {
-    Response::new(Full::new(Bytes::from_static(b"upstream")))
-}
-async fn raw_exchange(
-    mut stream: impl AsyncRead + AsyncWrite + Unpin,
-    request: &str,
-) -> (u16, String, String) {
-    stream.write_all(request.as_bytes()).await.unwrap();
-    let mut response = String::new();
-    stream.read_to_string(&mut response).await.unwrap();
-    let (headers, body) = response.split_once("\r\n\r\n").unwrap_or((&response, ""));
-    (
-        headers
-            .split_whitespace()
-            .nth(1)
-            .and_then(|status| status.parse().ok())
-            .unwrap_or(0),
-        headers.to_owned(),
-        body.to_owned(),
-    )
-}
-
 #[tokio::test]
 async fn a_request_received_inside_tls_is_never_forwarded_in_cleartext() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    let mut egress = local_egress();
-    egress.allow = vec![format!("https://localhost:{port}")];
-    let proxy = Proxy::configured(RootCertStore::empty(), egress).await;
-    let peer = tokio::spawn(recording_upstream(listener, plain));
+    let proxy = Proxy::configured(RootCertStore::empty(), local_egress_for_port(port)).await;
+    let peer = tokio::spawn(upstream(listener, None));
     let tunnel = proxy.tunnel(port).await;
     let tls = TlsConnector::from(Arc::clone(&proxy.tls))
         .connect(ServerName::try_from("localhost").unwrap(), tunnel)
         .await
         .unwrap();
-    let (status, _, body) = raw_exchange(
+    let (status, body) = exchange(
         tls,
         &format!("GET http://localhost:{port}/session HTTP/1.1\r\nHost: localhost:{port}\r\nCookie: sessionKey=placeholder\r\nConnection: close\r\n\r\n"),
     )
@@ -1635,9 +1609,9 @@ async fn an_allowed_host_does_not_authorize_an_unlisted_port() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let proxy = Proxy::new(RootCertStore::empty()).await;
-    let peer = tokio::spawn(recording_upstream(listener, plain));
+    let peer = tokio::spawn(upstream(listener, None));
     let stream = TcpStream::connect(proxy.addr).await.unwrap();
-    let (status, _, body) = raw_exchange(
+    let (status, body) = exchange(
         stream,
         &format!("GET http://localhost:{port}/private HTTP/1.1\r\nHost: localhost:{port}\r\nCookie: sessionKey=placeholder\r\nConnection: close\r\n\r\n"),
     ).await;

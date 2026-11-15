@@ -308,6 +308,7 @@ fn config_reports_all_conflicts_together() {
         .replace("maxConnections: 128", "maxConnections: 256");
     let mut config: Config = serde_yaml_ng::from_str(&yaml).unwrap();
     let invalid = [
+        "localhost",
         "www.google.com:443",
         "ftp://x",
         "https://x:65536",
@@ -321,7 +322,7 @@ fn config_reports_all_conflicts_together() {
     let conflicts = config.conflicts();
     for host in invalid {
         assert!(
-            conflicts.contains(&config::Conflict::EgressAllow(host.into())),
+            conflicts.contains(&config::Conflict::EgressAllow("travel".into(), host.into())),
             "{conflicts:?}"
         );
     }

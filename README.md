@@ -143,9 +143,9 @@ must agree with CONNECT and TLS SNI, and every forwarded request loses W3C trace
 There is no credential injection, HTTP/2 or WebSocket tunneling.
 After DNS resolution, every returned address must be global unicast before the proxy connects
 using those exact addresses. Profile `egress.allowPrivate` CIDRs are the only exceptions (empty
-by default); the scheme, host and port allow-list still applies. To use a nonstandard port, add an
-explicit `https://host:port` or `http://host:port` entry to the profile's allow list. Mixed
-public/private DNS answers fail closed.
+by default); the origin allow-list still applies. Each entry must be `http://host[:port]` or
+`https://host[:port]`; a bare host refuses startup. Requests received inside TLS that specify
+HTTP are refused. Mixed public/private DNS answers fail closed.
 DNS lookup failures are `refused:dns`; empty answers and prohibited addresses are
 `refused:address`. Both return 403 with the usual refusal body.
 

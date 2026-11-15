@@ -212,9 +212,8 @@ fn allowed_destination(host: &str, scheme: &str, port: u16, allow: &[String]) ->
         .filter_map(|entry| allow_entry(entry))
         .any(|entry| {
             let permitted = match entry.scheme {
-                None => matches!((scheme, port), ("http", 80) | ("https", 443)),
-                Some(AllowScheme::Http) => scheme == "http" && port == entry.port.unwrap_or(80),
-                Some(AllowScheme::Https) => scheme == "https" && port == entry.port.unwrap_or(443),
+                AllowScheme::Http => scheme == "http" && port == entry.port,
+                AllowScheme::Https => scheme == "https" && port == entry.port,
             };
             permitted && host_matches(host, entry.host)
         })
@@ -628,9 +627,7 @@ impl Engine {
         exchange.headers(req.headers(), HeaderSide::Request, &self.omit.headers);
         let head = req.method() == hyper::Method::HEAD;
         let decision = destination(&req, tunnel, |host, scheme, port| {
-            allowed_destination(host, scheme, port, &self.egress.allow)
-                || (self.routes_models(host)
-                    && matches!((scheme, port), ("http", 80) | ("https", 443)))
+            allowed_destination(host, scheme, port, &self.egress.allow) || self.routes_models(host)
         });
         let (response, outcome, error) = match decision {
             Err(reason) => {

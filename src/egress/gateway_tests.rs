@@ -546,7 +546,7 @@ async fn tcp_garbage_zero_length_and_partial_frames_each_emit_one_protocol_refus
 async fn punycode_allow_entries_match_dns_and_http_and_remain_ascii_in_spans() {
     let name = "xn--80ak6aa92e.com";
     let mut egress = local_egress();
-    egress.allow = vec![name.into()];
+    egress.allow = vec![format!("https://{name}")];
     let gateway = Gateway::new(egress).await;
     let mut dns = TcpStream::connect(gateway.dns).await.unwrap();
     let reply = tcp_query(&mut dns, &query(&format!("{name}."), RecordType::A)).await;

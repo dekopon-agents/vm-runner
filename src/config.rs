@@ -98,24 +98,24 @@ pub(crate) enum AllowScheme {
 }
 pub(crate) struct AllowEntry<'a> {
     pub host: &'a str,
-    pub scheme: Option<AllowScheme>,
-    pub port: Option<u16>,
+    pub scheme: AllowScheme,
+    pub port: u16,
 }
 pub(crate) fn allow_entry(value: &str) -> Option<AllowEntry<'_>> {
     let (scheme, authority) = if let Some(authority) = value.strip_prefix("http://") {
-        (Some(AllowScheme::Http), authority)
-    } else if let Some(authority) = value.strip_prefix("https://") {
-        (Some(AllowScheme::Https), authority)
+        (AllowScheme::Http, authority)
     } else {
-        (None, value)
+        (AllowScheme::Https, value.strip_prefix("https://")?)
     };
-    let (host, port) = if scheme.is_some() {
-        match authority.rsplit_once(':') {
-            Some((host, port)) => (host, Some(port.parse::<u16>().ok().filter(|p| *p != 0)?)),
-            None => (authority, None),
-        }
-    } else {
-        (authority, None)
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) => (host, port.parse::<u16>().ok().filter(|p| *p != 0)?),
+        None => (
+            authority,
+            match scheme {
+                AllowScheme::Http => 80,
+                AllowScheme::Https => 443,
+            },
+        ),
     };
     let suffix = host.strip_prefix("*.").unwrap_or(host);
     if suffix.is_empty()
@@ -393,8 +393,8 @@ pub enum Conflict {
     Shape(String),
     #[error("empty allow list: {0}")]
     EmptyAllow(String),
-    #[error("malformed egress allow entry: {0}")]
-    EgressAllow(String),
+    #[error("malformed egress allow entry in profile {0}: {1}")]
+    EgressAllow(String, String),
     #[error("idleSeconds and maxSeconds must be at least 60, with idleSeconds <= maxSeconds: {0}")]
     Lifetime(String),
     #[error("egress.maxConnections exceeds 255 (Tokio blocking-pool budget): {0}")]
@@ -524,9 +524,9 @@ impl Config {
             if profile.egress.allow.is_empty() {
                 errors.push(Conflict::EmptyAllow(name.clone()));
             }
-            for host in &profile.egress.allow {
-                if allow_entry(host).is_none() {
-                    errors.push(Conflict::EgressAllow(host.clone()));
+            for entry in &profile.egress.allow {
+                if allow_entry(entry).is_none() {
+                    errors.push(Conflict::EgressAllow(name.clone(), entry.clone()));
                 }
             }
         }

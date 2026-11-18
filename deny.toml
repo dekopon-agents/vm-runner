@@ -9,6 +9,7 @@ ignore = [
   { id = "RUSTSEC-2025-0134", reason = "Poem 3.1.12's required rustls listener uses rustls-pemfile 2.2, an archived thin wrapper over rustls-pki-types PEM parsing; our startup/reload validation uses rustls-pki-types directly; remove when Poem migrates" },
   { id = "RUSTSEC-2026-0194", reason = "quick-xml 0.36 via poem-openapi is unreachable: no route accepts XML, enforced by the OpenAPI request-body test; revisit at quick-xml >= 0.41 or an XML route" },
   { id = "RUSTSEC-2026-0195", reason = "quick-xml 0.36 via poem-openapi is unreachable: no route accepts XML, enforced by the OpenAPI request-body test; revisit at quick-xml >= 0.41 or an XML route" },
+  { id = "RUSTSEC-2026-0543", reason = "unmaintained, not a vulnerability: chrono 0.4.45 reaches the graph only through oci-client 0.18.0; removable when oci-client drops it" },
 ]
 
 [licenses]

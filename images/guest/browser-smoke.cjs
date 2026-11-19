@@ -37,8 +37,26 @@ function exec(argv, expectedCode = 0) {
     const help = await exec(['browse', '--help']);
     assert.match(help, /\/artifacts\/NAME\.mp4/);
     assert.match(help, /\/artifacts\/NAME\.png/);
+    assert.match(help, /browse shot NAME[^\n]+adds \.png unless \.png\/\.jpg\/\.jpeg \(case-insensitive\)/);
     await exec(['browse', 'open', page('Browse smoke')]);
+    for (const [name, file, signature] of [
+      ['staging-login', 'staging-login.png', '89504e470d0a1a0a'],
+      ['release-1.2', 'release-1.2.png', '89504e470d0a1a0a'],
+      ['a.jpg', 'a.jpg', 'ffd8ff'],
+      ['b.jpeg', 'b.jpeg', 'ffd8ff'],
+      ['c.PNG', 'c.PNG', '89504e470d0a1a0a'],
+      ['d.JPG', 'd.JPG', 'ffd8ff'],
+      ['e.JPEG', 'e.JPEG', 'ffd8ff'],
+    ]) {
+      assert.equal(await exec(['browse', 'shot', name]), `saved /artifacts/${file}\n`);
+      assert.equal(fs.readFileSync(`/artifacts/${file}`).subarray(0, signature.length / 2).toString('hex'), signature);
+      fs.unlinkSync(`/artifacts/${file}`);
+    }
+    console.log('shot appends .png unless the name has an image extension and writes the matching image format');
     const artifacts = fs.readdirSync('/artifacts');
+    assert.equal(await exec(['browse', 'shot', 'a'.repeat(128)], 1), 'error: shot output file name must be at most 128 characters including the image extension\n');
+    assert.deepEqual(fs.readdirSync('/artifacts'), artifacts);
+    console.log('shot refuses names that exceed 128 characters after adding the image extension');
     const recordings = fs.readdirSync('/scratch/recordings');
     for (const [command, code] of [[['browse', 'record'], 1], [['record-cdp'], 2]]) {
       for (const name of ['', '../escape', '-bad', '_bad', 'bad name', 'bad.mp4', 'é', 'a'.repeat(125)]) {
@@ -83,10 +101,12 @@ function exec(argv, expectedCode = 0) {
     assert.match(await exec(['browse', 'record', 'smoke', '--seconds', '1'], 1), /record output already exists: \/artifacts\/smoke\.mp4/);
     fs.unlinkSync('/artifacts/smoke.mp4');
     fs.unlinkSync('/artifacts/smoke.png');
-    await exec(['browse', 'shot', 'clash.png']);
-    assert.match(await exec(['browse', 'record', 'clash', '--seconds', '1'], 1), /record output already exists: \/artifacts\/clash\.png/);
-    assert.equal(fs.existsSync('/artifacts/clash.mp4'), false);
-    fs.unlinkSync('/artifacts/clash.png');
+    for (const name of ['clash.png', 'clash']) {
+      await exec(['browse', 'shot', name]);
+      assert.match(await exec(['browse', 'record', 'clash', '--seconds', '1'], 1), /record output already exists: \/artifacts\/clash\.png/);
+      assert.equal(fs.existsSync('/artifacts/clash.mp4'), false);
+      fs.unlinkSync('/artifacts/clash.png');
+    }
     const missingParent = fs.mkdtempSync('/home/jail/record-error.');
     const missingArtifacts = `${missingParent}/artifacts`;
     const failedPublish = await exec(['env', `BROWSE_ARTIFACTS=${missingArtifacts}`, 'browse', 'record', 'rejected', '--seconds', '1'], 1);

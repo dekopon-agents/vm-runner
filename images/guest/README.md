@@ -35,6 +35,8 @@ call starts it in its own session, outside the exec's process group, with DevToo
 127.0.0.1:9222 and a profile under `~/.browse-profile`; every call reattaches over CDP, so
 tabs, cookies and page state carry across execs. Playwright scripts can attach with
 `chromium.connectOverCDP('http://127.0.0.1:9222')`.
+`browse shot NAME` appends `.png` unless NAME ends in `.png`, `.jpg` or `.jpeg`
+(case-insensitive); the final file name must fit 128 characters.
 
 The Guest image workflow builds both architectures on PRs without publishing. Its
 `KVM PR guest` job boots the amd64 artifact (not the released digest) against a

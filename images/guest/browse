@@ -23,7 +23,7 @@ browse press KEY           press a key in the focused element, e.g. Enter, Tab, 
 browse text [SELECTOR]     visible text of the page or of SELECTOR
 browse eval JS             evaluate an expression in the page and print the JSON result
 browse wait MS             wait MS milliseconds (at most 20000)
-browse shot NAME           screenshot to /artifacts/NAME
+browse shot NAME           screenshot to /artifacts/NAME; adds .png unless .png/.jpg/.jpeg (case-insensitive)
 browse record NAME [--seconds N]  video of the current tab; 1–30 seconds (default 10)
 browse tabs | tab N        list tabs, or switch to tab N
 browse reset               stop the browser and delete its profile (cookies, tabs); the next call starts clean
@@ -175,8 +175,10 @@ async function run(state, argv) {
     case 'shot': {
       const name = args[0] || 'page.png';
       if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(name)) throw new Error('shot NAME must be a flat file name');
-      await page.screenshot({ path: `${ARTIFACTS}/${name}` });
-      return `saved ${ARTIFACTS}/${name}`;
+      const file = /\.(png|jpe?g)$/i.test(name) ? name : `${name}.png`;
+      if (file.length > 128) throw new Error('shot output file name must be at most 128 characters including the image extension');
+      await page.screenshot({ path: `${ARTIFACTS}/${file}`, type: /\.jpe?g$/i.test(file) ? 'jpeg' : 'png' });
+      return `saved ${ARTIFACTS}/${file}`;
     }
     case 'record': {
       if (args.length !== 1 && !(args.length === 3 && args[1] === '--seconds')) {

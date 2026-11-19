@@ -3,6 +3,7 @@
 // One Chromium per jail, started on first use and outliving each exec: every call reattaches over CDP.
 const { spawn } = require('node:child_process');
 const fs = require('node:fs');
+const { configurePage } = require('/opt/playwright/browser.cjs');
 const { chromium } = require(process.env.BROWSE_PLAYWRIGHT || '/opt/playwright/node_modules/playwright');
 
 const PORT = Number(process.env.BROWSE_PORT || 9222);
@@ -137,6 +138,7 @@ async function run(state, argv) {
       const url = tab ? args[1] : args[0];
       if (!url) throw new Error('usage: open [--tab] URL');
       if (tab) await select(state, await state.context.newPage());
+      await configurePage(state.page);
       // A slow page is still a page: report where it stands instead of failing the command.
       await state.page.goto(url, { waitUntil: 'domcontentloaded', timeout: 8000 }).catch((error) => {
         if (error.name !== 'TimeoutError') throw error;

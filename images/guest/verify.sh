@@ -17,3 +17,4 @@ python=$(debugfs -R 'stat /usr/bin/python3' "$rootfs" 2>/dev/null | awk -F '"' '
 debugfs -R "stat /usr/bin/$python" "$rootfs" 2>/dev/null | grep -Eq 'Type: regular.*Mode:  +0755'
 debugfs -R 'stat /sbin' "$rootfs" 2>/dev/null | grep '"usr/sbin"'
 debugfs -R 'stat /usr/local/bin/chromium' "$rootfs" 2>/dev/null | grep -F "\"$browser\""
+debugfs -R 'stat /opt/playwright/browser.cjs' "$rootfs" 2>/dev/null | grep 'Type: regular'

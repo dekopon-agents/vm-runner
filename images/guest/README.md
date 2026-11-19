@@ -38,6 +38,18 @@ tabs, cookies and page state carry across execs. Playwright scripts can attach w
 `browse shot NAME` appends `.png` unless NAME ends in `.png`, `.jpg` or `.jpeg`
 (case-insensitive); the final file name must fit 128 characters.
 
+Before each `browse open` navigation, the CLI applies a desktop User-Agent without
+`HeadlessChrome` and client hints derived from the installed Chromium version.
+Node scripts share the same defaults with
+`const { configurePage } = require('/opt/playwright/browser.cjs')`: await
+`configurePage(page)` before navigating each new page. The returned CDP session
+is retained for that script's lifetime; do not detach it before navigation or
+extraction finishes. Overrides are scoped to the live attachment, not a persistent
+browser policy. A site recipe can apply an explicit identity after the default.
+This keeps Linux identity and software graphics; it adds no stealth package and
+does not change grants, egress or TLS verification. These defaults normalize page identity; site access still depends on the
+browser launch, session, network and site policy. They do not guarantee content access.
+
 The Guest image workflow builds both architectures on PRs without publishing. Its
 `KVM PR guest` job boots the amd64 artifact (not the released digest) against a
 local fake; if hosted `/dev/kvm` is absent the job fails rather than proving a

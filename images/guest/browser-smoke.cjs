@@ -2,6 +2,7 @@
 const assert = require('node:assert/strict');
 const { spawn } = require('node:child_process');
 const fs = require('node:fs');
+const http = require('node:http');
 
 // Separate exec groups, cleared env, and group cleanup after EVERY command, as in guest.rs.
 // AB must setsid its own daemon; merely surviving a shell exit is not sufficient.
@@ -33,7 +34,29 @@ function exec(argv, expectedCode = 0) {
 (async () => {
   assert.equal(process.getuid(), 1000);
   const page = title => `data:text/html,${encodeURIComponent(`<title>${title}</title><h1>${title}</h1><button>Local action</button>`)}`;
+  const requests = [];
+  const server = http.createServer((request, response) => {
+    requests.push({ url: request.url, headers: request.headers });
+    response.setHeader('content-type', 'text/html');
+    response.end('<title>Identity smoke</title><script>window.browserIdentity={ua:navigator.userAgent,brands:navigator.userAgentData.brands,platform:navigator.userAgentData.platform}</script>');
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   try {
+    const address = `http://127.0.0.1:${server.address().port}/identity`;
+    await exec(['browse', 'open', address]);
+    await exec(['browse', 'open', '--tab', address + '?tab=2']);
+    const identity = JSON.parse(await exec(['browse', 'eval', 'window.browserIdentity']));
+    assert.doesNotMatch(identity.ua, /HeadlessChrome/);
+    assert.equal(identity.platform, 'Linux');
+    assert.equal(identity.brands[0].brand, 'Chromium');
+    const navigations = requests.filter(request => request.url.startsWith('/identity'));
+    assert.equal(navigations.length, 2);
+    for (const request of navigations) {
+      assert.equal(request.headers['user-agent'], identity.ua);
+      assert.equal(request.headers['sec-ch-ua-platform'], '"Linux"');
+      assert.match(request.headers['sec-ch-ua'], /Chromium/);
+    }
+    console.log('desktop identity reaches the upstream and page JavaScript across execs and new tabs');
     const help = await exec(['browse', '--help']);
     assert.match(help, /\/artifacts\/NAME\.mp4/);
     assert.match(help, /\/artifacts\/NAME\.png/);
@@ -129,6 +152,7 @@ function exec(argv, expectedCode = 0) {
     assert.equal(fs.existsSync('/home/jail/.agent-browser/guest.sock'), false);
     console.log('jail browser smoke passed: open/snapshot/close across cleaned exec groups');
   } finally {
+    await new Promise(resolve => server.close(resolve));
     await exec(['agent-browser', 'close']);
     await exec(['browse', 'reset']);
   }

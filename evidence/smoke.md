@@ -18,3 +18,12 @@ observed one exec and no retries. The test passed in 0.22 s.
 
 The smoke uses a local Unix relay and the guest test working directory. The CI
 KVM gate exercises the Firecracker and vsock path.
+
+## Exec follow-up
+
+The command above passed on 2026-11-21T10:14:48Z at source commit
+`2df6cbc83f2ec746c5a068d444dd62a4eeaef1b1` with vm-runner 0.6.0, Rust 1.98.1,
+and x86_64 Linux. The jail API dispatched one exec to the production guest handler
+through a Unix relay. After the test observed the child running, jail shutdown closed
+the exchange, reaped the child, and retired the job. The relay observed one exec and
+the job endpoint returned HTTP 404.

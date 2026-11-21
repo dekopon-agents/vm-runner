@@ -294,6 +294,15 @@ async fn launch(
     .await
 }
 
+fn log_jail_ready(guest: &client::Guest, pid: Option<u32>) {
+    let depth = telemetry::detail!(crate::config::Category::VmLifecycle);
+    tracing::info!(name: "vm_runner.boot.ready", target: crate::config::Category::VmLifecycle.target(), {
+        telemetry.detail = depth,
+        process.pid = pid.map(i64::from),
+        vm_runner.guest.exec_deadline_ms = i64::from(guest.exec_deadline_ms()),
+    }, "jail ready");
+}
+
 pub async fn run(config: Config, profile: &str, session: &str) -> Result<()> {
     if !cfg!(target_os = "linux") {
         return Err(Error::LinuxOnly.into());
@@ -430,11 +439,7 @@ pub async fn run(config: Config, profile: &str, session: &str) -> Result<()> {
                 return Ok(());
             }
             state.mark_ready();
-            let depth = telemetry::detail!(crate::config::Category::VmLifecycle);
-            tracing::info!(name: "vm_runner.boot.ready", target: crate::config::Category::VmLifecycle.target(), {
-                telemetry.detail = depth,
-                process.pid = pid.map(i64::from),
-            }, "jail ready");
+            log_jail_ready(&guest, pid);
             loop {
                 tokio::select! {
                     _ = ticker.tick() => {

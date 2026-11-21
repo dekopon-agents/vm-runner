@@ -364,7 +364,9 @@ impl Api {
             }
         })
         .await;
-        state.require_running()?;
+        if state.require_running().is_err() {
+            return Ok(ExecResponse::Unknown(unknown(id)));
+        }
         Ok(match result {
             Ok(Progress::Done(result)) => ExecResponse::Done(Json((*result).clone())),
             _ => ExecResponse::Unknown(unknown(id)),

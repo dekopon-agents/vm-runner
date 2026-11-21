@@ -290,7 +290,8 @@ async fn a_controller_and_jail_prefer_wait_read_returns_the_fake_guests_terminal
         &listener,
         json!({"outcome":"executed","exitCode":0}),
     )
-    .await;
+    .await
+    .unwrap();
     let (endpoint, requests, state) =
         endpoint(auth.config.auth.clone(), controller_subject.into(), guest)
             .await

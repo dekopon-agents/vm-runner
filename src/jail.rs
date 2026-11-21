@@ -448,6 +448,7 @@ pub async fn run(config: Config, profile: &str, session: &str) -> Result<()> {
             }
         }
         .await;
+        let stopped_jobs = state.stop();
         let stopped_vm = match vm.as_mut() {
             Some(child) => stop_vm(child).await,
             None => Ok(()),
@@ -465,7 +466,7 @@ pub async fn run(config: Config, profile: &str, session: &str) -> Result<()> {
         if let Some(firewall) = firewall.as_mut() {
             firewall.sample(firewall::Interval::End).await;
         }
-        result.and(stopped_vm).and(drained)
+        result.and(stopped_jobs).and(stopped_vm).and(drained)
     };
     let result = tokio::task::spawn_blocking(move || {
         tracing::dispatcher::with_default(&dispatch, || runtime.block_on(lifecycle))

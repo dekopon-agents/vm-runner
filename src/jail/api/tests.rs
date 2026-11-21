@@ -324,7 +324,7 @@ async fn jail_auth_deadline_job_and_later_result_use_one_guest_execution() {
         let request: serde_json::Value =
             serde_json::from_slice(&guest::read_frame(&mut stream).await.unwrap()).unwrap();
         assert_eq!(request["argv"], json!(["echo", "ok"]));
-        assert_eq!(request["deadlineMs"], 600_000);
+        assert_eq!(request["deadlineMs"], 1_200_000);
         started.send(()).unwrap();
         released.await.unwrap();
         guest::write_frame(&mut stream, &json!({"outcome":"executed","exitCode":0,"stdout":"ok","stderr":"","truncated":false,"durationMs":1})).await.unwrap();
@@ -375,6 +375,7 @@ async fn jail_auth_deadline_job_and_later_result_use_one_guest_execution() {
     response.assert_status(StatusCode::ACCEPTED);
     let pending: serde_json::Value = response.0.into_body().into_json().await.unwrap();
     assert_eq!(pending["outcome"], "unknown");
+    tokio::time::advance(Duration::from_secs(1199)).await;
     let path = format!("/jobs/{}", pending["jobId"].as_str().unwrap());
     client
         .get(&path)
@@ -399,6 +400,97 @@ async fn jail_auth_deadline_job_and_later_result_use_one_guest_execution() {
 }
 
 #[tokio::test]
+async fn session_shutdown_drops_the_job_and_reaps_its_guest_process_without_resending() {
+    use futures_util::FutureExt as _;
+    use nix::{errno::Errno, sys::signal::kill, unistd::Pid};
+
+    let mut auth = crate::tests::Fixture::new().await;
+    let mut claims = auth.claims();
+    claims["aud"] = json!(["vm-runner-jail"]);
+    claims["sub"] = json!(CONTROLLER);
+    let token = auth.token(&claims, "ec");
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("guest.sock");
+    let marker = dir.path().join("pid");
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let (endpoint, requests, state) = endpoint(
+        auth.config.auth.clone(),
+        CONTROLLER.into(),
+        Arc::new(Guest::new(socket)),
+    )
+    .await
+    .unwrap();
+    let client = poem::test::TestClient::new(endpoint)
+        .default_header("Authorization", format!("Bearer {token}"));
+    let argv = json!([
+        "/bin/sh",
+        "-c",
+        r#"printf '%s' "$$" > "$1"; exec sleep 20"#,
+        "job",
+        marker
+    ]);
+    let peer = async {
+        let (mut relay, frame) = request(listener.accept().await.unwrap().0).await;
+        assert_eq!(
+            frame,
+            json!({"op":"exec","argv":argv,"deadlineMs":1_200_000,"stdin":null,"env":null,"cwd":null})
+        );
+        let (mut forward, stream) = tokio::io::duplex(4096);
+        guest::write_frame(&mut forward, &frame).await.unwrap();
+        let (handled, transferred) = tokio::join!(
+            guest::tests::serve_one(stream),
+            tokio::io::copy_bidirectional(&mut relay, &mut forward)
+        );
+        handled.unwrap();
+        assert_eq!(transferred.unwrap(), (0, 0));
+    };
+    let shutdown = async {
+        let response = client
+            .post("/exec")
+            .body_json(&json!({"argv":argv,"deadlineMs":0}))
+            .send()
+            .await;
+        response.assert_status(StatusCode::ACCEPTED);
+        let pending: serde_json::Value = response.0.into_body().into_json().await.unwrap();
+        let path = format!("/jobs/{}", pending["jobId"].as_str().unwrap());
+        let pid = loop {
+            if let Ok(text) = tokio::fs::read_to_string(&marker).await
+                && let Ok(pid) = text.parse()
+            {
+                break Pid::from_raw(pid);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert_eq!(kill(pid, None), Ok(()));
+        client
+            .get(&path)
+            .send()
+            .await
+            .assert_json(json!({"state":"running"}))
+            .await;
+
+        state.stop().unwrap();
+        state.drain().await.unwrap();
+        assert!(state.jobs.lock().unwrap().entries.is_empty());
+        client
+            .get(path)
+            .send()
+            .await
+            .assert_status(StatusCode::NOT_FOUND);
+        pid
+    };
+    let ((), pid) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(peer, shutdown)
+    })
+    .await
+    .expect("retirement should close the exchange and reap the child promptly");
+    assert_eq!(kill(pid, None), Err(Errno::ESRCH));
+    assert!(listener.accept().now_or_never().is_none());
+    requests.drain().await.unwrap();
+    auth.tasks.shutdown().await;
+}
+
+#[tokio::test]
 async fn job_capacity_refuses_active_work_and_evicts_only_non_running_records() {
     let dir = tempfile::tempdir().unwrap();
     let mut jobs = Jobs::default();
@@ -417,6 +509,7 @@ async fn job_capacity_refuses_active_work_and_evicts_only_non_running_records() 
         guest: Arc::new(Guest::new(dir.path().join("absent.sock"))),
         ready: Arc::new(AtomicBool::new(false)),
         jobs: Mutex::new(jobs),
+        stopping: watch::channel(false).0,
         transfers: Arc::new(tokio::sync::Semaphore::new(4)),
         progress_read_hook: Mutex::new(None),
     };

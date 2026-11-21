@@ -77,12 +77,7 @@ impl Controller {
             .ok_or(Error::NotFound)
     }
     pub(super) fn address(&self, pod: &Pod) -> Result<Option<url::Url>, Error> {
-        if pod.metadata.deletion_timestamp.is_some()
-            || matches!(
-                pod.status.as_ref().and_then(|s| s.phase.as_deref()),
-                Some("Failed" | "Succeeded")
-            )
-        {
+        if terminal_pod(pod) {
             return Err(Error::Boot("pod terminated"));
         }
         let Some(status) = &pod.status else {
@@ -248,7 +243,9 @@ impl Controller {
                     let stored = sessions.get_mut(key).ok_or(Error::NotFound)?;
                     stored.retiring.get_or_insert(EndReason::BootFailure);
                     stored.boot_cause = Some(cause);
-                    stored.pod.is_some()
+                    let registered = stored.pod.is_some();
+                    self.drop_retired_jobs(&sessions);
+                    registered
                 };
                 if registered
                     && let Ok(Some(pod)) = self.pods.get_opt(&name).await
@@ -269,10 +266,6 @@ impl Controller {
                     if let Some(ended) = ended {
                         ended.emit();
                     }
-                    self.jobs
-                        .lock()
-                        .expect("job registry poisoned")
-                        .retain(|_, job| job.session != session.body.session_id);
                 }
                 Err(Error::Boot(cause))
             }

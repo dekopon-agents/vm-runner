@@ -318,7 +318,7 @@ async fn a_controller_and_jail_prefer_wait_read_returns_the_fake_guests_terminal
     let peer = tokio::spawn(async move {
         let (mut stream, frame) = request(listener.accept().await.unwrap().0).await;
         assert_eq!(frame["argv"], json!(["echo", "ok"]));
-        assert_eq!(frame["deadlineMs"], 600000);
+        assert_eq!(frame["deadlineMs"], 1_200_000);
         tokio::time::sleep(Duration::from_secs(2)).await;
         guest::write_frame(&mut stream, &json!({"outcome":"executed","exitCode":7,"stdout":"smoke result","stderr":"","truncated":false})).await.unwrap();
     });

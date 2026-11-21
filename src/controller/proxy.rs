@@ -377,6 +377,7 @@ impl Controller {
             })))
         } else {
             let mut result = json(checked(response, 200)?).await?;
+            self.session(subject, id)?;
             cap(&mut result);
             record_exec_result(&result);
             Ok(ExecResponse::Complete(Json(result)))
@@ -395,11 +396,24 @@ impl Controller {
             .get(id)
             .cloned()
             .ok_or(Error::NotFound)?;
-        let (_, session) = self.session(subject, &job.session)?;
+        let (key, session) = self.session(subject, &job.session)?;
         let pod = self
             .pods
-            .get(session.pod.as_ref().ok_or(Error::NotFound)?)
+            .get_opt(session.pod.as_ref().ok_or(Error::NotFound)?)
             .await?;
+        let pod = match pod {
+            Some(pod) if !terminal_pod(&pod) => pod,
+            terminal => {
+                let mut sessions = self.sessions.lock().expect("session registry poisoned");
+                if let Some(stored) = sessions.get_mut(&key).filter(|s| !s.is_retiring()) {
+                    stored.retiring = Some(EndReason::Terminal);
+                    stored.pod_end = terminal.as_ref().map(PodEnd::from_pod).unwrap_or_default();
+                    stored.pod_read = true;
+                }
+                self.drop_retired_jobs(&sessions);
+                return Err(Error::NotFound);
+            }
+        };
         let mut url = self.address(&pod)?.ok_or(Error::Boot("jail not ready"))?;
         url.path_segments_mut()
             .map_err(|()| Error::Protocol)?
@@ -437,6 +451,7 @@ impl Controller {
         }
         if response.status().as_u16() == 202 {
             let _: Pending = json(response).await?;
+            self.session(subject, &job.session)?;
             tracing::Span::current().record("vm_runner.job.state", "unknown");
             self.jobs.lock().expect("job registry poisoned").remove(id);
             return Ok(JobResponse::Ok(
@@ -445,6 +460,7 @@ impl Controller {
             ));
         }
         let mut status = json(checked(response, 200)?).await?;
+        self.session(subject, &job.session)?;
         match &mut status {
             JobStatus::Complete(result) => {
                 cap(result);

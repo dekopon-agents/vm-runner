@@ -26,6 +26,7 @@ use tokio::{
 };
 
 pub(crate) const FRAME_CAP: usize = 1024 * 1024;
+pub(crate) const EXEC_DEADLINE_MS: u32 = 1_200_000;
 const OUTPUT_CAP: usize = 64 * 1024;
 // Base64 plus the JSON envelope must fit in one response frame.
 const READ_CAP: u32 = ((FRAME_CAP - 64) / 4 * 3) as u32;
@@ -151,11 +152,17 @@ impl Guest {
     async fn serve(&self, mut stream: impl AsyncRead + AsyncWrite + Unpin) -> Result<(), Error> {
         let bytes = read_frame(&mut stream).await?;
         let result = match serde_json::from_slice(&bytes) {
-            Ok(request) => self.dispatch(request).await,
+            Ok(request) => {
+                self.dispatch(request, async {
+                    let _closed = stream.read_u8().await;
+                })
+                .await
+            }
             Err(error) => Err(error.into()),
         };
         let response = match result {
-            Ok(response) => response,
+            Ok(Some(response)) => response,
+            Ok(None) => return Ok(()),
             Err(error) => Response::Refused {
                 outcome: "not_executed",
                 reason: error.reason(),
@@ -166,7 +173,11 @@ impl Guest {
         Ok(())
     }
 
-    async fn dispatch(&self, request: Request) -> Result<Response, Error> {
+    async fn dispatch(
+        &self,
+        request: Request,
+        disconnected: impl Future<Output = ()>,
+    ) -> Result<Option<Response>, Error> {
         match request {
             Request::Exec {
                 argv,
@@ -175,10 +186,15 @@ impl Guest {
                 env,
                 cwd,
             } => {
-                if argv.first().is_none_or(String::is_empty) || deadline_ms > 600_000 {
+                if argv.first().is_none_or(String::is_empty) || deadline_ms > EXEC_DEADLINE_MS {
                     return Err(Error::InvalidExec);
                 }
-                let _exec = self.exec.lock().await;
+                tokio::pin!(disconnected);
+                let _exec = tokio::select! {
+                    biased;
+                    () = &mut disconnected => return Ok(None),
+                    lock = self.exec.lock() => lock,
+                };
                 let mut command = Command::new(&argv[0]);
                 command
                     .args(&argv[1..])
@@ -199,16 +215,22 @@ impl Guest {
                 if let Some((uid, gid)) = self.identity {
                     command.uid(uid).gid(gid);
                 }
-                Ok(Response::Exec(
-                    execute(command, stdin, deadline_ms, Path::new("/sys/fs/cgroup")).await?,
-                ))
+                execute(
+                    command,
+                    stdin,
+                    deadline_ms,
+                    Path::new("/sys/fs/cgroup"),
+                    disconnected,
+                )
+                .await
+                .map(|result| result.map(Response::Exec))
             }
-            Request::List => self.artifacts(list).await,
-            Request::Read { path, offset, len } => {
-                self.artifacts(move |root| read(root, &path, offset, len))
-                    .await
-            }
-            Request::Ping => Ok(Response::Pong { ok: true }),
+            Request::List => self.artifacts(list).await.map(Some),
+            Request::Read { path, offset, len } => self
+                .artifacts(move |root| read(root, &path, offset, len))
+                .await
+                .map(Some),
+            Request::Ping => Ok(Some(Response::Pong { ok: true })),
         }
     }
 
@@ -463,7 +485,8 @@ async fn execute(
     input: Option<String>,
     deadline_ms: u32,
     cgroup_root: &Path,
-) -> Result<Executed, Error> {
+    disconnected: impl Future<Output = ()>,
+) -> Result<Option<Executed>, Error> {
     let start = Instant::now();
     let cgroup = ExecCgroup::create(cgroup_root).map(|(group, procs)| {
         #[expect(unsafe_code, reason = "pre_exec joins the exec cgroup before execve; the closure only calls write(2) on an fd opened before fork")]
@@ -508,26 +531,29 @@ async fn execute(
             Ok(())
         })
     };
-    let result = timeout(Duration::from_millis(u64::from(deadline_ms)), work).await;
+    let result = tokio::select! {
+        biased;
+        () = disconnected => None,
+        result = timeout(Duration::from_millis(u64::from(deadline_ms)), work) => Some(result),
+    };
     let ended = match result {
-        Ok(Ok((status, (), (), ()))) => {
+        Some(Ok(Ok((status, (), (), ())))) => {
             use std::os::unix::process::ExitStatusExt;
-            Ok((
+            Ok(Some((
                 status
                     .code()
                     .unwrap_or_else(|| -status.signal().unwrap_or(1)),
                 false,
-            ))
+            )))
         }
         failure => {
             async {
                 group.kill()?;
-                child.start_kill()?;
-                child.wait().await?;
-                if let Ok(Err(error)) = failure {
+                child.kill().await?;
+                if let Some(Ok(Err(error))) = failure {
                     return Err(error);
                 }
-                Ok::<_, io::Error>((-9, true))
+                Ok::<_, io::Error>(failure.map(|_| (-9, true)))
             }
             .await
         }
@@ -538,11 +564,14 @@ async fn execute(
         Some(cgroup) => cgroup.finish().await,
         None => None,
     };
-    let (exit_code, timed_out) = ended?;
+    let ended = ended?;
     killed?;
+    let Some((exit_code, timed_out)) = ended else {
+        return Ok(None);
+    };
     let (stdout, out_truncated) = out.text();
     let (stderr, err_truncated) = err.text();
-    Ok(Executed {
+    Ok(Some(Executed {
         outcome: "executed",
         exit_code,
         stdout,
@@ -552,8 +581,8 @@ async fn execute(
         timed_out,
         cpu_us: measurements.map(|(cpu, _)| cpu),
         memory_peak_bytes: measurements.map(|(_, peak)| peak),
-    })
+    }))
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

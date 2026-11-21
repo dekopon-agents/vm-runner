@@ -136,6 +136,14 @@ struct PodEnd {
     terminated_reason: Option<String>,
     exit_code: Option<i32>,
 }
+fn terminal_pod(pod: &Pod) -> bool {
+    pod.metadata.deletion_timestamp.is_some()
+        || matches!(
+            pod.status.as_ref().and_then(|s| s.phase.as_deref()),
+            Some("Failed" | "Succeeded")
+        )
+}
+
 impl PodEnd {
     fn from_pod(pod: &Pod) -> Self {
         let terminated = pod
@@ -317,9 +325,7 @@ impl Controller {
                     boot_cause: None,
                     pod_end: PodEnd::default(),
                     pod_read: false,
-                    retiring: (pod.metadata.deletion_timestamp.is_some()
-                        || matches!(pod.status.as_ref().and_then(|s| s.phase.as_deref()),
-                            Some("Failed" | "Succeeded"))).then_some(EndReason::Terminal),
+                    retiring: terminal_pod(&pod).then_some(EndReason::Terminal),
                 })
             });
             // Foreign/inconsistent pods are not ours to adopt or delete.
@@ -473,13 +479,22 @@ impl Controller {
             vm_runner.session.live.count = i64::try_from(count).unwrap_or(i64::MAX),
         }, "telemetry healthy");
     }
-    pub(crate) async fn reap(&self, now: u64) {
+    fn drop_retired_jobs(&self, sessions: &HashMap<String, Session>) {
+        let live: HashSet<_> = sessions
+            .values()
+            .filter(|session| !session.is_retiring())
+            .map(|session| session.body.session_id.as_str())
+            .collect();
+        self.jobs
+            .lock()
+            .expect("job registry poisoned")
+            .retain(|_, job| live.contains(job.session.as_str()));
+    }
+    fn retiring_sessions(&self, now: u64) -> Vec<Expired> {
         // Mark under the same mutex used by create. Network I/O never owns admission
         // or the registry lock; retiring entries reserve quota, but cannot be returned.
-        let expired: Vec<_> = self
-            .sessions
-            .lock()
-            .expect("session registry poisoned")
+        let mut sessions = self.sessions.lock().expect("session registry poisoned");
+        let expired = sessions
             .iter_mut()
             .filter_map(|(key, s)| {
                 let was_retiring = s.is_retiring();
@@ -516,12 +531,16 @@ impl Controller {
                 })
             })
             .collect();
+        self.drop_retired_jobs(&sessions);
+        expired
+    }
+    pub(crate) async fn reap(&self, now: u64) {
         for Expired {
             key,
             session_id,
             pod,
             attempt,
-        } in expired
+        } in self.retiring_sessions(now)
         {
             let result = async {
                 let Some(pod) = pod else { return Ok(true) };
@@ -559,22 +578,13 @@ impl Controller {
             .await;
             match result {
                 Ok(true) => {
-                    let (ended, live) = {
-                        let mut sessions = self.sessions.lock().expect("session registry poisoned");
-                        let ended = remove_retired(&mut sessions, &key, now);
-                        let live = sessions
-                            .values()
-                            .any(|s| !s.is_retiring() && s.body.session_id == session_id);
-                        (ended, live)
-                    };
+                    let ended = remove_retired(
+                        &mut self.sessions.lock().expect("session registry poisoned"),
+                        &key,
+                        now,
+                    );
                     if let Some(ended) = ended {
                         ended.emit();
-                    }
-                    if !live {
-                        self.jobs
-                            .lock()
-                            .expect("job registry poisoned")
-                            .retain(|_, job| job.session != session_id);
                     }
                 }
                 Ok(false) => {}

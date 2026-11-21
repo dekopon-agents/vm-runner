@@ -96,7 +96,8 @@ impl Fixture {
                 let response = match method.as_str() {
                     "GET" if kube_code.load(Ordering::SeqCst) != 200 => {
                         status = u16::try_from(kube_code.load(Ordering::SeqCst)).unwrap();
-                        json!({"kind":"Status","apiVersion":"v1","code":status,"status":"Failure","reason":"ServiceUnavailable","message":"transient"})
+                        let reason = if status == 404 { "NotFound" } else { "ServiceUnavailable" };
+                        json!({"kind":"Status","apiVersion":"v1","code":status,"status":"Failure","reason":reason,"message":reason})
                     }
                     "POST" if uri.path().ends_with("/pods") => {
                         started.notify_one();
@@ -550,10 +551,30 @@ async fn per_session_job_cap_still_admits_another_session() {
     assert_eq!(f.calls.load(Ordering::SeqCst), 1);
     f.controller.reap(u64::MAX).await;
     assert!(!f.controller.sessions.lock().unwrap().is_empty());
-    f.controller.reap(u64::MAX).await;
     assert!(f.controller.jobs.lock().unwrap().is_empty());
+    f.controller.reap(u64::MAX).await;
     f.tasks.shutdown().await;
 }
+#[tokio::test]
+async fn job_poll_retires_the_session_and_drops_handles_when_the_pod_is_gone() {
+    let mut f = Fixture::new().await;
+    let session = f.session();
+    let ExecResponse::Pending(Json(pending)) =
+        f.controller.exec(SUBJECT, &session, &exec()).await.unwrap()
+    else {
+        panic!("pending job");
+    };
+    f.kube_status.store(404, Ordering::SeqCst);
+    assert!(matches!(
+        f.controller.job(SUBJECT, &pending.job_id, None).await,
+        Err(Error::NotFound)
+    ));
+    assert!(f.controller.sessions.lock().unwrap()[&session].is_retiring());
+    assert!(f.controller.jobs.lock().unwrap().is_empty());
+    assert_eq!(f.calls.load(Ordering::SeqCst), 1);
+    f.tasks.shutdown().await;
+}
+
 #[tokio::test]
 async fn invalid_token_never_dispatches_exec_but_keeps_the_reservation() {
     let mut f = Fixture::new().await;

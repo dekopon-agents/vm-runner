@@ -18,6 +18,11 @@ fn guest() -> (TempDir, Guest) {
     (dir, guest)
 }
 
+pub(crate) async fn serve_one(stream: impl AsyncRead + AsyncWrite + Unpin) -> Result<(), Error> {
+    let (_dir, guest) = guest();
+    guest.serve(stream).await
+}
+
 async fn send(stream: &mut DuplexStream, request: Value) {
     let bytes = serde_json::to_vec(&request).unwrap();
     stream.write_u32(bytes.len() as u32).await.unwrap();
@@ -47,7 +52,7 @@ async fn call(guest: &Guest, request: Value) -> Value {
 }
 
 fn exec(script: &str) -> Value {
-    json!({"op":"exec", "argv":["/bin/sh", "-c", script], "deadlineMs":600000})
+    json!({"op":"exec", "argv":["/bin/sh", "-c", script], "deadlineMs":1_200_000})
 }
 
 #[tokio::test]
@@ -108,7 +113,10 @@ async fn exec_joins_its_cgroup_in_the_child_before_running() {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let result = execute(command, None, 5000, root.path()).await.unwrap();
+    let result = execute(command, None, 5000, root.path(), std::future::pending())
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(result.exit_code, 0);
     let groups: Vec<_> = std::fs::read_dir(root.path())
         .unwrap()
@@ -149,15 +157,10 @@ async fn cgroup_release_timeout_keeps_measurements_and_stops_at_deadline() {
 async fn exec_reports_nonzero_exit_and_spawn_refusals() {
     let (_dir, guest) = guest();
     assert_eq!(call(&guest, exec("exit 7")).await["exitCode"], 7);
-    for request in [
-        json!({"op":"exec", "argv":[], "deadlineMs":1}),
-        json!({"op":"exec", "argv":["/bin/true"], "deadlineMs":600001}),
-    ] {
-        assert_eq!(
-            call(&guest, request).await,
-            json!({"outcome":"not_executed", "reason":"invalid_exec"})
-        );
-    }
+    assert_eq!(
+        call(&guest, json!({"op":"exec", "argv":[], "deadlineMs":1})).await,
+        json!({"outcome":"not_executed", "reason":"invalid_exec"})
+    );
     assert_eq!(
         call(
             &guest,
@@ -169,6 +172,20 @@ async fn exec_reports_nonzero_exit_and_spawn_refusals() {
 }
 
 #[tokio::test]
+async fn exec_accepts_the_maximum_deadline_and_refuses_one_millisecond_more() {
+    let (_dir, guest) = guest();
+    assert_eq!(call(&guest, exec("exit 0")).await["exitCode"], 0);
+    assert_eq!(
+        call(
+            &guest,
+            json!({"op":"exec", "argv":["/bin/true"], "deadlineMs":1_200_001}),
+        )
+        .await,
+        json!({"outcome":"not_executed", "reason":"invalid_exec"})
+    );
+}
+
+#[tokio::test]
 async fn deadline_kills_the_child_and_its_grandchild() {
     let (_dir, guest) = guest();
     let ready = guest.home.join("ready");
@@ -176,7 +193,7 @@ async fn deadline_kills_the_child_and_its_grandchild() {
     let task = tokio::spawn(async move { guest.serve(server).await });
     send(
         &mut client,
-        exec("sleep 600 & printf '%s %s' \"$$\" \"$!\" > ready; wait"),
+        exec("sleep 1200 & printf '%s %s' \"$$\" \"$!\" > ready; wait"),
     )
     .await;
     let pids = timeout(Duration::from_secs(10), async {
@@ -196,7 +213,7 @@ async fn deadline_kills_the_child_and_its_grandchild() {
     .await
     .unwrap();
     tokio::time::pause();
-    tokio::time::advance(Duration::from_secs(600)).await;
+    tokio::time::advance(Duration::from_secs(1200)).await;
     let response = receive(&mut client).await;
     task.await.unwrap().unwrap();
     tokio::time::resume();

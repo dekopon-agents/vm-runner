@@ -284,13 +284,17 @@ async fn a_controller_and_jail_prefer_wait_read_returns_the_fake_guests_terminal
     let token = auth.token(&claims, "ec");
     let dir = tempfile::tempdir().unwrap();
     let listener = tokio::net::UnixListener::bind(dir.path().join("guest.sock")).unwrap();
-    let (endpoint, requests, state) = endpoint(
-        auth.config.auth.clone(),
-        controller_subject.into(),
-        Arc::new(Guest::new(dir.path().join("guest.sock"))),
+    let guest = Arc::new(Guest::new(dir.path().join("guest.sock")));
+    ready_guest(
+        &guest,
+        &listener,
+        json!({"outcome":"executed","exitCode":0}),
     )
-    .await
-    .unwrap();
+    .await;
+    let (endpoint, requests, state) =
+        endpoint(auth.config.auth.clone(), controller_subject.into(), guest)
+            .await
+            .unwrap();
     state.mark_ready();
     let mut f = crate::controller::proxy::tests::Fixture::with_jail(
         endpoint.boxed(),
@@ -318,7 +322,7 @@ async fn a_controller_and_jail_prefer_wait_read_returns_the_fake_guests_terminal
     let peer = tokio::spawn(async move {
         let (mut stream, frame) = request(listener.accept().await.unwrap().0).await;
         assert_eq!(frame["argv"], json!(["echo", "ok"]));
-        assert_eq!(frame["deadlineMs"], 600000);
+        assert_eq!(frame["deadlineMs"], 1_200_000);
         tokio::time::sleep(Duration::from_secs(2)).await;
         guest::write_frame(&mut stream, &json!({"outcome":"executed","exitCode":7,"stdout":"smoke result","stderr":"","truncated":false})).await.unwrap();
     });

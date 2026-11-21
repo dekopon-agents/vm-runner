@@ -183,6 +183,7 @@ pub(super) struct State {
     guest: Arc<Guest>,
     ready: Arc<AtomicBool>,
     jobs: Mutex<Jobs>,
+    stopping: watch::Sender<bool>,
     transfers: Arc<tokio::sync::Semaphore>,
     #[cfg(test)]
     progress_read_hook: Mutex<Option<tests::ProgressReadHook>>,
@@ -195,6 +196,7 @@ impl State {
         let mut jobs = self.jobs.lock().map_err(|error| {
             poem::error::InternalServerError(std::io::Error::other(error.to_string()))
         })?;
+        self.require_running()?;
         while let Some(result) = jobs.workers.try_join_next() {
             result.map_err(poem::error::InternalServerError)?;
         }
@@ -218,6 +220,7 @@ impl State {
             progress: progress.clone(),
         });
         let guest = Arc::clone(&self.guest);
+        let stopping = self.stopping.subscribe();
         let runtime = tokio::runtime::Handle::current();
         let dispatch = tracing::dispatcher::get_default(Clone::clone);
         let queued = std::time::Instant::now();
@@ -236,18 +239,22 @@ impl State {
             tracing::dispatcher::with_default(&dispatch, || {
                 runtime.block_on(
                     async {
+                        let deadline_ms = guest.exec_deadline_ms();
                         let request = guest::Request::Exec {
                             argv: input.argv,
                             stdin: input.stdin,
-                            deadline_ms: 600_000,
+                            deadline_ms,
                             env: None,
                             cwd: None,
                         };
                         tracing::Span::current().record("vm_runner.exec.queue_wait_ms", queued.elapsed().as_millis().min(i64::MAX as u128) as i64);
-                        let result = match guest
-                            .call::<GuestTerminal>(&request, Duration::from_secs(610))
-                            .await
-                        {
+                        let timeout = Duration::from_millis(u64::from(deadline_ms)) + Duration::from_secs(10);
+                        let reply = tokio::select! {
+                            biased;
+                            () = super::stopped(stopping) => return,
+                            reply = guest.call::<GuestTerminal>(&request, timeout) => reply,
+                        };
+                        let result = match reply {
                             Ok(GuestTerminal::Executed(value)) => {
                                 Progress::Done(Arc::new(value.into_response()))
                             }
@@ -275,6 +282,23 @@ impl State {
             })
         });
         Ok(Some(Job { id, progress }))
+    }
+    fn require_running(&self) -> poem::Result<()> {
+        if *self.stopping.borrow() {
+            return Err(poem::Error::from_status(StatusCode::SERVICE_UNAVAILABLE));
+        }
+        Ok(())
+    }
+    pub(super) fn stop(&self) -> super::Result<()> {
+        let mut jobs = self
+            .jobs
+            .lock()
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        self.stopping.send_replace(true);
+        self.ready
+            .store(false, std::sync::atomic::Ordering::Release);
+        jobs.entries.clear();
+        Ok(())
     }
     pub(super) async fn drain(&self) -> super::Result<()> {
         let mut workers = std::mem::take(
@@ -340,6 +364,7 @@ impl Api {
             }
         })
         .await;
+        state.require_running()?;
         Ok(match result {
             Ok(Progress::Done(result)) => ExecResponse::Done(Json((*result).clone())),
             _ => ExecResponse::Unknown(unknown(id)),
@@ -393,6 +418,10 @@ impl Api {
                 observed.send(()).unwrap();
                 resume.await.unwrap();
             }
+            if *state.stopping.borrow() {
+                tracing::Span::current().record("vm_runner.job.state", "not_found");
+                return Err(poem::Error::from_status(StatusCode::NOT_FOUND));
+            }
             let value = progress.borrow().clone();
             Ok(match value {
                 Progress::Running if wait.is_some() && closed => {
@@ -436,6 +465,7 @@ pub(super) async fn endpoint(
         guest,
         ready: Arc::new(AtomicBool::new(false)),
         jobs: Mutex::new(Jobs::default()),
+        stopping: watch::channel(false).0,
         transfers: Arc::new(tokio::sync::Semaphore::new(4)),
         #[cfg(test)]
         progress_read_hook: Mutex::new(None),

@@ -93,7 +93,8 @@ stdout/stderr are capped at 64 KiB each. The job map is capped at 64 per session
 globally; a full map refuses exec before dispatch. `deadlineMs` must be 1000–25000.
 `GET /v1/jobs/{jobId}` accepts `Prefer: wait=N` for 1–25 integer seconds and reports honoured waits with `Preference-Applied: wait=N`; omit the wait preference for an immediate read.
 A jail's terminal unknown job returns 200 `not_executed` with reason `unknown` and removes
-the controller handle. Polling never refreshes session activity. Terminal boot failure retires
+the controller handle. Retirement drops all jobs for the session. Polling never refreshes
+session activity. Terminal boot failure retires
 the reservation; transport/health errors return 502 `not_executed` without destroying it.
 Terminating pods retain quota until confirmed gone. Jail and profile images require SHA-256 pins.
 
@@ -383,13 +384,15 @@ SIGTERM kills and reaps the VM before flushing telemetry; the pod owns netns/emp
 
 The same process serves gateway DNS, HTTP and HTTPS using the CA supplied to the guest.
 The jail serves `:8080` before boot: authenticated `GET /healthz` returns 503 until the
-guest answers `ping`, then 200. It also serves `POST /exec {argv, stdin?, deadlineMs}` and
+guest answers `ping` and the jail checks its exec deadline with a no-op. It also serves
+`POST /exec {argv, stdin?, deadlineMs}` and
 `GET /jobs/{id}`. Tokens must have audience `vm-runner-jail` and exactly the subject from
 `jails.controllerSubject`; C4's `auth.subjects` grants no jail access. GET admission is
 independent of long-poll exec admission. Guest stdout, stderr and refusal reasons are capped
 at 64 KiB each on a UTF-8 boundary, setting `truncated: true` when cut. A response deadline (0–25000 ms) returns
-202 with a job ID; execution continues up to the guest's 600 s limit. Transport loss leaves
-an unknown outcome, never a false success or automatic retry. The table retains at most 64
+202 with a job ID. The guest runs each command for up to 1200 s, or 600 s if the guest
+image only supports the older limit. Jail shutdown ends running work. The jail sends
+each admitted exec once. Transport loss leaves an unknown outcome. The table retains at most 64
 jobs, evicting non-running records first; when all slots are active, exec returns
 `{outcome: not_executed, reason: quota}` without sending anything to the guest.
 

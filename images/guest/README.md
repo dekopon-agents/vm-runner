@@ -59,6 +59,43 @@ An owner-pushed annotated `guest-v*` tag on main additionally publishes
 annotated layers (zstd ext4 and kernel); the OCI index advertises both platforms
 and is provenance-attested. Profiles must use its digest, not its tag.
 
+## Compatibility evidence and validation boundary
+
+A headed macOS browser completed a Discord sign-in and an application-page reload
+on 2026-11-21 with its existing launch configuration: Chrome 158.0.8127.37,
+playwright-cli 0.1.24, `--enable-automation` omitted and
+`--disable-blink-features=AutomationControlled` supplied. No configuration change
+or CAPTCHA was needed on that successful attempt. This is neither a controlled
+attribution to those flags nor Linux, guest-proxy or restart-persistence proof.
+Do not copy macOS keychain settings or a signed-in desktop profile into a guest.
+
+The reusable layer is browser lifecycle plus platform-appropriate launch/page
+configuration. `configurePage` applies only to its live page attachment; raw
+Chromium and agent-browser clients do not inherit it as a persistent global
+policy. Site-specific exceptions should follow the common setup, not duplicate it.
+A startup-policy change needs its own tests rather than copying desktop flags and
+assuming a headless guest will be accepted.
+
+Before calling a configuration VM-validated:
+
+- Build and boot the candidate guest artifact in the existing dual-architecture
+  and PR KVM gates. Verify upstream HTTP headers against page JavaScript, separate
+  execs, new tabs, retained identity sessions, site overrides and resource bounds.
+- Use an authorized disposable Firecracker session through the actual runner
+  egress proxy and an explicitly authorized origin set. Record the guest digest,
+  architecture, subject/profile, browser version and final rendered evidence.
+  A Mac container or a local fake is not the real-site result.
+- Compare baseline, page helper and proposed launch changes in fresh sessions.
+  Repeat successful public-content reads across two sessions and two threads;
+  preserve DNS/egress failures, security blocks, CAPTCHA and partial renders.
+- Treat authenticated browsing as a separate credential and persistence design.
+  The guest currently holds no credential and loses its profile at jail expiry.
+  Do not import desktop passwords, cookies, tokens or keychain material. A human
+  verification requirement needs an owner interaction path, not a CAPTCHA solver.
+- Publish only an owner-authorized version, then review the deployment digest
+  change and verify a new authorized test session. Source, image publication,
+  deployed pin and successful site access are different claims.
+
 ## Small offline toolkit
 
 The image also includes distro `python3`, `jq`, `ripgrep` (`rg`), `zip`, `unzip`

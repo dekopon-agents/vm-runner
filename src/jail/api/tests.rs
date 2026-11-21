@@ -1,4 +1,5 @@
 use super::*;
+use futures_util::FutureExt as _;
 mod wait;
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -141,8 +142,35 @@ async fn request(
     (stream, value)
 }
 
+async fn ready_guest(
+    guest: &Guest,
+    listener: &tokio::net::UnixListener,
+    probe_reply: serde_json::Value,
+) {
+    let peer = async {
+        let exchanges = [
+            (json!({"op":"ping"}), json!({"ok":true})),
+            (
+                json!({"op":"exec","argv":["/bin/true"],"deadlineMs":1_200_000,"stdin":null,"env":null,"cwd":null}),
+                probe_reply,
+            ),
+        ];
+        for (expected, reply) in exchanges {
+            let (mut stream, value) = request(listener.accept().await.unwrap().0).await;
+            assert_eq!(value, expected);
+            guest::write_frame(&mut stream, &reply).await.unwrap();
+        }
+    };
+    let (ready, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(guest.ready(), peer)
+    })
+    .await
+    .expect("guest must complete ping and the exec deadline probe");
+    ready.unwrap();
+}
+
 #[tokio::test]
-async fn healthz_returns_503_until_the_guest_answers_ping() {
+async fn healthz_returns_503_until_the_guest_is_ready() {
     let fixture = crate::tests::Fixture::new().await;
     let mut claims = fixture.claims();
     claims["sub"] = json!(CONTROLLER);
@@ -164,16 +192,13 @@ async fn healthz_returns_503_until_the_guest_answers_ping() {
         .await;
     starting.assert_status(StatusCode::SERVICE_UNAVAILABLE);
     starting.assert_text("starting").await;
-    let peer = tokio::spawn(async move {
-        let (mut stream, value) = request(listener.accept().await.unwrap().0).await;
-        assert_eq!(value, json!({"op":"ping"}));
-        guest::write_frame(&mut stream, &json!({"ok":true}))
-            .await
-            .unwrap();
-    });
-    guest.ready().await.unwrap();
+    ready_guest(
+        &guest,
+        &listener,
+        json!({"outcome":"executed","exitCode":0}),
+    )
+    .await;
     state.mark_ready();
-    peer.await.unwrap();
     let ready = client
         .get("/healthz")
         .header("Authorization", &token)
@@ -303,6 +328,19 @@ async fn get_answers_while_all_exec_admission_capacity_is_saturated() {
 
 #[tokio::test]
 async fn jail_auth_deadline_job_and_later_result_use_one_guest_execution() {
+    assert_exec_delivered_once(1_200_000, json!({"outcome":"executed","exitCode":0})).await;
+}
+
+#[tokio::test]
+async fn the_jail_sends_the_first_job_to_an_older_guest_once_at_its_supported_deadline() {
+    assert_exec_delivered_once(
+        600_000,
+        json!({"outcome":"not_executed","reason":"invalid_exec"}),
+    )
+    .await;
+}
+
+async fn assert_exec_delivered_once(deadline_ms: u32, probe_reply: serde_json::Value) {
     let fixture = crate::tests::Fixture::new().await;
     let wrong_audience = fixture.token(&fixture.claims(), "ec");
     let mut claims = fixture.claims();
@@ -312,30 +350,22 @@ async fn jail_auth_deadline_job_and_later_result_use_one_guest_execution() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("guest.sock");
     let listener = tokio::net::UnixListener::bind(&path).unwrap();
+    let guest = Arc::new(Guest::new(path));
+    ready_guest(&guest, &listener, probe_reply).await;
     let (started, receive_started) = tokio::sync::oneshot::channel();
     let (release, released) = tokio::sync::oneshot::channel();
     let peer = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.unwrap();
-        let mut stream = BufReader::new(stream);
-        let mut hello = String::new();
-        stream.read_line(&mut hello).await.unwrap();
-        assert_eq!(hello, "CONNECT 1024\n");
-        stream.write_all(b"OK 1234\n").await.unwrap();
-        let request: serde_json::Value =
-            serde_json::from_slice(&guest::read_frame(&mut stream).await.unwrap()).unwrap();
-        assert_eq!(request["argv"], json!(["echo", "ok"]));
-        assert_eq!(request["deadlineMs"], 1_200_000);
+        let (mut stream, frame) = request(listener.accept().await.unwrap().0).await;
+        assert_eq!(frame["argv"], json!(["echo", "ok"]));
+        assert_eq!(frame["deadlineMs"], deadline_ms);
         started.send(()).unwrap();
         released.await.unwrap();
         guest::write_frame(&mut stream, &json!({"outcome":"executed","exitCode":0,"stdout":"ok","stderr":"","truncated":false,"durationMs":1})).await.unwrap();
+        listener
     });
-    let (endpoint, requests, state) = endpoint(
-        fixture.config.auth,
-        CONTROLLER.into(),
-        Arc::new(Guest::new(path)),
-    )
-    .await
-    .unwrap();
+    let (endpoint, requests, state) = endpoint(fixture.config.auth, CONTROLLER.into(), guest)
+        .await
+        .unwrap();
     state.mark_ready();
     let client = Arc::new(poem::test::TestClient::new(endpoint));
     tokio::time::pause();
@@ -375,7 +405,7 @@ async fn jail_auth_deadline_job_and_later_result_use_one_guest_execution() {
     response.assert_status(StatusCode::ACCEPTED);
     let pending: serde_json::Value = response.0.into_body().into_json().await.unwrap();
     assert_eq!(pending["outcome"], "unknown");
-    tokio::time::advance(Duration::from_secs(1199)).await;
+    tokio::time::advance(Duration::from_millis(u64::from(deadline_ms) - 1000)).await;
     let path = format!("/jobs/{}", pending["jobId"].as_str().unwrap());
     client
         .get(&path)
@@ -385,8 +415,9 @@ async fn jail_auth_deadline_job_and_later_result_use_one_guest_execution() {
         .assert_json(json!({"state":"running"}))
         .await;
     release.send(()).unwrap();
-    peer.await.unwrap();
+    let listener = peer.await.unwrap();
     state.drain().await.unwrap();
+    assert!(listener.accept().now_or_never().is_none());
     client
         .get(&path)
         .header("Authorization", &auth)
@@ -401,7 +432,6 @@ async fn jail_auth_deadline_job_and_later_result_use_one_guest_execution() {
 
 #[tokio::test]
 async fn session_shutdown_drops_the_job_and_reaps_its_guest_process_without_resending() {
-    use futures_util::FutureExt as _;
     use nix::{errno::Errno, sys::signal::kill, unistd::Pid};
 
     let mut auth = crate::tests::Fixture::new().await;
@@ -413,13 +443,16 @@ async fn session_shutdown_drops_the_job_and_reaps_its_guest_process_without_rese
     let socket = dir.path().join("guest.sock");
     let marker = dir.path().join("pid");
     let listener = tokio::net::UnixListener::bind(&socket).unwrap();
-    let (endpoint, requests, state) = endpoint(
-        auth.config.auth.clone(),
-        CONTROLLER.into(),
-        Arc::new(Guest::new(socket)),
+    let guest = Arc::new(Guest::new(socket));
+    ready_guest(
+        &guest,
+        &listener,
+        json!({"outcome":"executed","exitCode":0}),
     )
-    .await
-    .unwrap();
+    .await;
+    let (endpoint, requests, state) = endpoint(auth.config.auth.clone(), CONTROLLER.into(), guest)
+        .await
+        .unwrap();
     let client = poem::test::TestClient::new(endpoint)
         .default_header("Authorization", format!("Bearer {token}"));
     let argv = json!([

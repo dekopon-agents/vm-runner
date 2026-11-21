@@ -239,15 +239,16 @@ impl State {
             tracing::dispatcher::with_default(&dispatch, || {
                 runtime.block_on(
                     async {
+                        let deadline_ms = guest.exec_deadline_ms();
                         let request = guest::Request::Exec {
                             argv: input.argv,
                             stdin: input.stdin,
-                            deadline_ms: guest::EXEC_DEADLINE_MS,
+                            deadline_ms,
                             env: None,
                             cwd: None,
                         };
                         tracing::Span::current().record("vm_runner.exec.queue_wait_ms", queued.elapsed().as_millis().min(i64::MAX as u128) as i64);
-                        let timeout = Duration::from_millis(u64::from(guest::EXEC_DEADLINE_MS)) + Duration::from_secs(10);
+                        let timeout = Duration::from_millis(u64::from(deadline_ms)) + Duration::from_secs(10);
                         let reply = tokio::select! {
                             biased;
                             () = super::stopped(stopping) => return,

@@ -1,8 +1,9 @@
 use super::*;
 use futures_util::FutureExt as _;
 mod wait;
+use crate::jail::client::Error as GuestError;
 use serde_json::json;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
 const CONTROLLER: &str = "system:serviceaccount:test:controller";
 
@@ -146,7 +147,7 @@ async fn ready_guest(
     guest: &Guest,
     listener: &tokio::net::UnixListener,
     probe_reply: serde_json::Value,
-) {
+) -> Result<(), GuestError> {
     let peer = async {
         let exchanges = [
             (json!({"op":"ping"}), json!({"ok":true})),
@@ -166,7 +167,73 @@ async fn ready_guest(
     })
     .await
     .expect("guest must complete ping and the exec deadline probe");
-    ready.unwrap();
+    ready
+}
+
+#[tokio::test]
+async fn boot_ready_logs_the_guest_exec_ceiling_selected_by_the_probe() {
+    use opentelemetry::logs::AnyValue;
+    use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
+    use opentelemetry_sdk::logs::{InMemoryLogExporter, SdkLoggerProvider};
+    use tracing_subscriber::layer::SubscriberExt;
+
+    let exporter = InMemoryLogExporter::default();
+    let provider = SdkLoggerProvider::builder()
+        .with_simple_exporter(exporter.clone())
+        .build();
+    let dispatch = tracing::Dispatch::new(
+        tracing_subscriber::registry().with(OpenTelemetryTracingBridge::new(&provider)),
+    );
+
+    for reply in [
+        json!({"outcome":"executed","exitCode":0}),
+        json!({"outcome":"not_executed","reason":"invalid_exec"}),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("guest.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let guest = Guest::new(path);
+        ready_guest(&guest, &listener, reply).await.unwrap();
+        tracing::dispatcher::with_default(&dispatch, || super::super::log_jail_ready(&guest, None));
+    }
+    let logs = exporter.get_emitted_logs().unwrap();
+    let deadlines: Vec<_> = logs
+        .iter()
+        .filter(|log| log.record.event_name() == Some("vm_runner.boot.ready"))
+        .map(|log| {
+            log.record
+                .attributes_iter()
+                .find(|(key, _)| key.as_str() == "vm_runner.guest.exec_deadline_ms")
+                .map(|(_, value)| value)
+        })
+        .collect();
+    assert_eq!(
+        deadlines,
+        [
+            Some(&AnyValue::Int(1_200_000)),
+            Some(&AnyValue::Int(600_000))
+        ]
+    );
+    provider.shutdown().unwrap();
+}
+
+#[tokio::test]
+async fn unexpected_exec_deadline_probe_replies_fail_readiness_and_keep_the_legacy_ceiling() {
+    for reply in [
+        json!({"outcome":"not_executed","reason":"spawn_failed"}),
+        json!({"outcome":"executed","exitCode":1}),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("guest.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let guest = Guest::new(path);
+        let result = ready_guest(&guest, &listener, reply.clone()).await;
+        assert!(
+            matches!(result, Err(GuestError::ExecDeadlineProbe)),
+            "{reply}: {result:?}"
+        );
+        assert_eq!(guest.exec_deadline_ms(), 600_000, "{reply}");
+    }
 }
 
 #[tokio::test]
@@ -197,7 +264,8 @@ async fn healthz_returns_503_until_the_guest_is_ready() {
         &listener,
         json!({"outcome":"executed","exitCode":0}),
     )
-    .await;
+    .await
+    .unwrap();
     state.mark_ready();
     let ready = client
         .get("/healthz")
@@ -351,7 +419,7 @@ async fn assert_exec_delivered_once(deadline_ms: u32, probe_reply: serde_json::V
     let path = dir.path().join("guest.sock");
     let listener = tokio::net::UnixListener::bind(&path).unwrap();
     let guest = Arc::new(Guest::new(path));
-    ready_guest(&guest, &listener, probe_reply).await;
+    ready_guest(&guest, &listener, probe_reply).await.unwrap();
     let (started, receive_started) = tokio::sync::oneshot::channel();
     let (release, released) = tokio::sync::oneshot::channel();
     let peer = tokio::spawn(async move {
@@ -431,6 +499,54 @@ async fn assert_exec_delivered_once(deadline_ms: u32, probe_reply: serde_json::V
 }
 
 #[tokio::test]
+async fn shutdown_reports_submitted_exec_as_unknown_and_refuses_new_exec() {
+    let mut fixture = crate::tests::Fixture::new().await;
+    let mut claims = fixture.claims();
+    claims["aud"] = json!(["vm-runner-jail"]);
+    claims["sub"] = json!(CONTROLLER);
+    let token = fixture.token(&claims, "ec");
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("guest.sock");
+    let listener = tokio::net::UnixListener::bind(&path).unwrap();
+    let guest = Arc::new(Guest::new(path));
+    let (endpoint, requests, state) =
+        endpoint(fixture.config.auth.clone(), CONTROLLER.into(), guest)
+            .await
+            .unwrap();
+    let client = poem::test::TestClient::new(endpoint)
+        .default_header("Authorization", format!("Bearer {token}"));
+    let input = json!({"argv":["echo","ok"],"deadlineMs":25_000});
+    let post = client.post("/exec").body_json(&input).send();
+    let shutdown = async {
+        let (mut stream, frame) = request(listener.accept().await.unwrap().0).await;
+        assert_eq!(frame["op"], "exec");
+        assert_eq!(frame["argv"], input["argv"]);
+        state.stop().unwrap();
+        assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
+    };
+    let (response, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(post, shutdown)
+    })
+    .await
+    .expect("shutdown must end the wait before the response deadline");
+    response.assert_status(StatusCode::ACCEPTED);
+    let pending: serde_json::Value = response.0.into_body().into_json().await.unwrap();
+    assert_eq!(pending["outcome"], "unknown");
+    assert!(uuid::Uuid::parse_str(pending["jobId"].as_str().unwrap()).is_ok());
+
+    client
+        .post("/exec")
+        .body_json(&input)
+        .send()
+        .await
+        .assert_status(StatusCode::SERVICE_UNAVAILABLE);
+    state.drain().await.unwrap();
+    assert!(listener.accept().now_or_never().is_none());
+    requests.drain().await.unwrap();
+    fixture.tasks.shutdown().await;
+}
+
+#[tokio::test]
 async fn session_shutdown_drops_the_job_and_reaps_its_guest_process_without_resending() {
     use nix::{errno::Errno, sys::signal::kill, unistd::Pid};
 
@@ -449,7 +565,8 @@ async fn session_shutdown_drops_the_job_and_reaps_its_guest_process_without_rese
         &listener,
         json!({"outcome":"executed","exitCode":0}),
     )
-    .await;
+    .await
+    .unwrap();
     let (endpoint, requests, state) = endpoint(auth.config.auth.clone(), CONTROLLER.into(), guest)
         .await
         .unwrap();

@@ -64,10 +64,16 @@ through the scratch-backed overlay, so a normal `uv venv ~/venv` works without
 pip or interpreter downloads. Package installation/network access still requires
 the existing egress policy; no additional hosts are allowed by this image.
 
+The guest ships Codex CLI 0.171.0 at `/usr/local/bin/codex` from the official
+Linux musl release archives, with SHA-256 pins for amd64 and arm64. The jail
+starts with an empty `~/.codex` directory. Network access follows the existing
+egress policy.
+
 An offline build-time smoke runs as uid 1000 with cleared environment and no
-network. It executes Python, creates/writes a uv venv using the baked interpreter
-without pip, installs/imports a tiny local wheel via `uv --offline pip install`
-into the discovered `.venv`, checks jq/rg and a zip/unzip roundtrip, and extracts
+network. It checks `codex --version`, runs Python, creates a writable uv venv
+without pip using the baked interpreter, installs/imports a tiny local wheel via
+`uv --offline pip install` into the discovered `.venv`, checks jq/rg and a
+zip/unzip roundtrip, and extracts
 text/metadata from a tiny generated PDF. Fixtures, the venv and its cache are removed.
 `verify.sh` checks these shipped executables in ext4, including Python's symlink
 target. Dual-arch guest CI is the full image gate.

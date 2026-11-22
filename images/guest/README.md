@@ -30,6 +30,11 @@ exits, losing the browser, scratch and any running exec. That session's next exe
 The `jail` user's default Node module and browser-cache paths point at the baked
 Playwright installation; no browser download is needed at exec time.
 
+Use `browse --tab research open URL` and `browse --tab research snapshot` to work in
+a named page. Calls with another name have their own page in the same browser
+context and share logins. `browse tabs` shows each named page with its name.
+`browse open --tab URL` and `browse tab N` still set the selection for unqualified calls.
+
 `browse` (`browse --help`) keeps one headless Chromium for the life of the jail. The first
 call starts it in its own session, outside the exec's process group, with DevTools on
 127.0.0.1:9222 and a profile under `~/.browse-profile`; every call reattaches over CDP, so

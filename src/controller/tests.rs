@@ -725,6 +725,174 @@ async fn quota_and_bad_profile_refusals_preserve_the_registry() {
     assert_eq!(controller.sessions.lock().unwrap().len(), 1);
 }
 #[tokio::test]
+async fn only_the_verified_subject_can_list_or_close_its_sessions_and_quota_waits_for_pod_absence()
+{
+    use crate::tests::Fixture;
+    use poem::{http::StatusCode, test::TestClient};
+
+    let mut fixture = Fixture::new().await;
+    let subject = "system:serviceaccount:other:default";
+    fixture.config.auth.subjects.push(subject.into());
+    let mut other_claims = fixture.claims();
+    other_claims["sub"] = json!(subject);
+    let caller = format!("Bearer {}", fixture.token(&fixture.claims(), "ec"));
+    let other = format!("Bearer {}", fixture.token(&other_claims, "ec"));
+    let existing = pod();
+    let id = existing["metadata"]["labels"]["vm-runner/session"]
+        .as_str()
+        .unwrap();
+    let path = format!("/v1/sessions/{id}");
+    let (controller, mut mock) = setup(vec![existing.clone()]).await;
+    let state = crate::State {
+        auth: crate::Authenticator::new(fixture.config.auth.clone())
+            .await
+            .unwrap(),
+        config: Arc::new(fixture.config),
+        controller: Some(Arc::new(controller)),
+    };
+    let client = TestClient::new(crate::endpoint(
+        Arc::new(state),
+        Arc::new(tokio::sync::Semaphore::new(1)),
+        Arc::new(Mutex::new(crate::RequestRollups::new(
+            crate::Origin::Controller,
+        ))),
+    ));
+    let reserve = |authorization: &str, name: &str| {
+        client
+            .post("/v1/sessions")
+            .header("Authorization", authorization)
+            .body_json(&json!({"profile":"travel","name":name}))
+    };
+    let owned = reserve(&caller, "second").send().await;
+    owned.assert_status(StatusCode::CREATED);
+    let owned_id = owned
+        .0
+        .headers()
+        .get(SESSION_HEADER)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    reserve(&other, "foreign")
+        .send()
+        .await
+        .assert_status(StatusCode::CREATED);
+
+    let listed = client
+        .get("/v1/sessions")
+        .header("Authorization", &caller)
+        .header("x-dekopon-vm-subject", subject)
+        .send()
+        .await;
+    listed.assert_status_is_ok();
+    listed
+        .assert_json(json!([
+            {"sessionId":id,"name":"default","profile":"travel","state":"pending"},
+            {"sessionId":owned_id,"name":"second","profile":"travel","state":"pending"}
+        ]))
+        .await;
+
+    for candidate in [path.as_str(), "/v1/sessions/missing"] {
+        let response = client
+            .delete(candidate)
+            .header("Authorization", &other)
+            .header("x-dekopon-vm-subject", SUBJECT_VALUE)
+            .send()
+            .await;
+        response.assert_status(StatusCode::NOT_FOUND);
+        response
+            .assert_json(json!({"error":"unknown_session"}))
+            .await;
+    }
+
+    let close = client.delete(&path).header("Authorization", &caller).send();
+    tokio::pin!(close);
+    let kubernetes = async {
+        reply(&mut mock, "GET", POD_PATH, existing.clone()).await;
+        let (request, send) = mock.next_request().await.unwrap();
+        assert_eq!(request.method(), "DELETE");
+        assert_eq!(request.uri().to_string(), format!("{POD_PATH}?"));
+        assert!(request.headers().get("x-dekopon-vm-subject").is_none());
+        let bytes = request.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&bytes).unwrap()["gracePeriodSeconds"],
+            1
+        );
+        send.send_response(hyper::Response::new(kube::client::Body::from(
+            serde_json::to_vec(&existing).unwrap(),
+        )));
+        let mut terminating = existing.clone();
+        terminating["metadata"]["deletionTimestamp"] = json!("2026-09-25T00:00:01Z");
+        reply(&mut mock, "GET", POD_PATH, terminating).await;
+
+        let quota = reserve(&caller, "next").send().await;
+        quota.assert_status(StatusCode::BAD_REQUEST);
+        quota.assert_json(json!({"outcome":"not_executed","reason":"quota","sessionsInUse":2,"maxSessions":2})).await;
+        let listed = client
+            .get("/v1/sessions")
+            .header("Authorization", &caller)
+            .send()
+            .await;
+        listed.assert_status_is_ok();
+        listed.assert_json(json!([
+            {"sessionId":id,"name":"default","profile":"travel","state":"down","reason":"closed"},
+            {"sessionId":owned_id,"name":"second","profile":"travel","state":"pending"}
+        ])).await;
+
+        gone(&mut mock, "GET", POD_PATH).await;
+    };
+    tokio::select! {
+        biased;
+        response = &mut close => panic!("DELETE answered before the pod's 404: {:?}", response.0.status()),
+        () = kubernetes => {}
+    }
+    close.await.assert_status(StatusCode::NO_CONTENT);
+    reserve(&caller, "next")
+        .send()
+        .await
+        .assert_status(StatusCode::CREATED);
+
+    client
+        .delete(format!("/v1/sessions/{owned_id}"))
+        .header("Authorization", &caller)
+        .send()
+        .await
+        .assert_status(StatusCode::NO_CONTENT);
+    assert!(
+        mock.poll_request().is_pending(),
+        "unexpected Kubernetes request"
+    );
+    fixture.tasks.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn close_times_out_with_the_session_still_reserved_for_the_reaper() {
+    let existing = pod();
+    let id = existing["metadata"]["labels"]["vm-runner/session"]
+        .as_str()
+        .unwrap();
+    let (controller, mut mock) = setup(vec![existing.clone()]).await;
+    let close = controller.close(SUBJECT_VALUE, id);
+    tokio::pin!(close);
+    let requests = async {
+        reply(&mut mock, "GET", POD_PATH, existing.clone()).await;
+        reply(&mut mock, "DELETE", POD_PATH, existing.clone()).await;
+        mock.next_request().await.unwrap()
+    };
+    let (poll, response) = tokio::select! {
+        _ = &mut close => panic!("close finished before polling Kubernetes"),
+        exchange = requests => exchange,
+    };
+    assert_eq!(poll.method(), "GET");
+    assert_eq!(poll.uri().to_string(), POD_PATH);
+    assert!(matches!(close.await, Err(CloseError::Timeout)));
+    drop(response);
+    assert_eq!(controller.sessions.lock().unwrap().len(), 1);
+    tokio::join!(controller.reap(now()), gone(&mut mock, "GET", POD_PATH));
+    assert!(controller.sessions.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn rebuild_recovers_named_sessions_and_reaper_deletes_expired_pods() {
     let (controller, mut mock) = setup(vec![pod()]).await;
     let body = controller.sessions.lock().unwrap()["jail-rebuilt"]

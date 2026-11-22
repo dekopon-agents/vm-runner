@@ -641,6 +641,153 @@ async fn session_shutdown_drops_the_job_and_reaps_its_guest_process_without_rese
 }
 
 #[tokio::test]
+#[ignore = "requires Chromium and a browse executable named by VM_RUNNER_BROWSE_SMOKE"]
+async fn the_jail_api_keeps_named_browser_pages_independent_until_session_delete() {
+    let mut auth = crate::tests::Fixture::new().await;
+    let subject = "system:serviceaccount:runner:controller";
+    let mut claims = auth.claims();
+    claims["aud"] = json!(["vm-runner-jail"]);
+    claims["sub"] = json!(subject);
+    let token = auth.token(&claims, "ec");
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("guest.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let (jail, requests, state) = endpoint(
+        auth.config.auth.clone(),
+        subject.into(),
+        Arc::new(Guest::new(socket)),
+    )
+    .await
+    .unwrap();
+    state.mark_ready();
+    let upstream = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = Arc::clone(&upstream);
+    let jail = jail.before(move |req| {
+        if req.method() == poem::http::Method::POST {
+            assert_eq!(req.uri().to_string(), "/exec");
+            assert!(req.header("x-dekopon-vm-subject").is_none());
+            assert!(req.header("x-dekopon-vm-session").is_none());
+            seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        async { Ok(req) }
+    });
+    let mut fixture = crate::controller::proxy::tests::Fixture::with_jail(
+        jail.boxed(),
+        token,
+        auth.config.auth.clone(),
+    )
+    .await;
+    let client = poem::test::TestClient::new(fixture.api_endpoint(&auth).await).default_header(
+        "Authorization",
+        format!("Bearer {}", auth.token(&auth.claims(), "ec")),
+    );
+    let session = format!("/v1/sessions/{}", fixture.session());
+    let browse = std::env::var("VM_RUNNER_BROWSE_SMOKE").unwrap();
+    let profile = format!("BROWSE_PROFILE={}/profile", dir.path().display());
+    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = format!("BROWSE_PORT={}", port.local_addr().unwrap().port());
+    drop(port);
+    let pages = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", pages.local_addr().unwrap());
+    fixture.tasks.spawn(async move {
+        poem::Server::new_with_acceptor(poem::listener::TcpAcceptor::from_tokio(pages).unwrap())
+            .run(poem::endpoint::make_sync(|req| {
+                let heading = match req.uri().path() {
+                    "/research-1" => "Research one",
+                    "/research-2" => "Research two",
+                    "/booking-1" => "Booking one",
+                    "/booking-2" => "Booking two",
+                    _ => "",
+                };
+                poem::web::Html(format!("<h1>{heading}</h1>"))
+            }))
+            .await
+            .unwrap();
+    });
+    let [research_one, research_two, booking_one, booking_two] =
+        ["research-1", "research-2", "booking-1", "booking-2"].map(|page| format!("{base}/{page}"));
+    let commands: &[(&[&str], Option<&str>)] = &[
+        (&["--tab", "research", "open", &research_one], None),
+        (&["--tab", "booking", "open", &booking_one], None),
+        (&["--tab", "research", "open", &research_two], None),
+        (&["--tab", "booking", "text", "h1"], Some("Booking one\n")),
+        (&["--tab", "booking", "open", &booking_two], None),
+        (&["--tab", "research", "text", "h1"], Some("Research two\n")),
+        (&["reset"], Some("browser stopped and profile deleted\n")),
+    ];
+    let mut results = Vec::new();
+    for (args, _) in commands {
+        let argv: Vec<_> = ["/usr/bin/env", &profile, &address, &browse]
+            .into_iter()
+            .chain(args.iter().copied())
+            .collect();
+        let body = json!({"argv":argv,"deadlineMs":25000});
+        let call = client
+            .post(format!("{session}/exec"))
+            .header("x-dekopon-vm-subject", "guest:forged")
+            .body_json(&body)
+            .send();
+        let peer = async {
+            let (mut relay, frame) = request(listener.accept().await.unwrap().0).await;
+            assert_eq!(
+                frame,
+                json!({
+                    "op":"exec","argv":argv,"deadlineMs":600_000,"stdin":null,"env":null,"cwd":null
+                })
+            );
+            let (mut forward, stream) = tokio::io::duplex(4096);
+            guest::write_frame(&mut forward, &frame).await.unwrap();
+            let (handled, transferred) = tokio::join!(
+                guest::tests::serve_one(stream),
+                tokio::io::copy_bidirectional(&mut relay, &mut forward)
+            );
+            handled.unwrap();
+            transferred.unwrap();
+        };
+        let (response, ()) =
+            tokio::time::timeout(Duration::from_secs(30), async { tokio::join!(call, peer) })
+                .await
+                .unwrap();
+        response.assert_status_is_ok();
+        results.push(
+            response
+                .0
+                .into_body()
+                .into_json::<serde_json::Value>()
+                .await
+                .unwrap(),
+        );
+    }
+
+    for (result, (_, expected)) in results.iter().zip(commands) {
+        assert_eq!(result["exitCode"], 0, "{result}");
+        if let Some(expected) = expected {
+            assert_eq!(result["stdout"], *expected);
+        }
+    }
+    assert_eq!(
+        upstream.load(std::sync::atomic::Ordering::Relaxed),
+        commands.len()
+    );
+    assert!(listener.accept().now_or_never().is_none());
+    client
+        .delete(session)
+        .send()
+        .await
+        .assert_status(StatusCode::NO_CONTENT);
+    client
+        .get("/v1/sessions")
+        .send()
+        .await
+        .assert_json(json!([]))
+        .await;
+    requests.drain().await.unwrap();
+    state.drain().await.unwrap();
+    fixture.tasks.shutdown().await;
+    auth.tasks.shutdown().await;
+}
+
+#[tokio::test]
 async fn job_capacity_refuses_active_work_and_evicts_only_non_running_records() {
     let dir = tempfile::tempdir().unwrap();
     let mut jobs = Jobs::default();

@@ -115,6 +115,16 @@ function exec(argv, expectedCode = 0) {
     fs.rmdirSync(missingParent);
     console.log('record names existing outputs and reports the final stderr line after a publish failure');
     await exec(['browse', 'open', page('Browse smoke')]);
+    await exec(['browse', '--tab', 'research', 'open', page('Research one')]);
+    await exec(['browse', '--tab', 'booking', 'open', page('Booking one')]);
+    await exec(['browse', '--tab', 'research', 'open', page('Research two')]);
+    assert.equal(await exec(['browse', '--tab', 'booking', 'text', 'h1']), 'Booking one\n');
+    await exec(['browse', '--tab', 'booking', 'open', page('Booking two')]);
+    assert.equal(await exec(['browse', '--tab', 'research', 'text', 'h1']), 'Research two\n');
+    const tabs = (await exec(['browse', 'tabs'])).trimEnd().split('\n');
+    assert.equal(tabs.filter(line => /\[research\].* Research two$/.test(line)).length, 1);
+    assert.equal(tabs.filter(line => /\[booking\].* Booking two$/.test(line)).length, 1);
+    console.log('named browse pages keep independent navigation across execs');
     await exec(['agent-browser', 'open', page('Agent browser smoke')]);
     const snapshot = await exec(['agent-browser', 'snapshot']);
     assert.match(snapshot, /Agent browser smoke/);

@@ -27,3 +27,36 @@ and x86_64 Linux. The jail API dispatched one exec to the production guest handl
 through a Unix relay. After the test observed the child running, jail shutdown closed
 the exchange, reaped the child, and retired the job. The relay observed one exec and
 the job endpoint returned HTTP 404.
+
+## Codex guest toolkit smoke
+
+On 2026-11-22T19:04:19Z, the amd64 toolkit smoke passed at source commit
+`1770631a34a4636f2cad4af542bd63ddd3928a92` with Docker 28.4.0, Buildx 0.31.0
+and Codex CLI 0.171.0. The focused image ID was
+`sha256:5ae5c834b010efd6280718135373b606a7fb2a4c6bd5ef21be287f7e4f8f9156`.
+
+From the normal guest context, a temporary Dockerfile omitted the Playwright,
+guest-agent and browser smoke steps. The Codex archive installation and the
+existing `RUN --network=none` invocation of `toolkit-smoke.sh` ran as in the
+committed Dockerfile, using the Cloud proxy CA as a build secret for downloads.
+
+```sh
+docker buildx build --platform linux/amd64 --load --progress plain \
+  --secret id=proxy_ca,src=/etc/ssl/certs/ca-certificates.crt \
+  -f "$context/Dockerfile.toolkit" -t "$image" "$context"
+docker run --rm --network=none --user 1000:1000 --workdir /home/jail \
+  --entrypoint /usr/bin/env "$image" -i HOME=/home/jail \
+  PATH=/usr/local/bin:/usr/bin:/bin codex --version
+```
+
+The amd64 archive passed the Dockerfile's SHA-256 check. The full toolkit script
+ran with an empty environment except for `HOME` and `PATH` and printed
+`codex-cli 0.171.0`. A second invocation in the resulting image printed the same
+version after checking that the baked `.codex` directory was empty and had mode
+`0700` and owner `1000:1000`. Both upstream release archives also matched their
+published SHA-256 digests when downloaded independently.
+
+The full amd64 guest Docker build reached the pinned Playwright browser download
+and received HTTP 403 `Domain forbidden` from the Cloud proxy for
+`cdn.playwright.dev`. Full guest, ext4 verification and Firecracker boot depend
+on the CI jobs.

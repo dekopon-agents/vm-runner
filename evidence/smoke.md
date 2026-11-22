@@ -60,3 +60,26 @@ The full amd64 guest Docker build reached the pinned Playwright browser download
 and received HTTP 403 `Domain forbidden` from the Cloud proxy for
 `cdn.playwright.dev`. Full guest, ext4 verification and Firecracker boot depend
 on the CI jobs.
+
+## Named browser pages and session close
+
+On 2026-11-22 at 19:15 UTC, the smoke passed in 14.56 seconds at source commit
+`3f1889614f7eb3abb645a692a624500fc2df9ef4`. It ran with vm-runner 0.6.0,
+Rust 1.98.1, Node 24.21.0, Playwright 1.63.0 and Chromium 154.0.8037.57 on
+amd64 Linux. `$browse_smoke` is an executable wrapper for this checkout's
+`images/guest/browse` that sets `BROWSE_PLAYWRIGHT` and `BROWSE_CHROMIUM` for
+the installed Playwright and Chromium.
+
+```sh
+VM_RUNNER_BROWSE_SMOKE="$browse_smoke" cargo test --all-features --locked --lib \
+  jail::api::tests::the_jail_api_keeps_named_browser_pages_independent_until_session_delete \
+  -- --exact --ignored --nocapture
+```
+
+The authenticated controller forwarded seven separate execs to the real jail
+HTTP endpoint. The production guest handler ran the real `browse` script
+through a local Unix relay using loopback pages. Each named tab retained its
+own navigation. The jail received each command once at `/exec`, with no
+guest-supplied identity headers. The session DELETE returned 204 after the
+Kubernetes test fixture reported the pod absent, and the next list was empty.
+The hosted KVM gate exercises the Firecracker and vsock path.

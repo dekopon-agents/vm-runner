@@ -1,6 +1,9 @@
 #!/bin/sh
 set -eu
 [ "$(id -u)" = 1000 ]
+codex_version=$(codex --version)
+printf '%s\n' "$codex_version"
+[ "$codex_version" = 'codex-cli 0.171.0' ]
 uv --version | grep -Ex 'uv 0\.12\.21( \([^)]*\))?'
 [ "$(pi --version)" = 1.2.0 ]
 node /opt/pi/sse-smoke.cjs /opt/pi/node_modules/openai/core/streaming.js /home/jail/.pi-proxy/response.sse

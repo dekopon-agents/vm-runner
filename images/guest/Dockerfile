@@ -58,6 +58,17 @@ RUN case "$TARGETARCH" in \
     && chmod 0755 /usr/local/bin/agent-browser-native \
     && test "$(/usr/local/bin/agent-browser-native --version)" = 'agent-browser 0.38.1'
 COPY --chmod=0755 agent-browser /usr/local/bin/agent-browser
+RUN case "$TARGETARCH" in \
+      amd64) codex_arch=x86_64; sha=01baa2e47809f8597be5b2f8abd4e4dfe3fb5bcb6e504c2fbaaad97056c15e8d ;; \
+      arm64) codex_arch=aarch64; sha=bcf50b836385e51bd2976ab2bbe92b1b08a1cbe37712eb8dbe378aa78d24871c ;; \
+      *) exit 2 ;; \
+    esac \
+    && codex_asset="codex-$codex_arch-unknown-linux-musl" \
+    && curl -fSL "https://github.com/openai/codex/releases/download/rust-v0.171.0/$codex_asset.tar.gz" -o /tmp/codex.tar.gz \
+    && printf '%s  /tmp/codex.tar.gz\n' "$sha" | sha256sum --check \
+    && tar -xzf /tmp/codex.tar.gz -C /tmp "$codex_asset" \
+    && install -m 0755 "/tmp/$codex_asset" /usr/local/bin/codex \
+    && rm /tmp/codex.tar.gz "/tmp/$codex_asset"
 COPY --chmod=0755 vm-guest-agent /usr/local/bin/vm-guest-agent
 COPY --chmod=0755 vm-init /sbin/vm-init
 COPY --chmod=0755 browse /usr/local/bin/browse
@@ -72,6 +83,8 @@ RUN install -d -o 1000 -g 1000 -m 0700 /scratch/recordings \
 COPY toolkit-smoke.sh /tmp/toolkit-smoke.sh
 RUN --network=none setpriv --reuid=1000 --regid=1000 --clear-groups \
     env -i HOME=/home/jail PATH=/usr/local/bin:/usr/bin:/bin sh /tmp/toolkit-smoke.sh \
-    && rm /tmp/toolkit-smoke.sh /opt/pi/sse-smoke.cjs /home/jail/.pi-proxy/response.sse
+    && rm /tmp/toolkit-smoke.sh /opt/pi/sse-smoke.cjs /home/jail/.pi-proxy/response.sse \
+    && rm -rf /home/jail/.codex \
+    && install -d -o 1000 -g 1000 -m 0700 /home/jail/.codex
 WORKDIR /home/jail
 ENTRYPOINT ["/sbin/vm-init"]

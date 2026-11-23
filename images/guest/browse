@@ -328,7 +328,10 @@ async function main() {
     if (batch.length > 1) console.log(`$ ${command.map((w) => (/\s/.test(w) ? JSON.stringify(w) : w)).join(' ')}`);
     try {
       const [verb, arg] = command;
-      if (name && (verb === 'tab' || verb === 'reset' || (verb === 'open' && arg === '--tab'))) {
+      if (name && verb === 'open' && arg === '--tab') {
+        throw new Error('use browse --tab NAME open URL for a named tab or browse open --tab URL for an unnamed tab');
+      }
+      if (name && (verb === 'tab' || verb === 'reset')) {
         throw new Error(`use ${verb} without browse --tab NAME`);
       }
       console.log(cap(await run(state, command)));

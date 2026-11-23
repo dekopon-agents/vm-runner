@@ -70,9 +70,10 @@ A quota refusal includes `sessionsInUse` and `maxSessions`.
 `DELETE /v1/sessions/{id}` closes an owned session with a one-second pod grace
 period and returns 204 once Kubernetes confirms the pod is gone. A reserved
 session without a pod closes immediately. Missing or foreign IDs return 404
-`unknown_session`. If cleanup exceeds 20 seconds, the API returns 504
-`session_delete_timeout` and the reaper continues cleanup. Without `jails`,
-session requests return 503.
+`unknown_session`. Kubernetes request failures return 502 `session_delete_failed`.
+If cleanup exceeds 20 seconds, the API returns 504 `session_delete_timeout`.
+The reaper retries cleanup after either error. Without `jails`, session requests
+return 503.
 
 Configure `jails` for both controller and jail roles; `controllerSubject` is required and
 names the controller's service account, not a C4 caller from `auth.subjects`:

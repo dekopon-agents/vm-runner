@@ -562,9 +562,7 @@ impl Controller {
                     && let Some(current) = self.pods.get_opt(&pod).await?
                 {
                     self.remember_pod_end(&key, Some(&current));
-                    if current.metadata.deletion_timestamp.is_none() {
-                        delete_pod(&self.pods, &pod, Some(CLOSE_GRACE_SECONDS)).await?;
-                    }
+                    delete_pod(&self.pods, &pod, Some(CLOSE_GRACE_SECONDS)).await?;
                     while self.pods.get_opt(&pod).await?.is_some() {
                         tokio::time::sleep(CLOSE_POLL).await;
                     }

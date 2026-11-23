@@ -77,6 +77,71 @@ paths:
             text/plain; charset=utf-8:
               schema:
                 type: string
+    get:
+      responses:
+        '200':
+          description: ''
+          content:
+            application/json; charset=utf-8:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ListedSession'
+        '401':
+          description: ''
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/Refusal'
+        '503':
+          description: ''
+          content:
+            text/plain; charset=utf-8:
+              schema:
+                type: string
+  /v1/sessions/{id}:
+    delete:
+      parameters:
+      - name: id
+        schema:
+          type: string
+        in: path
+        required: true
+        deprecated: false
+        explode: true
+      responses:
+        '204':
+          description: ''
+        '401':
+          description: ''
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/Refusal'
+        '404':
+          description: ''
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/CloseRefusal'
+        '502':
+          description: ''
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/CloseRefusal'
+        '503':
+          description: ''
+          content:
+            text/plain; charset=utf-8:
+              schema:
+                type: string
+        '504':
+          description: ''
+          content:
+            application/json; charset=utf-8:
+              schema:
+                $ref: '#/components/schemas/CloseRefusal'
   /v1/whoami:
     get:
       responses:
@@ -561,6 +626,20 @@ components:
           format: uint64
         sha256:
           type: string
+    CloseCode:
+      type: string
+      enum:
+      - unknown_session
+      - session_delete_failed
+      - session_delete_timeout
+    CloseRefusal:
+      type: object
+      title: CloseRefusal
+      required:
+      - error
+      properties:
+        error:
+          $ref: '#/components/schemas/CloseCode'
     Conflict:
       type: object
       title: Conflict
@@ -628,6 +707,15 @@ components:
           type: string
         name:
           type: string
+    EndReason:
+      type: string
+      enum:
+      - idle
+      - max_seconds
+      - boot_failure
+      - duplicate
+      - terminal
+      - closed
     Exec:
       type: object
       title: Exec
@@ -759,6 +847,31 @@ components:
       anyOf:
       - $ref: '#/components/schemas/ControllerRunning'
       - $ref: '#/components/schemas/ExecResult'
+    ListedSession:
+      type: object
+      title: ListedSession
+      required:
+      - sessionId
+      - name
+      - profile
+      - state
+      properties:
+        sessionId:
+          type: string
+        name:
+          type: string
+        profile:
+          type: string
+        state:
+          $ref: '#/components/schemas/ListedState'
+        reason:
+          $ref: '#/components/schemas/EndReason'
+    ListedState:
+      type: string
+      enum:
+      - pending
+      - ready
+      - down
     NotExecuted:
       type: object
       title: NotExecuted
@@ -770,6 +883,12 @@ components:
           $ref: '#/components/schemas/NotExecutedOutcome'
         reason:
           $ref: '#/components/schemas/Failure'
+        sessionsInUse:
+          type: integer
+          format: uint64
+        maxSessions:
+          type: integer
+          format: uint32
     NotExecutedOutcome:
       type: string
       enum:

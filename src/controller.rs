@@ -13,7 +13,7 @@ use poem_openapi::{
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tracing::Instrument;
 
@@ -24,6 +24,9 @@ const SUBJECT_HASH: &str = "vm-runner/subject-hash";
 const NAME: &str = "vm-runner/name";
 const CREATED: &str = "vm-runner/created";
 const ACTIVE: &str = "vm-runner/active";
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(20);
+const CLOSE_POLL: Duration = Duration::from_millis(250);
+const CLOSE_GRACE_SECONDS: u32 = 1;
 #[derive(Object)]
 #[oai(deny_unknown_fields)]
 pub(crate) struct Create {
@@ -45,10 +48,32 @@ enum SessionState {
     Pending,
     Ready,
 }
+#[derive(Clone, Copy, poem_openapi::Enum)]
+#[oai(rename_all = "snake_case")]
+enum ListedState {
+    Pending,
+    Ready,
+    Down,
+}
 #[derive(Object)]
+#[oai(rename_all = "camelCase")]
+pub(crate) struct ListedSession {
+    session_id: String,
+    name: String,
+    profile: String,
+    state: ListedState,
+    #[oai(skip_serializing_if_is_none)]
+    reason: Option<EndReason>,
+}
+#[derive(Object)]
+#[oai(rename_all = "camelCase")]
 pub(crate) struct NotExecuted {
     outcome: NotExecutedOutcome,
     reason: Failure,
+    #[oai(skip_serializing_if_is_none)]
+    sessions_in_use: Option<u64>,
+    #[oai(skip_serializing_if_is_none)]
+    max_sessions: Option<u32>,
 }
 #[derive(poem_openapi::Enum)]
 #[oai(rename_all = "snake_case")]
@@ -105,6 +130,16 @@ impl Created {
         Self::Refused(Json(NotExecuted {
             outcome: NotExecutedOutcome::NotExecuted,
             reason,
+            sessions_in_use: None,
+            max_sessions: None,
+        }))
+    }
+    fn quota(sessions_in_use: usize, max_sessions: u32) -> Self {
+        Self::Refused(Json(NotExecuted {
+            outcome: NotExecutedOutcome::NotExecuted,
+            reason: Failure::Quota,
+            sessions_in_use: Some(sessions_in_use as u64),
+            max_sessions: Some(max_sessions),
         }))
     }
 }
@@ -121,13 +156,20 @@ struct Session {
     pod_read: bool,
     starting: bool,
 }
-#[derive(Clone, Copy)]
+pub(crate) enum CloseError {
+    Unknown,
+    Upstream,
+    Timeout,
+}
+#[derive(Clone, Copy, poem_openapi::Enum)]
+#[oai(rename_all = "snake_case")]
 enum EndReason {
     Idle,
     MaxSeconds,
     BootFailure,
     Duplicate,
     Terminal,
+    Closed,
 }
 #[derive(Clone, Default)]
 struct PodEnd {
@@ -170,6 +212,7 @@ struct Expired {
     session_id: String,
     pod: Option<String>,
     attempt: ReapAttempt,
+    grace: Option<u32>,
 }
 #[must_use]
 fn remove_retired(
@@ -193,6 +236,7 @@ impl EndReason {
             Self::BootFailure => "boot_failure",
             Self::Duplicate => "duplicate",
             Self::Terminal => "terminal",
+            Self::Closed => "closed",
         }
     }
 }
@@ -349,7 +393,7 @@ impl Controller {
                 .filter(|_| pod.metadata.deletion_timestamp.is_none())
             {
                 // The listed pod is already a read of its status; no extra GET is needed.
-                match delete_pod(&pods, name).await {
+                match delete_pod(&pods, name, None).await {
                     Ok(true) => {
                         EndRecord {
                             session,
@@ -421,9 +465,9 @@ impl Controller {
             .iter()
             .find(|(s, _)| s == subject)
             .map_or(self.config.quotas.default, |(_, q)| *q);
-        if sessions.values().filter(|s| s.subject == subject).count() >= quota.max_sessions as usize
-        {
-            return Ok(Created::refused(Failure::Quota));
+        let sessions_in_use = sessions.values().filter(|s| s.subject == subject).count();
+        if sessions_in_use >= quota.max_sessions as usize {
+            return Ok(Created::quota(sessions_in_use, quota.max_sessions));
         }
         let body = SessionBody {
             session_id: uuid::Uuid::now_v7().to_string(),
@@ -467,6 +511,106 @@ impl Controller {
         }, "session started");
         Ok(Created::new(body))
     }
+    pub(crate) fn list(&self, subject: &str) -> Vec<ListedSession> {
+        let mut listed: Vec<_> = self
+            .sessions
+            .lock()
+            .expect("session registry poisoned")
+            .values()
+            .filter(|s| s.subject == subject)
+            .map(|s| ListedSession {
+                session_id: s.body.session_id.clone(),
+                name: s.body.name.clone(),
+                profile: s.body.profile.clone(),
+                state: match (s.retiring, s.body.state) {
+                    (Some(_), _) => ListedState::Down,
+                    (None, SessionState::Pending) => ListedState::Pending,
+                    (None, SessionState::Ready) => ListedState::Ready,
+                },
+                reason: s.retiring,
+            })
+            .collect();
+        listed.sort_by(|a, b| {
+            a.name
+                .cmp(&b.name)
+                .then_with(|| a.session_id.cmp(&b.session_id))
+        });
+        listed
+    }
+
+    pub(crate) async fn close(&self, subject: &str, id: &str) -> Result<(), CloseError> {
+        let matched = {
+            let mut sessions = self.sessions.lock().expect("session registry poisoned");
+            let matched: Vec<_> = sessions
+                .iter_mut()
+                .filter(|(_, s)| s.subject == subject && s.body.session_id == id)
+                .map(|(key, s)| {
+                    s.retiring.get_or_insert(EndReason::Closed);
+                    (key.clone(), s.pod.clone())
+                })
+                .collect();
+            if matched.is_empty() {
+                return Err(CloseError::Unknown);
+            }
+            self.drop_retired_jobs(&sessions);
+            matched
+        };
+
+        let cleanup = async {
+            for (key, pod) in matched {
+                if let Some(pod) = pod
+                    && let Some(current) = self.pods.get_opt(&pod).await?
+                {
+                    self.remember_pod_end(&key, Some(&current));
+                    delete_pod(&self.pods, &pod, Some(CLOSE_GRACE_SECONDS)).await?;
+                    while self.pods.get_opt(&pod).await?.is_some() {
+                        tokio::time::sleep(CLOSE_POLL).await;
+                    }
+                }
+                self.finish_retired(&key, now());
+            }
+            Ok::<(), kube::Error>(())
+        };
+        match tokio::time::timeout(CLOSE_TIMEOUT, cleanup).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => {
+                tracing::warn!(name: "vm_runner.close.failed", target: crate::config::Category::VmLifecycle.target(), {
+                    telemetry.detail = crate::telemetry::detail!(crate::config::Category::VmLifecycle),
+                    vm_runner.session_id = %id,
+                    %error,
+                }, "pod cleanup failed; retrying next tick");
+                Err(CloseError::Upstream)
+            }
+            Err(_) => Err(CloseError::Timeout),
+        }
+    }
+
+    fn remember_pod_end(&self, key: &str, pod: Option<&Pod>) {
+        if let Some(stored) = self
+            .sessions
+            .lock()
+            .expect("session registry poisoned")
+            .get_mut(key)
+            .filter(|s| !s.pod_read)
+        {
+            if let Some(pod) = pod {
+                stored.pod_end = PodEnd::from_pod(pod);
+            }
+            stored.pod_read = true;
+        }
+    }
+
+    fn finish_retired(&self, key: &str, at: u64) {
+        let ended = remove_retired(
+            &mut self.sessions.lock().expect("session registry poisoned"),
+            key,
+            at,
+        );
+        if let Some(ended) = ended {
+            ended.emit();
+        }
+    }
+
     pub(crate) fn health(&self) {
         let count = self
             .sessions
@@ -528,6 +672,8 @@ impl Controller {
                     } else {
                         ReapAttempt::First
                     },
+                    grace: matches!(s.retiring, Some(EndReason::Closed))
+                        .then_some(CLOSE_GRACE_SECONDS),
                 })
             })
             .collect();
@@ -540,6 +686,7 @@ impl Controller {
             session_id,
             pod,
             attempt,
+            grace,
         } in self.retiring_sessions(now)
         {
             let result = async {
@@ -551,18 +698,8 @@ impl Controller {
                     Err(_) if matches!(attempt, ReapAttempt::First) => None,
                     Err(error) => return Err(error),
                 };
-                if matches!(attempt, ReapAttempt::First)
-                    && let Some(stored) = self
-                        .sessions
-                        .lock()
-                        .expect("session registry poisoned")
-                        .get_mut(&key)
-                        .filter(|s| !s.pod_read)
-                {
-                    if let Some(current) = &current {
-                        stored.pod_end = PodEnd::from_pod(current);
-                    }
-                    stored.pod_read = true;
+                if matches!(attempt, ReapAttempt::First) {
+                    self.remember_pod_end(&key, current.as_ref());
                 }
                 if let Some(current) = current {
                     if matches!(attempt, ReapAttempt::Retry)
@@ -573,20 +710,11 @@ impl Controller {
                 } else if matches!(attempt, ReapAttempt::Retry) {
                     return Ok(true);
                 }
-                delete_pod(&self.pods, &pod).await
+                delete_pod(&self.pods, &pod, grace).await
             }
             .await;
             match result {
-                Ok(true) => {
-                    let ended = remove_retired(
-                        &mut self.sessions.lock().expect("session registry poisoned"),
-                        &key,
-                        now,
-                    );
-                    if let Some(ended) = ended {
-                        ended.emit();
-                    }
-                }
+                Ok(true) => self.finish_retired(&key, now),
                 Ok(false) => {}
                 Err(error) => {
                     tracing::warn!(name: "vm_runner.reap.failed", target: crate::config::Category::VmLifecycle.target(), {
@@ -599,8 +727,12 @@ impl Controller {
         }
     }
 }
-async fn delete_pod(pods: &Api<Pod>, name: &str) -> Result<bool, kube::Error> {
-    match pods.delete(name, &DeleteParams::default()).await {
+async fn delete_pod(pods: &Api<Pod>, name: &str, grace: Option<u32>) -> Result<bool, kube::Error> {
+    let params = DeleteParams {
+        grace_period_seconds: grace,
+        ..DeleteParams::default()
+    };
+    match pods.delete(name, &params).await {
         // A successful DELETE only starts termination; quota is held until GET returns 404.
         Ok(_) => Ok(false),
         Err(kube::Error::Api(error)) if error.code == 404 => Ok(true),

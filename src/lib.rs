@@ -18,6 +18,7 @@ use opentelemetry::{propagation::TextMapPropagator, trace::TraceContextExt};
 use poem::{Endpoint, EndpointExt, IntoResponse, Request};
 use poem_openapi::{
     ApiResponse, Object, OpenApi, OpenApiService,
+    param::Path,
     payload::{Json, PlainText},
 };
 use request_rollups::{Origin, RequestRollups};
@@ -40,6 +41,41 @@ enum Whoami {
     Ok(Json<Identity>),
     #[oai(status = 401)]
     Unauthorized(Json<Refusal>),
+}
+#[derive(ApiResponse)]
+enum ListSessions {
+    #[oai(status = 200)]
+    Ok(Json<Vec<controller::ListedSession>>),
+    #[oai(status = 401)]
+    Unauthorized(Json<Refusal>),
+    #[oai(status = 503)]
+    Unavailable(PlainText<&'static str>),
+}
+#[derive(Object)]
+struct CloseRefusal {
+    error: CloseCode,
+}
+#[derive(poem_openapi::Enum)]
+#[oai(rename_all = "snake_case")]
+enum CloseCode {
+    UnknownSession,
+    SessionDeleteFailed,
+    SessionDeleteTimeout,
+}
+#[derive(ApiResponse)]
+enum DeleteSession {
+    #[oai(status = 204)]
+    Gone,
+    #[oai(status = 401)]
+    Unauthorized(Json<Refusal>),
+    #[oai(status = 404)]
+    Unknown(Json<CloseRefusal>),
+    #[oai(status = 502)]
+    Upstream(Json<CloseRefusal>),
+    #[oai(status = 503)]
+    Unavailable(PlainText<&'static str>),
+    #[oai(status = 504)]
+    Timeout(Json<CloseRefusal>),
 }
 struct Api;
 #[derive(Clone)]
@@ -70,6 +106,48 @@ impl Api {
         tracing::info_span!(target: crate::config::Category::VmLifecycle.target(), "vm_runner.session.create",
             telemetry.detail = telemetry::detail!(crate::config::Category::VmLifecycle))
         .in_scope(|| controller.create(&subject, body.0))
+    }
+    #[oai(path = "/v1/sessions", method = "get")]
+    async fn list_sessions(
+        &self,
+        request: &Request,
+        state: poem::web::Data<&std::sync::Arc<State>>,
+    ) -> ListSessions {
+        let subject = match state.authenticate(request).await {
+            Ok(subject) => subject,
+            Err(refusal) => return ListSessions::Unauthorized(Json(refusal)),
+        };
+        match &state.controller {
+            Some(controller) => ListSessions::Ok(Json(controller.list(&subject))),
+            None => ListSessions::Unavailable(PlainText("jails are not configured")),
+        }
+    }
+    #[oai(path = "/v1/sessions/:id", method = "delete")]
+    async fn delete_session(
+        &self,
+        request: &Request,
+        state: poem::web::Data<&std::sync::Arc<State>>,
+        id: Path<String>,
+    ) -> DeleteSession {
+        let subject = match state.authenticate(request).await {
+            Ok(subject) => subject,
+            Err(refusal) => return DeleteSession::Unauthorized(Json(refusal)),
+        };
+        let Some(controller) = &state.controller else {
+            return DeleteSession::Unavailable(PlainText("jails are not configured"));
+        };
+        match controller.close(&subject, &id.0).await {
+            Ok(()) => DeleteSession::Gone,
+            Err(controller::CloseError::Unknown) => DeleteSession::Unknown(Json(CloseRefusal {
+                error: CloseCode::UnknownSession,
+            })),
+            Err(controller::CloseError::Upstream) => DeleteSession::Upstream(Json(CloseRefusal {
+                error: CloseCode::SessionDeleteFailed,
+            })),
+            Err(controller::CloseError::Timeout) => DeleteSession::Timeout(Json(CloseRefusal {
+                error: CloseCode::SessionDeleteTimeout,
+            })),
+        }
     }
     #[oai(path = "/v1/whoami", method = "get")]
     async fn whoami(

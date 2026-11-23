@@ -258,7 +258,7 @@ impl Controller {
                     stored.pod_end = PodEnd::from_pod(&pod);
                     stored.pod_read = true;
                 }
-                if !registered || delete_pod(&self.pods, &name).await? {
+                if !registered || delete_pod(&self.pods, &name, None).await? {
                     let ended = {
                         let mut sessions = self.sessions.lock().expect("session registry poisoned");
                         remove_retired(&mut sessions, key, now())

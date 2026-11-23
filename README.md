@@ -64,7 +64,16 @@ Both lifetimes must be at least 60 seconds. Terminating pods still consume quota
 Kubernetes confirms they are gone, but never satisfy create-or-get. Kubernetes cleanup
 errors are logged and retried without blocking API admission; connect/read timeouts are
 5/15 seconds.
-No DELETE route is exposed. Without `jails`, session requests return 503.
+`GET /v1/sessions` lists the authenticated subject's reservations as
+`{sessionId, name, profile, state}`, with a `reason` for a `down` session.
+A quota refusal includes `sessionsInUse` and `maxSessions`.
+`DELETE /v1/sessions/{id}` closes an owned session with a one-second pod grace
+period and returns 204 once Kubernetes confirms the pod is gone. A reserved
+session without a pod closes immediately. Missing or foreign IDs return 404
+`unknown_session`. Kubernetes request failures return 502 `session_delete_failed`.
+If cleanup exceeds 20 seconds, the API returns 504 `session_delete_timeout`.
+The reaper retries cleanup after either error. Without `jails`, session requests
+return 503.
 
 Configure `jails` for both controller and jail roles; `controllerSubject` is required and
 names the controller's service account, not a C4 caller from `auth.subjects`:
@@ -269,8 +278,7 @@ tokens (including retries/tool output), task correctness against the same predef
 answer rubric, end-to-end wall time, failures, and peak CPU/RSS/scratch usage from
 available resource measurements (mark unavailable values, do not infer them from
 image size). Include model, image digest, Chromium version, shape and repetitions.
-Do not reuse either session for another arm/task: close tools and let these isolated
-jails expire under their configured lifetime (there is no session DELETE API).
+Close each isolated session with `DELETE /v1/sessions/{id}` after its arm or task.
 No evaluation campaign, deployment or release is performed by this change.
 
 ## Release builds

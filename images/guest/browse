@@ -11,10 +11,13 @@ const PROFILE = process.env.BROWSE_PROFILE || `${process.env.HOME || '/home/jail
 const ARTIFACTS = process.env.BROWSE_ARTIFACTS || '/artifacts';
 const MAX_OUT = Number(process.env.BROWSE_MAX_CHARS || 6000);
 const STATE = `${PROFILE}.state.json`;
+const TABS = `${STATE}.tabs`;
+const TAB_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$/;
 
 const HELP = `browse: a browser that stays open for the life of the jail.
 
-browse open URL            go to URL (new tab with --tab)
+browse [--tab NAME] open URL  go to URL in the selected page
+browse open --tab URL      open a new unnamed tab and select it for unqualified calls
 browse snapshot            URL, title and the accessibility tree (roles and names)
 browse click ROLE NAME     click by role and accessible name, e.g. click button "Search"
 browse click --text TEXT   click the first element showing TEXT
@@ -25,10 +28,13 @@ browse eval JS             evaluate an expression in the page and print the JSON
 browse wait MS             wait MS milliseconds (at most 20000)
 browse shot NAME           screenshot to /artifacts/NAME; adds .png unless .png/.jpg/.jpeg (case-insensitive)
 browse record NAME [--seconds N]  video of the current tab; 1–30 seconds (default 10)
-browse tabs | tab N        list tabs, or switch to tab N
+browse tabs | tab N        list numbered and named tabs, or switch the unqualified selection to tab N
 browse reset               stop the browser and delete its profile (cookies, tabs); the next call starts clean
 
-With no arguments, commands are read from stdin, one per line (quote arguments with
+Use browse --tab NAME COMMAND to select or create a named page in the shared browser
+context. NAME is 1–63 letters, digits, dots, underscores or hyphens and starts with
+a letter or digit. Use open --tab URL, tab N and reset without a named selection.
+With no command, commands are read from stdin, one per line (quote arguments with
 spaces), and run in order in one call. Output is capped at ${MAX_OUT} characters per command.
 Page loads are bounded so single commands finish well inside a 25 s exec; a load that times
 out still reports the page as it stands. Long batches may outlive the exec: poll the job.
@@ -108,6 +114,39 @@ async function targetId(page) {
   } finally {
     await session.detach().catch(() => {});
   }
+}
+
+async function pageForTarget(pages, target) {
+  if (target) {
+    for (const page of pages) {
+      if (await targetId(page).catch(() => null) === target) return page;
+    }
+  }
+  return null;
+}
+
+function readTab(name) {
+  try {
+    return fs.readFileSync(`${TABS}/${name}`, 'utf8');
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+    return null;
+  }
+}
+
+function tabNames() {
+  const names = fs.existsSync(TABS) ? fs.readdirSync(TABS).filter((name) => TAB_NAME.test(name)) : [];
+  return new Map(names.map((name) => [readTab(name), name]));
+}
+
+async function newNamedPage(context, name) {
+  const page = await context.newPage();
+  const id = await targetId(page);
+  fs.mkdirSync(TABS, { recursive: true });
+  const temporary = `${TABS}/.${name}.${process.pid}`;
+  fs.writeFileSync(temporary, id);
+  fs.renameSync(temporary, `${TABS}/${name}`);
+  return page;
 }
 
 async function select(state, page) {
@@ -217,9 +256,13 @@ async function run(state, argv) {
         });
       });
     }
-    case 'tabs':
-      return (await Promise.all(state.context.pages().map(async (p, i) =>
-        `${i}${p === page ? '*' : ' '} ${p.url()} ${await p.title().catch(() => '')}`))).join('\n');
+    case 'tabs': {
+      const names = tabNames();
+      return (await Promise.all(state.context.pages().map(async (p, i) => {
+        const name = names.get(await targetId(p).catch(() => null));
+        return `${i}${p === page ? '*' : ' '} ${name ? `[${name}] ` : ''}${p.url()} ${await p.title().catch(() => '')}`;
+      }))).join('\n');
+    }
     case 'tab': {
       const next = state.context.pages()[Number(args[0])];
       if (!next) throw new Error(`no tab ${args[0]}`);
@@ -234,8 +277,14 @@ async function run(state, argv) {
 
 async function main() {
   const argv = process.argv.slice(2);
+  let name;
+  if (argv[0] === '--tab') {
+    argv.shift();
+    name = argv.shift();
+    if (!name || !TAB_NAME.test(name)) throw new Error('invalid tab name; try browse --help');
+  }
   if (argv[0] === '-h' || argv[0] === '--help') return process.stdout.write(HELP);
-  if (argv[0] === 'reset') {
+  if (!name && argv[0] === 'reset') {
     const { pid } = readState();
     if (await alive()) {
       await chromium.connectOverCDP(ENDPOINT, { timeout: 5000 })
@@ -251,6 +300,7 @@ async function main() {
     }
     fs.rmSync(PROFILE, { recursive: true, force: true });
     fs.rmSync(STATE, { force: true });
+    fs.rmSync(TABS, { recursive: true, force: true });
     return console.log('browser stopped and profile deleted');
   }
   const batch = argv.length ? [argv] : fs.readFileSync(0, 'utf8').split('\n').map(words).filter((w) => w.length);
@@ -259,17 +309,31 @@ async function main() {
   const browser = await chromium.connectOverCDP(ENDPOINT, { timeout: 10000 });
   const context = browser.contexts()[0];
   const pages = context.pages();
-  const { target } = readState();
-  let current = null;
-  for (const page of target ? pages : []) {
-    if ((await targetId(page).catch(() => null)) === target) current = page;
+  const current = await pageForTarget(pages, name ? readTab(name) : readState().target);
+  const state = { context, page: current };
+  if (!current && name) {
+    state.page = await newNamedPage(context, name);
+  } else if (!current) {
+    const names = tabNames();
+    for (const page of pages.toReversed()) {
+      if (!names.has(await targetId(page).catch(() => null))) {
+        state.page = page;
+        break;
+      }
+    }
+    await select(state, state.page || await context.newPage());
   }
-  const state = { context, page: current || pages[pages.length - 1] || (await context.newPage()) };
-  if (!current) await select(state, state.page);
   let failed = false;
   for (const command of batch) {
     if (batch.length > 1) console.log(`$ ${command.map((w) => (/\s/.test(w) ? JSON.stringify(w) : w)).join(' ')}`);
     try {
+      const [verb, arg] = command;
+      if (name && verb === 'open' && arg === '--tab') {
+        throw new Error('use browse --tab NAME open URL for a named tab or browse open --tab URL for an unnamed tab');
+      }
+      if (name && (verb === 'tab' || verb === 'reset')) {
+        throw new Error(`use ${verb} without browse --tab NAME`);
+      }
       console.log(cap(await run(state, command)));
     } catch (error) {
       console.log(`error: ${String(error.message || error).split('\n')[0]}`);

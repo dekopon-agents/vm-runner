@@ -4,6 +4,17 @@ set -eu
 codex_version=$(codex --version)
 printf '%s\n' "$codex_version"
 [ "$codex_version" = 'codex-cli 0.171.0' ]
+claude_version=$(claude --version)
+printf '%s\n' "$claude_version"
+[ "$claude_version" = '2.1.330 (Claude Code)' ]
+bash -euc '
+    exec() {
+        [ "$(printenv DISABLE_AUTOUPDATER)" = 1 ]
+        [ "$(printenv CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC)" = 1 ]
+        builtin exec "$@"
+    }
+    . /usr/local/bin/claude
+' claude --version >/dev/null
 uv --version | grep -Ex 'uv 0\.12\.21( \([^)]*\))?'
 [ "$(pi --version)" = 1.2.0 ]
 node /opt/pi/sse-smoke.cjs /opt/pi/node_modules/openai/core/streaming.js /home/jail/.pi-proxy/response.sse

@@ -201,6 +201,9 @@ build-time offline smoke checks and image verification.
 ## Guest browser tools
 
 The guest keeps its existing Playwright-backed custom `browse` CLI as the default.
+Its navigations use the shared desktop identity in `/opt/playwright/browser.cjs`;
+attached Node scripts call `configurePage(page)` from that module before navigating.
+See [the guest browser defaults](images/guest/README.md) for attachment lifetime and site overrides.
 It does **not** install Microsoft's `playwright-cli`. Alongside it, `agent-browser`
 0.38.1 uses the checksum-pinned upstream Linux native binary (the same release asset
 selected by that npm version's postinstall), on both amd64 and arm64. Both tools use

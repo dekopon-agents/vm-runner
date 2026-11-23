@@ -43,6 +43,18 @@ tabs, cookies and page state carry across execs. Playwright scripts can attach w
 `browse shot NAME` appends `.png` unless NAME ends in `.png`, `.jpg` or `.jpeg`
 (case-insensitive); the final file name must fit 128 characters.
 
+Before each `browse open` navigation, the CLI applies a desktop User-Agent without
+`HeadlessChrome` and client hints derived from the installed Chromium version.
+Node scripts share the same defaults with
+`const { configurePage } = require('/opt/playwright/browser.cjs')`: await
+`configurePage(page)` before navigating each new page. The returned CDP session
+is retained for that script's lifetime; do not detach it before navigation or
+extraction finishes. Overrides are scoped to the live attachment, not a persistent
+browser policy. A site recipe can apply an explicit identity after the default.
+This keeps Linux identity and software graphics; it adds no stealth package and
+does not change grants, egress or TLS verification. These defaults normalize page identity; site access still depends on the
+browser launch, session, network and site policy. They do not guarantee content access.
+
 The Guest image workflow builds both architectures on PRs without publishing. Its
 `KVM PR guest` job boots the amd64 artifact (not the released digest) against a
 local fake; if hosted `/dev/kvm` is absent the job fails rather than proving a
@@ -51,6 +63,43 @@ An owner-pushed annotated `guest-v*` tag on main additionally publishes
 `ghcr.io/dekopon-agents/vm-runner-guest:v*`. Each platform manifest has two
 annotated layers (zstd ext4 and kernel); the OCI index advertises both platforms
 and is provenance-attested. Profiles must use its digest, not its tag.
+
+## Compatibility evidence and validation boundary
+
+A headed macOS browser completed a Discord sign-in and an application-page reload
+on 2026-11-21 with its existing launch configuration: Chrome 158.0.8127.37,
+playwright-cli 0.1.24, `--enable-automation` omitted and
+`--disable-blink-features=AutomationControlled` supplied. No configuration change
+or CAPTCHA was needed on that successful attempt. This is neither a controlled
+attribution to those flags nor Linux, guest-proxy or restart-persistence proof.
+Do not copy macOS keychain settings or a signed-in desktop profile into a guest.
+
+The reusable layer is browser lifecycle plus platform-appropriate launch/page
+configuration. `configurePage` applies only to its live page attachment; raw
+Chromium and agent-browser clients do not inherit it as a persistent global
+policy. Site-specific exceptions should follow the common setup, not duplicate it.
+A startup-policy change needs its own tests rather than copying desktop flags and
+assuming a headless guest will be accepted.
+
+Before calling a configuration VM-validated:
+
+- Build and boot the candidate guest artifact in the existing dual-architecture
+  and PR KVM gates. Verify upstream HTTP headers against page JavaScript, separate
+  execs, new tabs, retained identity sessions, site overrides and resource bounds.
+- Use an authorized disposable Firecracker session through the actual runner
+  egress proxy and an explicitly authorized origin set. Record the guest digest,
+  architecture, subject/profile, browser version and final rendered evidence.
+  A Mac container or a local fake is not the real-site result.
+- Compare baseline, page helper and proposed launch changes in fresh sessions.
+  Repeat successful public-content reads across two sessions and two threads;
+  preserve DNS/egress failures, security blocks, CAPTCHA and partial renders.
+- Treat authenticated browsing as a separate credential and persistence design.
+  The guest currently holds no credential and loses its profile at jail expiry.
+  Do not import desktop passwords, cookies, tokens or keychain material. A human
+  verification requirement needs an owner interaction path, not a CAPTCHA solver.
+- Publish only an owner-authorized version, then review the deployment digest
+  change and verify a new authorized test session. Source, image publication,
+  deployed pin and successful site access are different claims.
 
 ## Small offline toolkit
 

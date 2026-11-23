@@ -73,6 +73,7 @@ COPY --chmod=0755 vm-guest-agent /usr/local/bin/vm-guest-agent
 COPY --chmod=0755 vm-init /sbin/vm-init
 COPY --chmod=0755 browse /usr/local/bin/browse
 COPY --chmod=0755 record-cdp /usr/local/bin/record-cdp
+COPY browser.cjs /opt/playwright/browser.cjs
 COPY browser-smoke.cjs /tmp/browser-smoke.cjs
 # Match the guest agent's cleared environment and identity, not Docker ENV defaults.
 RUN install -d -o 1000 -g 1000 -m 0700 /scratch/recordings \

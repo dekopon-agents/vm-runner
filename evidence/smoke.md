@@ -63,8 +63,8 @@ on the CI jobs.
 
 ## Named browser pages and session close
 
-On 2026-11-22 at 19:15 UTC, the smoke passed in 14.56 seconds at source commit
-`3f1889614f7eb3abb645a692a624500fc2df9ef4`. It ran with vm-runner 0.6.0,
+At 2026-11-23T03:34:39Z, the smoke passed in 8.34 seconds at source commit
+`34675776b8d66172563c4fec9e89604aab478f2b`. It ran with vm-runner 0.6.0,
 Rust 1.98.1, Node 24.21.0, Playwright 1.63.0 and Chromium 154.0.8037.57 on
 amd64 Linux. `$browse_smoke` is an executable wrapper for this checkout's
 `images/guest/browse` that sets `BROWSE_PLAYWRIGHT` and `BROWSE_CHROMIUM` for

@@ -69,6 +69,18 @@ RUN case "$TARGETARCH" in \
     && tar -xzf /tmp/codex.tar.gz -C /tmp "$codex_asset" \
     && install -m 0755 "/tmp/$codex_asset" /usr/local/bin/codex \
     && rm /tmp/codex.tar.gz "/tmp/$codex_asset"
+RUN case "$TARGETARCH" in \
+      amd64) claude_arch=x64; sha=40ff30c5768723958032132065e6fcdd1e2dc3a2b3ff9a0bf36c6620ef1c40ef ;; \
+      arm64) claude_arch=arm64; sha=5460d42c696670f4fd2a7ec619719edda14a576b28ee3c289b348ade96efbf6d ;; \
+      *) exit 2 ;; \
+    esac \
+    && claude_package="claude-code-linux-$claude_arch" \
+    && curl -fSL "https://registry.npmjs.org/@anthropic-ai/$claude_package/-/$claude_package-2.1.330.tgz" -o /tmp/claude.tgz \
+    && printf '%s  /tmp/claude.tgz\n' "$sha" | sha256sum --check \
+    && tar -xzf /tmp/claude.tgz -C /tmp package/claude \
+    && install -m 0755 /tmp/package/claude /usr/local/bin/claude-native \
+    && rm /tmp/claude.tgz /tmp/package/claude && rmdir /tmp/package
+COPY --chmod=0755 claude-wrapper /usr/local/bin/claude
 COPY --chmod=0755 vm-guest-agent /usr/local/bin/vm-guest-agent
 COPY --chmod=0755 vm-init /sbin/vm-init
 COPY --chmod=0755 browse /usr/local/bin/browse

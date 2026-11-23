@@ -30,7 +30,8 @@ trap cleanup EXIT
 mkdir "$work/context" "$work/root"
 cp "$source_dir/Dockerfile" "$source_dir/vm-init" "$source_dir/browse" \
     "$source_dir/agent-browser" "$source_dir/browser-smoke.cjs" "$source_dir/record-cdp" \
-    "$source_dir/uv" "$source_dir/pi-wrapper" "$source_dir/toolkit-smoke.sh" "$work/context/"
+    "$source_dir/uv" "$source_dir/pi-wrapper" "$source_dir/claude-wrapper" \
+    "$source_dir/toolkit-smoke.sh" "$work/context/"
 cp -R "$source_dir/pi" "$work/context/pi"
 cp "$1" "$work/context/vm-guest-agent"
 docker buildx build --platform "linux/$arch" --load --tag "$image" "$work/context"

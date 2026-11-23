@@ -74,11 +74,19 @@ Linux musl release archives, with SHA-256 pins for amd64 and arm64. The jail
 starts with an empty `~/.codex` directory. Network access follows the existing
 egress policy.
 
+The guest ships Claude Code 2.1.330 from Anthropic's official Linux glibc npm
+archives, with SHA-256 pins for amd64 and arm64. `/usr/local/bin/claude` sets
+`DISABLE_AUTOUPDATER=1` and `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`
+when launching the binary, including when the guest agent clears the exec
+environment. The launcher supplies the gateway base URL and a placeholder token
+at runtime. The image contains no Claude login state or credentials.
+[Claude Code environment variables](https://code.claude.com/docs/en/env-vars)
+
 An offline build-time smoke runs as uid 1000 with cleared environment and no
-network. It checks `codex --version`, runs Python, creates a writable uv venv
-without pip using the baked interpreter, installs/imports a tiny local wheel via
-`uv --offline pip install` into the discovered `.venv`, checks jq/rg and a
-zip/unzip roundtrip, and extracts
+network. It checks `codex --version`, `claude --version` and both Claude environment
+switches, runs Python, creates a writable uv venv without pip using the baked
+interpreter, installs/imports a tiny local wheel via `uv --offline pip install`
+into the discovered `.venv`, checks jq/rg and a zip/unzip roundtrip, and extracts
 text/metadata from a tiny generated PDF. Fixtures, the venv and its cache are removed.
 `verify.sh` checks these shipped executables in ext4, including Python's symlink
 target. Dual-arch guest CI is the full image gate.

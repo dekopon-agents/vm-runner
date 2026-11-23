@@ -83,3 +83,51 @@ own navigation. The jail received each command once at `/exec`, with no
 guest-supplied identity headers. The session DELETE returned 204 after the
 Kubernetes test fixture reported the pod absent, and the next list was empty.
 The hosted KVM gate exercises the Firecracker and vsock path.
+
+## Claude Code guest toolkit smoke
+
+The amd64 offline build smoke passed at source commit
+`ed25753d6737cb1873430b7d39742a69ba85ccb9` with Docker 28.4.0,
+Buildx 0.31.0 and Claude Code 2.1.330. The focused image ID was
+`sha256:f78f2b9903da5d73ec709e3f5dc1ead6dda6b73e2ebcbc18132f08c9a73c0bb3`.
+The Dockerfile verified the amd64 archive before extraction. Separate downloads
+of both architectures matched the npm registry's SHA-512 integrity values and
+the Dockerfile's SHA-256 pins.
+
+The temporary `Dockerfile.toolkit` used the guest context with ordinary CI
+file permissions. It mounted the Cloud proxy CA for downloads and omitted
+the Playwright, browser smoke and guest-agent steps. Its install and
+`RUN --network=none` toolkit smoke used the committed wrapper and script.
+
+```sh
+docker buildx build --platform linux/amd64 --load --progress plain \
+  --secret id=proxy_ca,src=/etc/ssl/certs/ca-certificates.crt \
+  -f "$context/Dockerfile.toolkit" -t "$image" "$context"
+docker run --rm --network=none --user 1000:1000 --workdir /home/jail \
+  --entrypoint /usr/bin/env "$image" -i HOME=/home/jail \
+  PATH=/usr/local/bin:/usr/bin:/bin sh -ec '
+    version=$(claude --version)
+    test "$version" = "2.1.330 (Claude Code)"
+    printf "%s\n" "$version"
+    cat /sys/fs/cgroup/memory.peak
+  '
+docker run --rm --network=none --user 1000:1000 --workdir /home/jail \
+  --mount "type=bind,src=$context/toolkit-smoke.sh,dst=/tmp/toolkit-smoke.sh,readonly" \
+  --mount "type=bind,src=$context/pi/sse-smoke.cjs,dst=/opt/pi/sse-smoke.cjs,readonly" \
+  --mount "type=bind,src=$context/pi/response.sse,dst=/home/jail/.pi-proxy/response.sse,readonly" \
+  --entrypoint /usr/bin/env "$image" -i HOME=/home/jail \
+  PATH=/usr/local/bin:/usr/bin:/bin sh -ec '
+    sh /tmp/toolkit-smoke.sh
+    cat /sys/fs/cgroup/memory.peak
+  '
+```
+
+Both replays passed by 2026-11-23T11:48:51Z. The standalone command printed
+`2.1.330 (Claude Code)` and its container peaked at 7,438,336 bytes (7.09 MiB).
+The toolkit replay checked both exported switches and peaked at 83,722,240
+bytes (79.84 MiB). These are container measurements for offline startup and
+toolkit validation. Probe G measures the real model run for the jail shape.
+
+The Cloud proxy returned HTTP 403 for the pinned Playwright Chromium
+download from `cdn.playwright.dev`. The hosted Guest jobs build and verify
+the full rootfs and the hosted KVM PR guest job boots it.

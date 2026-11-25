@@ -666,9 +666,9 @@ impl Engine {
         req: Request<Incoming>,
         tunnel: Option<&Tunnel>,
         next: &Mutex<Option<Next>>,
-        recorded: &Cell<bool>,
+        record: &ConnectionRecord,
     ) -> Result<Response<HttpBody>, Infallible> {
-        recorded.set(true);
+        record.request.set(true);
         let header_host = req
             .headers()
             .get(header::HOST)
@@ -800,6 +800,7 @@ impl Engine {
                 sent: 0,
                 received: 0,
             }));
+            record.spliced.set(true);
             return Ok(response);
         }
         let (parts, body) = response.into_parts();
@@ -872,8 +873,7 @@ impl Engine {
                 Err(error) => return Err(error),
             };
             let next = Mutex::new(None);
-            let service =
-                service_fn(|req| self.request(req, tunnel.as_ref(), &next, &record.request));
+            let service = service_fn(|req| self.request(req, tunnel.as_ref(), &next, record));
             let parts = hyper::server::conn::http1::Builder::new()
                 .serve_connection(TokioIo::new(stream), service)
                 .without_shutdown()
@@ -900,7 +900,6 @@ impl Engine {
             {
                 Some(Next::Tunnel(next)) => next,
                 Some(Next::Splice(mut upstream)) => {
-                    record.spliced = true;
                     #[expect(
                         clippy::let_underscore_must_use,
                         reason = "a socket ending after the 101 is the exchange's normal ending; Spliced records it on drop"
@@ -955,7 +954,7 @@ impl Engine {
             } => result,
         };
         match result {
-            Err(error) if record.spliced && error.is::<ConnectionTimeout>() => Ok(()),
+            Err(error) if record.spliced.get() && error.is::<ConnectionTimeout>() => Ok(()),
             result => result,
         }
     }
@@ -1231,7 +1230,7 @@ struct ConnectionRecord {
     host: Option<String>,
     // HTTP/1 requests and this connection's classifier are driven by one worker.
     request: Cell<bool>,
-    spliced: bool,
+    spliced: Cell<bool>,
 }
 impl ConnectionRecord {
     fn failed(&self, rollups: &Arc<Mutex<Rollups>>) {

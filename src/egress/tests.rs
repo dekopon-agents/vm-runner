@@ -2119,8 +2119,13 @@ async fn active_spliced_socket_ends_as_one_upgraded_exchange_at_its_maximum_life
     egress.max_connection_seconds = 180.try_into().unwrap();
     spliced_socket_ends_on_timeout(egress, listener, &[80, 80], 0, 20).await;
 }
-struct ResetOnWrite(tokio::io::DuplexStream);
-impl AsyncRead for ResetOnWrite {
+#[derive(Clone, Copy)]
+enum WriteFault {
+    Reset,
+    Stall,
+}
+struct BrokenGuest(tokio::io::DuplexStream, WriteFault);
+impl AsyncRead for BrokenGuest {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -2129,13 +2134,16 @@ impl AsyncRead for ResetOnWrite {
         Pin::new(&mut self.0).poll_read(cx, buf)
     }
 }
-impl AsyncWrite for ResetOnWrite {
+impl AsyncWrite for BrokenGuest {
     fn poll_write(
         self: Pin<&mut Self>,
         _: &mut Context<'_>,
         _: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        Poll::Ready(Err(std::io::ErrorKind::ConnectionReset.into()))
+        match self.1 {
+            WriteFault::Reset => Poll::Ready(Err(std::io::ErrorKind::ConnectionReset.into())),
+            WriteFault::Stall => Poll::Pending,
+        }
     }
     fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Poll::Ready(Ok(()))
@@ -2165,7 +2173,7 @@ async fn guest_reset_while_the_101_is_written_ends_as_one_quiet_upgraded_exchang
     let mut record = ConnectionRecord::default();
     let (ended, (_, mut upstream)) = tokio::join!(
         engine.bounded_connection(
-            Box::new(ResetOnWrite(stream)),
+            Box::new(BrokenGuest(stream, WriteFault::Reset)),
             &mut record,
             Instant::now(),
             gateway::Protocol::Http,
@@ -2173,6 +2181,46 @@ async fn guest_reset_while_the_101_is_written_ends_as_one_quiet_upgraded_exchang
         accept_upgrade(&listener, None, format!("{SWITCHED}\r\n")),
     );
     ended.unwrap();
+    assert_eq!(upstream.read(&mut [0; 1]).await.unwrap(), 0);
+    capture.assert_one_quiet_upgraded_ending(0);
+}
+#[tokio::test]
+async fn idle_expiry_while_the_101_write_stalls_ends_as_one_quiet_upgraded_exchange() {
+    let capture = SpliceCapture::new();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let engine = splice_engine(local_egress_for_port(port));
+    let (mut client, stream) = tokio::io::duplex(4096);
+    client
+        .write_all(
+            upgrade_request(
+                &format!("http://localhost:{port}/ws"),
+                &format!("localhost:{port}"),
+                "",
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut record = ConnectionRecord::default();
+    let mut connection = Box::pin(engine.bounded_connection(
+        Box::new(BrokenGuest(stream, WriteFault::Stall)),
+        &mut record,
+        Instant::now(),
+        gateway::Protocol::Http,
+    ));
+    let (_, mut upstream) = tokio::select! {
+        ended = connection.as_mut() => panic!("connection ended before the upgrade: {ended:?}"),
+        accepted = accept_upgrade(&listener, None, format!("{SWITCHED}\r\n")) => accepted,
+    };
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), connection.as_mut())
+            .await
+            .is_err()
+    );
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(91)).await;
+    connection.await.unwrap();
     assert_eq!(upstream.read(&mut [0; 1]).await.unwrap(), 0);
     capture.assert_one_quiet_upgraded_ending(0);
 }

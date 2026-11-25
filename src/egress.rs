@@ -622,9 +622,11 @@ impl Engine {
         exchange.phase(Phase::ResponseBody);
         let (mut parts, incoming) = response.into_parts();
         if parts.status == StatusCode::SWITCHING_PROTOCOLS {
-            if matches!(forwarding, Forwarding::Close)
-                || !has_token(&parts.headers, header::UPGRADE, "websocket")
-            {
+            let requested = match forwarding {
+                Forwarding::Upgrade => true,
+                Forwarding::Close => false,
+            };
+            if !requested || !has_token(&parts.headers, header::UPGRADE, "websocket") {
                 return Err(RefusalError.into());
             }
             if !done {
@@ -878,7 +880,15 @@ impl Engine {
                 .await;
             let parts = match parts {
                 Ok(parts) => parts,
-                Err(error) => return Err(error.into()),
+                Err(error) => {
+                    return match next
+                        .into_inner()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    {
+                        Some(Next::Splice(_)) => Ok(()),
+                        Some(Next::Tunnel(_)) | None => Err(error.into()),
+                    };
+                }
             };
             stream = Box::new(Buffered {
                 prefix: parts.read_buf,

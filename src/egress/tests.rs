@@ -1691,10 +1691,10 @@ async fn websocket_handshake_reaches_the_upstream_once_with_its_upgrade_headers_
         .await
         .unwrap();
     let request = upgrade_request(
-        "/p32/ws/user/u1?ws=1",
+        "/socket/u1?ws=1",
         &format!("localhost:{port}"),
         &format!(
-            "Sec-WebSocket-Extensions: permessage-deflate; client_max_window_bits\r\nSec-WebSocket-Protocol: json\r\nOrigin: https://chatgpt.com\r\ntraceparent: 00-11111111111111111111111111111111-2222222222222222-01\r\nProxy-Authorization: placeholder\r\nKeep-Alive: timeout=5\r\n{}: system:serviceaccount:guest:forged\r\n{}: 019955e0-0000-7000-8000-00000000000f\r\n",
+            "Sec-WebSocket-Extensions: permessage-deflate; client_max_window_bits\r\nSec-WebSocket-Protocol: json\r\nOrigin: https://example.com\r\ntraceparent: 00-11111111111111111111111111111111-2222222222222222-01\r\nProxy-Authorization: placeholder\r\nKeep-Alive: timeout=5\r\n{}: system:serviceaccount:guest:forged\r\n{}: 019955e0-0000-7000-8000-00000000000f\r\n",
             models::SUBJECT_HEADER,
             models::SESSION_HEADER,
         ),
@@ -1712,16 +1712,13 @@ async fn websocket_handshake_reaches_the_upstream_once_with_its_upgrade_headers_
             read_head(&mut guest).await
         },
     );
-    assert_eq!(
-        seen.lines().next(),
-        Some("GET /p32/ws/user/u1?ws=1 HTTP/1.1")
-    );
+    assert_eq!(seen.lines().next(), Some("GET /socket/u1?ws=1 HTTP/1.1"));
     let mut seen = header_lines(&seen);
     seen.sort();
     let mut expected = vec![
         "connection: upgrade".to_owned(),
         format!("host: localhost:{port}"),
-        "origin: https://chatgpt.com".to_owned(),
+        "origin: https://example.com".to_owned(),
         "sec-websocket-extensions: permessage-deflate; client_max_window_bits".to_owned(),
         "sec-websocket-key: dghlihnhbxbszsbub25jzq==".to_owned(),
         "sec-websocket-protocol: json".to_owned(),
@@ -1975,6 +1972,82 @@ async fn switching_protocols_to_a_non_websocket_request_or_protocol_is_a_bad_gat
         ));
     }
 }
+struct SpliceCapture {
+    spans: InMemorySpanExporter,
+    span_provider: SdkTracerProvider,
+    logs: InMemoryLogExporter,
+    _log_provider: SdkLoggerProvider,
+    _default: tracing::subscriber::DefaultGuard,
+}
+impl SpliceCapture {
+    fn new() -> Self {
+        let spans = InMemorySpanExporter::default();
+        let span_provider = SdkTracerProvider::builder()
+            .with_simple_exporter(spans.clone())
+            .build();
+        let logs = InMemoryLogExporter::default();
+        let log_provider = SdkLoggerProvider::builder()
+            .with_simple_exporter(logs.clone())
+            .build();
+        let default = tracing::subscriber::set_default(
+            tracing_subscriber::registry()
+                .with(
+                    tracing_opentelemetry::layer()
+                        .with_tracer(span_provider.tracer("splice-ending")),
+                )
+                .with(
+                    opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new(
+                        &log_provider,
+                    ),
+                ),
+        );
+        Self {
+            spans,
+            span_provider,
+            logs,
+            _log_provider: log_provider,
+            _default: default,
+        }
+    }
+    fn assert_one_quiet_upgraded_ending(&self, sent: usize) {
+        self.span_provider.force_flush().unwrap();
+        let requests: Vec<_> = self
+            .spans
+            .get_finished_spans()
+            .unwrap()
+            .into_iter()
+            .filter(|span| span.name == "egress.request")
+            .collect();
+        assert_eq!(requests.len(), 1);
+        assert!(attribute(
+            &requests[0],
+            "egress.exchange.outcome",
+            "upgraded"
+        ));
+        assert_eq!(
+            span_attribute(&requests[0], "http.request.body.size"),
+            Some(&i64::try_from(sent).unwrap().into())
+        );
+        let logs = self.logs.get_emitted_logs().unwrap();
+        assert!(logs.iter().all(|log| {
+            log.record.event_name() != Some("egress.exchange.failed")
+                && log
+                    .record
+                    .severity_number()
+                    .is_none_or(|severity| severity < opentelemetry::logs::Severity::Warn)
+        }));
+    }
+}
+fn splice_engine(egress: Egress) -> Engine {
+    Engine {
+        ca: Ca::new().unwrap().0,
+        egress,
+        tls: client_config(RootCertStore::empty()).unwrap(),
+        omit: Default::default(),
+        rollups: Arc::new(Mutex::new(Rollups::new())),
+        models: None,
+    }
+}
 async fn spliced_socket_ends_on_timeout(
     egress: Egress,
     listener: TcpListener,
@@ -1982,32 +2055,9 @@ async fn spliced_socket_ends_on_timeout(
     quiet: u64,
     last: u64,
 ) {
-    let exporter = InMemorySpanExporter::default();
-    let provider = SdkTracerProvider::builder()
-        .with_simple_exporter(exporter.clone())
-        .build();
-    let log_exporter = InMemoryLogExporter::default();
-    let log_provider = SdkLoggerProvider::builder()
-        .with_simple_exporter(log_exporter.clone())
-        .build();
-    let _default = tracing::subscriber::set_default(
-        tracing_subscriber::registry()
-            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("splice-timeout")))
-            .with(
-                opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new(
-                    &log_provider,
-                ),
-            ),
-    );
+    let capture = SpliceCapture::new();
     let port = listener.local_addr().unwrap().port();
-    let engine = Engine {
-        ca: Ca::new().unwrap().0,
-        egress,
-        tls: client_config(RootCertStore::empty()).unwrap(),
-        omit: Default::default(),
-        rollups: Arc::new(Mutex::new(Rollups::new())),
-        models: None,
-    };
+    let engine = splice_engine(egress);
     let (mut client, stream) = tokio::io::duplex(4096);
     let mut record = ConnectionRecord::default();
     let mut connection = Box::pin(engine.bounded_connection(
@@ -2053,31 +2103,7 @@ async fn spliced_socket_ends_on_timeout(
     let mut forwarded = Vec::new();
     upstream.read_to_end(&mut forwarded).await.unwrap();
     assert_eq!(forwarded, vec![b'x'; writes.len()]);
-    provider.force_flush().unwrap();
-    let requests: Vec<_> = exporter
-        .get_finished_spans()
-        .unwrap()
-        .into_iter()
-        .filter(|span| span.name == "egress.request")
-        .collect();
-    assert_eq!(requests.len(), 1);
-    assert!(attribute(
-        &requests[0],
-        "egress.exchange.outcome",
-        "upgraded"
-    ));
-    assert_eq!(
-        span_attribute(&requests[0], "http.request.body.size"),
-        Some(&i64::try_from(writes.len()).unwrap().into())
-    );
-    let logs = log_exporter.get_emitted_logs().unwrap();
-    assert!(logs.iter().all(|log| {
-        log.record.event_name() != Some("egress.exchange.failed")
-            && log
-                .record
-                .severity_number()
-                .is_none_or(|severity| severity < opentelemetry::logs::Severity::Warn)
-    }));
+    capture.assert_one_quiet_upgraded_ending(writes.len());
 }
 #[tokio::test]
 async fn idle_spliced_socket_ends_as_one_upgraded_exchange_after_inactivity() {
@@ -2093,6 +2119,63 @@ async fn active_spliced_socket_ends_as_one_upgraded_exchange_at_its_maximum_life
     egress.max_connection_seconds = 180.try_into().unwrap();
     spliced_socket_ends_on_timeout(egress, listener, &[80, 80], 0, 20).await;
 }
+struct ResetOnWrite(tokio::io::DuplexStream);
+impl AsyncRead for ResetOnWrite {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.0).poll_read(cx, buf)
+    }
+}
+impl AsyncWrite for ResetOnWrite {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+        _: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Poll::Ready(Err(std::io::ErrorKind::ConnectionReset.into()))
+    }
+    fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+#[tokio::test]
+async fn guest_reset_while_the_101_is_written_ends_as_one_quiet_upgraded_exchange() {
+    let capture = SpliceCapture::new();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let engine = splice_engine(local_egress_for_port(port));
+    let (mut client, stream) = tokio::io::duplex(4096);
+    client
+        .write_all(
+            upgrade_request(
+                &format!("http://localhost:{port}/ws"),
+                &format!("localhost:{port}"),
+                "",
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut record = ConnectionRecord::default();
+    let (ended, (_, mut upstream)) = tokio::join!(
+        engine.bounded_connection(
+            Box::new(ResetOnWrite(stream)),
+            &mut record,
+            Instant::now(),
+            gateway::Protocol::Http,
+        ),
+        accept_upgrade(&listener, None, format!("{SWITCHED}\r\n")),
+    );
+    ended.unwrap();
+    assert_eq!(upstream.read(&mut [0; 1]).await.unwrap(), 0);
+    capture.assert_one_quiet_upgraded_ending(0);
+}
 #[tokio::test]
 async fn websocket_handshake_values_reach_the_upstream_but_never_spans_or_logs_at_full_detail() {
     use std::io::{Read, Seek};
@@ -2105,7 +2188,7 @@ async fn websocket_handshake_values_reach_the_upstream_but_never_spans_or_logs_a
     let mut logs = proxy.logs.try_clone().unwrap();
     let mut guest = TcpStream::connect(proxy.addr).await.unwrap();
     let request = upgrade_request(
-        &format!("http://localhost:{port}/p32/ws/user/u1?verify={verify}"),
+        &format!("http://localhost:{port}/socket/u1?verify={verify}"),
         &format!("localhost:{port}"),
         &format!("Sec-WebSocket-Protocol: {offered}, json\r\n"),
     );
@@ -2122,7 +2205,7 @@ async fn websocket_handshake_values_reach_the_upstream_but_never_spans_or_logs_a
     );
     assert_eq!(
         seen.lines().next(),
-        Some(format!("GET /p32/ws/user/u1?verify={verify} HTTP/1.1").as_str())
+        Some(format!("GET /socket/u1?verify={verify} HTTP/1.1").as_str())
     );
     assert!(header_lines(&seen).contains(&format!("sec-websocket-protocol: {offered}, json")));
     assert!(header_lines(&switched).contains(&format!("sec-websocket-protocol: {chosen}")));

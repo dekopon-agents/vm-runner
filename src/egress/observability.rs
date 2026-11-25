@@ -452,8 +452,17 @@ fn record(data: ExchangeData, outcome: Outcome, error: Option<&str>) {
     if let Ok(mut rollups) = data.rollups.lock() {
         rollups.exchange(&data, &outcome);
     }
-    let failed = outcome.failed()
-        || matches!(outcome, Outcome::Completed) && status.is_some_and(|status| status >= 400);
+    let failed = match outcome {
+        Outcome::Completed => status.is_some_and(|status| status >= 400),
+        Outcome::Tunnel
+        | Outcome::Refused(_)
+        | Outcome::UpstreamFailed
+        | Outcome::CertificateRejected
+        | Outcome::ProtocolError
+        | Outcome::BodyError(_)
+        | Outcome::Abandoned(_)
+        | Outcome::Upgraded => outcome.failed(),
+    };
     if failed {
         let error = error.map(cut_text);
         tracing::info!(name: "egress.exchange.failed", target: "egress.exchange", {

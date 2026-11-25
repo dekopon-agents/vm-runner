@@ -1090,6 +1090,7 @@ fn span_attribute_assertions_reject_duplicate_values_of_any_type() {
             Some(80),
             "GET",
             "http://localhost/",
+            &hyper::HeaderMap::new(),
             &[],
             Arc::new(Mutex::new(Rollups::new())),
         );
@@ -1129,6 +1130,7 @@ async fn dropped_refusal_keeps_decision_and_emits_once() {
             Some(80),
             "GET",
             "http://denied.invalid/",
+            &hyper::HeaderMap::new(),
             &[],
             Arc::new(Mutex::new(Rollups::new())),
         );
@@ -1191,6 +1193,7 @@ async fn failed_and_empty_dns_answers_have_distinct_single_refusal_decisions() {
                 Some(80),
                 "GET",
                 "http://allowed.invalid/",
+                &hyper::HeaderMap::new(),
                 &[],
                 Arc::new(Mutex::new(Rollups::new())),
             );
@@ -1251,6 +1254,7 @@ fn worker_unwind_records_one_abandoned_exchange() {
                 Some(80),
                 "GET",
                 "http://localhost/",
+                &hyper::HeaderMap::new(),
                 &[],
                 Arc::new(Mutex::new(Rollups::new())),
             );
@@ -1622,4 +1626,511 @@ async fn an_allowed_host_does_not_authorize_an_unlisted_port() {
         "unlisted port received a request: {received:?}"
     );
     let _spans = proxy.finish().await;
+}
+
+const SWITCHED: &str = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n";
+fn upgrade_request(target: &str, host: &str, extra: &str) -> String {
+    format!(
+        "GET {target} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\nConnection: keep-alive, Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n{extra}\r\n"
+    )
+}
+async fn read_head(stream: &mut (impl AsyncRead + Unpin)) -> String {
+    let mut head = Vec::new();
+    while !head.ends_with(b"\r\n\r\n") {
+        head.push(stream.read_u8().await.unwrap());
+    }
+    String::from_utf8(head).unwrap()
+}
+fn header_lines(head: &str) -> Vec<String> {
+    head.lines().skip(1).map(str::to_ascii_lowercase).collect()
+}
+async fn accept_upgrade(
+    listener: &TcpListener,
+    tls: Option<Arc<ServerConfig>>,
+    reply: impl AsRef<str>,
+) -> (String, Stream) {
+    let (stream, _) = listener.accept().await.unwrap();
+    let mut stream: Stream = match tls {
+        Some(config) => Box::new(TlsAcceptor::from(config).accept(stream).await.unwrap()),
+        None => Box::new(stream),
+    };
+    let head = read_head(&mut stream).await;
+    stream.write_all(reply.as_ref().as_bytes()).await.unwrap();
+    (head, stream)
+}
+async fn assert_no_second_connection(listener: &TcpListener) {
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    std::future::poll_fn(|cx| Poll::Ready(listener.poll_accept(cx).is_pending()))
+        .await
+        .then_some(())
+        .expect("the upstream received a second connection");
+}
+#[tokio::test]
+async fn websocket_handshake_reaches_the_upstream_once_with_its_upgrade_headers_and_no_guest_identity()
+ {
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let server = ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_no_client_auth()
+    .with_single_cert(
+        vec![cert.cert.der().clone()],
+        PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()).into(),
+    )
+    .unwrap();
+    let mut roots = RootCertStore::empty();
+    roots.add(cert.cert.der().clone()).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let proxy = Proxy::configured(roots, local_egress_for_port(port)).await;
+    let tunnel = proxy.tunnel(port).await;
+    let mut guest = TlsConnector::from(Arc::clone(&proxy.tls))
+        .connect(ServerName::try_from("localhost").unwrap(), tunnel)
+        .await
+        .unwrap();
+    let request = upgrade_request(
+        "/p32/ws/user/u1?ws=1",
+        &format!("localhost:{port}"),
+        &format!(
+            "Sec-WebSocket-Extensions: permessage-deflate; client_max_window_bits\r\nSec-WebSocket-Protocol: json\r\nOrigin: https://chatgpt.com\r\ntraceparent: 00-11111111111111111111111111111111-2222222222222222-01\r\nProxy-Authorization: placeholder\r\nKeep-Alive: timeout=5\r\n{}: system:serviceaccount:guest:forged\r\n{}: 019955e0-0000-7000-8000-00000000000f\r\n",
+            models::SUBJECT_HEADER,
+            models::SESSION_HEADER,
+        ),
+    );
+    let ((seen, upstream), switched) = tokio::join!(
+        accept_upgrade(
+            &listener,
+            Some(Arc::new(server)),
+            format!(
+                "{SWITCHED}Sec-WebSocket-Extensions: permessage-deflate\r\nSec-WebSocket-Protocol: json\r\n\r\n"
+            ),
+        ),
+        async {
+            guest.write_all(request.as_bytes()).await.unwrap();
+            read_head(&mut guest).await
+        },
+    );
+    assert_eq!(
+        seen.lines().next(),
+        Some("GET /p32/ws/user/u1?ws=1 HTTP/1.1")
+    );
+    let mut seen = header_lines(&seen);
+    seen.sort();
+    let mut expected = vec![
+        "connection: upgrade".to_owned(),
+        format!("host: localhost:{port}"),
+        "origin: https://chatgpt.com".to_owned(),
+        "sec-websocket-extensions: permessage-deflate; client_max_window_bits".to_owned(),
+        "sec-websocket-key: dghlihnhbxbszsbub25jzq==".to_owned(),
+        "sec-websocket-protocol: json".to_owned(),
+        "sec-websocket-version: 13".to_owned(),
+        "upgrade: websocket".to_owned(),
+        String::new(),
+    ];
+    expected.sort();
+    assert_eq!(seen, expected);
+    assert!(switched.starts_with("HTTP/1.1 101 Switching Protocols\r\n"));
+    let switched = header_lines(&switched);
+    for line in [
+        "upgrade: websocket",
+        "connection: upgrade",
+        "sec-websocket-accept: s3pplmbitxaq9kygzzhzrbk+xoo=",
+        "sec-websocket-extensions: permessage-deflate",
+        "sec-websocket-protocol: json",
+    ] {
+        assert!(
+            switched.iter().any(|seen| seen == line),
+            "{line}: {switched:?}"
+        );
+    }
+    assert!(
+        !switched
+            .iter()
+            .any(|line| line.starts_with("content-length") || line.starts_with("transfer-encoding"))
+    );
+    assert_no_second_connection(&listener).await;
+    drop((guest, upstream));
+    let _spans = proxy.finish().await;
+}
+#[tokio::test]
+async fn websocket_bytes_pass_unchanged_both_ways_with_read_ahead_half_close_and_one_upgraded_record()
+ {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let proxy = Proxy::configured(RootCertStore::empty(), local_egress_for_port(port)).await;
+    let mut guest = TcpStream::connect(proxy.addr).await.unwrap();
+    let request = upgrade_request(
+        &format!("http://localhost:{port}/"),
+        &format!("localhost:{port}"),
+        "",
+    );
+    let ((_, mut upstream), switched) = tokio::join!(
+        accept_upgrade(&listener, None, format!("{SWITCHED}\r\nearly-upstream")),
+        async {
+            guest
+                .write_all(format!("{request}early-guest").as_bytes())
+                .await
+                .unwrap();
+            read_head(&mut guest).await
+        },
+    );
+    assert!(switched.starts_with("HTTP/1.1 101 "));
+    let mut early = [0; 11];
+    upstream.read_exact(&mut early).await.unwrap();
+    assert_eq!(&early, b"early-guest");
+    let mut early = [0; 14];
+    guest.read_exact(&mut early).await.unwrap();
+    assert_eq!(&early, b"early-upstream");
+    let outbound: Vec<u8> = (0..1 << 20).map(|i: u32| (i % 251) as u8).collect();
+    let inbound: Vec<u8> = (0..1 << 20).map(|i: u32| (i % 241) as u8 ^ 0xa5).collect();
+    let (mut guest_read, mut guest_write) = guest.into_split();
+    let (mut upstream_read, mut upstream_write) = tokio::io::split(upstream);
+    let (_, _, from_guest, from_upstream) = tokio::join!(
+        async { guest_write.write_all(&outbound).await.unwrap() },
+        async { upstream_write.write_all(&inbound).await.unwrap() },
+        async {
+            let mut received = vec![0; outbound.len()];
+            upstream_read.read_exact(&mut received).await.unwrap();
+            received
+        },
+        async {
+            let mut received = vec![0; inbound.len()];
+            guest_read.read_exact(&mut received).await.unwrap();
+            received
+        },
+    );
+    assert!(from_guest == outbound);
+    assert!(from_upstream == inbound);
+    guest_write.shutdown().await.unwrap();
+    assert_eq!(upstream_read.read(&mut [0; 1]).await.unwrap(), 0);
+    upstream_write.write_all(b"after-half-close").await.unwrap();
+    upstream_write.shutdown().await.unwrap();
+    let mut tail = Vec::new();
+    guest_read.read_to_end(&mut tail).await.unwrap();
+    assert_eq!(tail, b"after-half-close");
+    drop((upstream_read, upstream_write, guest_read, guest_write));
+    let (spans, logs) = proxy.finish_with_logs().await;
+    let requests: Vec<_> = spans
+        .iter()
+        .filter(|span| span.name == "egress.request")
+        .collect();
+    assert_eq!(requests.len(), 1);
+    let request = requests[0];
+    assert!(attribute(request, "egress.exchange.outcome", "upgraded"));
+    assert!(attribute(request, "egress.decision", "allowed"));
+    assert_eq!(
+        span_attribute(request, "http.response.status_code"),
+        Some(&101_i64.into())
+    );
+    let sent = 11 + (1_i64 << 20);
+    let received = 14 + (1_i64 << 20) + 16;
+    assert_eq!(
+        span_attribute(request, "http.request.body.size"),
+        Some(&sent.into())
+    );
+    assert_eq!(
+        span_attribute(request, "http.response.body.size"),
+        Some(&received.into())
+    );
+    assert!(
+        logs.iter()
+            .all(|log| log.record.event_name() != Some("egress.exchange.failed"))
+    );
+    let rollup = logs
+        .iter()
+        .find(|log| log.record.event_name() == Some("egress.exchange.rollup"))
+        .unwrap();
+    assert_eq!(log_int(rollup, "egress.exchange.count"), Some(1));
+    assert_eq!(log_int(rollup, "egress.exchange.error.count"), Some(0));
+    assert_eq!(
+        log_int(rollup, "egress.exchange.client_error.count"),
+        Some(0)
+    );
+    assert_eq!(log_int(rollup, "http.request.body.size.sum"), Some(sent));
+    assert_eq!(
+        log_int(rollup, "http.response.body.size.sum"),
+        Some(received)
+    );
+}
+#[tokio::test]
+async fn refused_websocket_upgrade_returns_the_upstream_status_and_the_guest_connection_serves_the_next_request()
+ {
+    for status in [403_u16, 426] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let proxy = Proxy::configured(RootCertStore::empty(), local_egress_for_port(port)).await;
+        let peer = tokio::spawn(async move {
+            let (first, mut refused) = accept_upgrade(
+                &listener,
+                None,
+                format!(
+                    "HTTP/1.1 {status} No\r\nUpgrade: websocket\r\nContent-Length: 2\r\n\r\nno"
+                ),
+            )
+            .await;
+            assert!(header_lines(&first).contains(&"upgrade: websocket".to_owned()));
+            assert_eq!(refused.read(&mut [0; 1]).await.unwrap(), 0);
+            let (second, _) = accept_upgrade(
+                &listener,
+                None,
+                "HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nupstream",
+            )
+            .await;
+            assert_eq!(second.lines().next(), Some("GET /after HTTP/1.1"));
+            let second = header_lines(&second);
+            assert!(second.contains(&"connection: close".to_owned()));
+            assert!(!second.iter().any(|line| line.starts_with("upgrade")));
+            assert_no_second_connection(&listener).await;
+        });
+        let mut guest = TcpStream::connect(proxy.addr).await.unwrap();
+        guest
+            .write_all(
+                upgrade_request(
+                    &format!("http://localhost:{port}/ws"),
+                    &format!("localhost:{port}"),
+                    "",
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let refused = read_head(&mut guest).await;
+        assert!(
+            refused.starts_with(&format!("HTTP/1.1 {status} ")),
+            "{refused}"
+        );
+        assert!(
+            !header_lines(&refused)
+                .iter()
+                .any(|line| line.starts_with("upgrade"))
+        );
+        let mut body = [0; 2];
+        guest.read_exact(&mut body).await.unwrap();
+        assert_eq!(&body, b"no");
+        let (status, body) = exchange(
+            guest,
+            &format!("GET http://localhost:{port}/after HTTP/1.1\r\nHost: localhost:{port}\r\nConnection: close\r\n\r\n"),
+        )
+        .await;
+        assert_eq!((status, body.as_str()), (200, "upstream"));
+        peer.await.unwrap();
+        let _spans = proxy.finish().await;
+    }
+}
+#[tokio::test]
+async fn websocket_upgrade_to_a_denied_host_is_refused_without_connecting() {
+    let proxy = Proxy::new(RootCertStore::empty()).await;
+    let mut guest = TcpStream::connect(proxy.addr).await.unwrap();
+    guest
+        .write_all(upgrade_request("http://denied.invalid/ws", "denied.invalid", "").as_bytes())
+        .await
+        .unwrap();
+    assert!(read_head(&mut guest).await.starts_with("HTTP/1.1 403 "));
+    drop(guest);
+    let spans = proxy.finish().await;
+    let request = spans
+        .iter()
+        .find(|span| span.name == "egress.request")
+        .unwrap();
+    assert!(attribute(request, "egress.decision", "refused:not_allowed"));
+    assert!(spans.iter().all(|span| span.name != "egress.connect"));
+}
+#[tokio::test]
+async fn switching_protocols_to_a_non_websocket_request_or_protocol_is_a_bad_gateway() {
+    for (request, reply) in [
+        (
+            "GET {target} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n".to_owned(),
+            format!("{SWITCHED}\r\n"),
+        ),
+        (
+            upgrade_request("{target}", "{host}", ""),
+            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: h2c\r\nConnection: Upgrade\r\n\r\n"
+                .to_owned(),
+        ),
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let proxy = Proxy::configured(RootCertStore::empty(), local_egress_for_port(port)).await;
+        let request = request
+            .replace("{target}", &format!("http://localhost:{port}/ws"))
+            .replace("{host}", &format!("localhost:{port}"));
+        let mut guest = TcpStream::connect(proxy.addr).await.unwrap();
+        let (_, head) = tokio::join!(accept_upgrade(&listener, None, &reply), async {
+            guest.write_all(request.as_bytes()).await.unwrap();
+            read_head(&mut guest).await
+        });
+        assert!(head.starts_with("HTTP/1.1 502 "), "{head}");
+        drop(guest);
+        let spans = proxy.finish().await;
+        let request = spans
+            .iter()
+            .find(|span| span.name == "egress.request")
+            .unwrap();
+        assert!(attribute(
+            request,
+            "egress.exchange.outcome",
+            "upstream-failed"
+        ));
+    }
+}
+async fn spliced_socket_ends_on_timeout(
+    egress: Egress,
+    listener: TcpListener,
+    writes: &[u64],
+    quiet: u64,
+    last: u64,
+) -> SpanData {
+    let exporter = InMemorySpanExporter::default();
+    let provider = SdkTracerProvider::builder()
+        .with_simple_exporter(exporter.clone())
+        .build();
+    let _default = tracing::subscriber::set_default(
+        tracing_subscriber::registry()
+            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("splice-timeout"))),
+    );
+    let port = listener.local_addr().unwrap().port();
+    let engine = Engine {
+        ca: Ca::new().unwrap().0,
+        egress,
+        tls: client_config(RootCertStore::empty()).unwrap(),
+        omit: Default::default(),
+        rollups: Arc::new(Mutex::new(Rollups::new())),
+        models: None,
+    };
+    let (mut client, stream) = tokio::io::duplex(4096);
+    let mut record = ConnectionRecord::default();
+    let mut connection = Box::pin(engine.bounded_connection(
+        Box::new(stream),
+        &mut record,
+        Instant::now(),
+        gateway::Protocol::Http,
+    ));
+    client
+        .write_all(
+            upgrade_request(
+                &format!("http://localhost:{port}/ws"),
+                &format!("localhost:{port}"),
+                "",
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let (_, mut upstream) = tokio::select! {
+        ended = connection.as_mut() => panic!("connection ended before the upgrade: {ended:?}"),
+        accepted = accept_upgrade(&listener, None, format!("{SWITCHED}\r\n")) => accepted,
+    };
+    let switched = tokio::select! {
+        ended = connection.as_mut() => panic!("connection ended before the 101: {ended:?}"),
+        head = read_head(&mut client) => head,
+    };
+    assert!(switched.starts_with("HTTP/1.1 101 "));
+    tokio::time::pause();
+    poll_pending(connection.as_mut()).await;
+    for seconds in writes {
+        tokio::time::advance(Duration::from_secs(*seconds)).await;
+        client.write_all(b"x").await.unwrap();
+        poll_pending(connection.as_mut()).await;
+    }
+    if quiet > 0 {
+        tokio::time::advance(Duration::from_secs(quiet)).await;
+        poll_pending(connection.as_mut()).await;
+    }
+    tokio::time::advance(Duration::from_secs(last)).await;
+    connection.await.unwrap();
+    assert_eq!(client.read(&mut [0; 1]).await.unwrap(), 0);
+    let mut forwarded = Vec::new();
+    upstream.read_to_end(&mut forwarded).await.unwrap();
+    assert_eq!(forwarded, vec![b'x'; writes.len()]);
+    provider.force_flush().unwrap();
+    let request = exporter
+        .get_finished_spans()
+        .unwrap()
+        .into_iter()
+        .find(|span| span.name == "egress.request")
+        .unwrap();
+    assert!(attribute(&request, "egress.exchange.outcome", "upgraded"));
+    assert_eq!(
+        span_attribute(&request, "http.request.body.size"),
+        Some(&i64::try_from(writes.len()).unwrap().into())
+    );
+    request
+}
+#[tokio::test]
+async fn idle_spliced_socket_ends_as_one_upgraded_exchange_after_inactivity() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    spliced_socket_ends_on_timeout(local_egress_for_port(port), listener, &[80], 80, 10).await;
+}
+#[tokio::test]
+async fn active_spliced_socket_ends_as_one_upgraded_exchange_at_its_maximum_lifetime() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let mut egress = local_egress_for_port(port);
+    egress.max_connection_seconds = 180.try_into().unwrap();
+    spliced_socket_ends_on_timeout(egress, listener, &[80, 80], 0, 20).await;
+}
+#[tokio::test]
+async fn websocket_handshake_values_reach_the_upstream_but_never_spans_or_logs_at_full_detail() {
+    use std::io::{Read, Seek};
+    let verify = uuid::Uuid::new_v4().simple().to_string();
+    let offered = uuid::Uuid::new_v4().simple().to_string();
+    let chosen = uuid::Uuid::new_v4().simple().to_string();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let proxy = Proxy::configured(RootCertStore::empty(), local_egress_for_port(port)).await;
+    let mut logs = proxy.logs.try_clone().unwrap();
+    let mut guest = TcpStream::connect(proxy.addr).await.unwrap();
+    let request = upgrade_request(
+        &format!("http://localhost:{port}/p32/ws/user/u1?verify={verify}"),
+        &format!("localhost:{port}"),
+        &format!("Sec-WebSocket-Protocol: {offered}, json\r\n"),
+    );
+    let ((seen, upstream), switched) = tokio::join!(
+        accept_upgrade(
+            &listener,
+            None,
+            format!("{SWITCHED}Sec-WebSocket-Protocol: {chosen}\r\n\r\n"),
+        ),
+        async {
+            guest.write_all(request.as_bytes()).await.unwrap();
+            read_head(&mut guest).await
+        },
+    );
+    assert_eq!(
+        seen.lines().next(),
+        Some(format!("GET /p32/ws/user/u1?verify={verify} HTTP/1.1").as_str())
+    );
+    assert!(header_lines(&seen).contains(&format!("sec-websocket-protocol: {offered}, json")));
+    assert!(header_lines(&switched).contains(&format!("sec-websocket-protocol: {chosen}")));
+    drop((guest, upstream));
+    let (spans, exported) = proxy.finish_with_logs().await;
+    let request = spans
+        .iter()
+        .find(|span| span.name == "egress.request")
+        .unwrap();
+    assert_eq!(
+        span_attribute(request, "url.query.keys")
+            .unwrap()
+            .to_string(),
+        r#"["verify"]"#
+    );
+    for key in ["http.request.header.names", "http.response.header.names"] {
+        assert!(
+            span_attribute(request, key)
+                .unwrap()
+                .to_string()
+                .contains("sec-websocket-protocol"),
+            "{key}"
+        );
+    }
+    logs.rewind().unwrap();
+    let mut text = String::new();
+    logs.read_to_string(&mut text).unwrap();
+    let recorded = format!("{spans:?}{exported:?}{text}");
+    for sentinel in [&verify, &offered, &chosen] {
+        assert!(!recorded.contains(sentinel.as_str()));
+    }
 }

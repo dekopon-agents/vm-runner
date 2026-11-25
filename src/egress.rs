@@ -133,6 +133,10 @@ impl Engine {
         self.models.is_some() && models::Route::addressed(host)
     }
 }
+enum Next {
+    Tunnel(Tunnel),
+    Splice(Spliced),
+}
 #[derive(Clone)]
 struct Tunnel {
     authority: hyper::http::uri::Authority,
@@ -174,7 +178,15 @@ pub(crate) fn cut(value: &str) -> String {
     format!("{}{MARKER}", &value[..end])
 }
 fn protocol_refusal(host: Option<&str>, rollups: &Arc<Mutex<Rollups>>) {
-    let exchange = Exchange::new(host.unwrap_or(""), None, "", "", &[], Arc::clone(rollups));
+    let exchange = Exchange::new(
+        host.unwrap_or(""),
+        None,
+        "",
+        "",
+        &hyper::HeaderMap::new(),
+        &[],
+        Arc::clone(rollups),
+    );
     let Recorded = exchange.finish(Outcome::ProtocolError, None);
 }
 fn reply(status: StatusCode, body: String) -> Response<HttpBody> {
@@ -323,6 +335,38 @@ fn strip(headers: &mut hyper::HeaderMap) {
     ] {
         headers.remove(name);
     }
+}
+fn has_token(headers: &hyper::HeaderMap, name: header::HeaderName, token: &str) -> bool {
+    headers
+        .get_all(name)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .any(|v| v.trim().eq_ignore_ascii_case(token))
+}
+fn websocket_upgrade<B>(req: &Request<B>) -> bool {
+    req.method() == hyper::Method::GET
+        && req.version() == hyper::Version::HTTP_11
+        && has_token(req.headers(), header::UPGRADE, "websocket")
+        && has_token(req.headers(), header::CONNECTION, "upgrade")
+}
+fn strip_keeping_upgrade(headers: &mut hyper::HeaderMap) {
+    let kept: Vec<_> = headers
+        .iter()
+        .filter(|(name, _)| *name == header::UPGRADE || name.as_str().starts_with("sec-websocket-"))
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect();
+    strip(headers);
+    for (name, _) in &kept {
+        headers.remove(name);
+    }
+    for (name, value) in kept {
+        headers.append(name, value);
+    }
+    headers.insert(
+        header::CONNECTION,
+        hyper::http::HeaderValue::from_static("Upgrade"),
+    );
 }
 fn strip_trailers(mut frame: Frame<Bytes>) -> Frame<Bytes> {
     if let Some(trailers) = frame.trailers_mut() {
@@ -510,8 +554,9 @@ impl Engine {
         &self,
         mut req: Request<Incoming>,
         uri: Uri,
+        upgrade: bool,
         exchange: &mut Exchange,
-    ) -> Result<Response<HttpBody>, Error> {
+    ) -> Result<(Response<HttpBody>, Option<Buffered>), Error> {
         let route = self
             .models
             .as_ref()
@@ -529,7 +574,15 @@ impl Engine {
             Some(route) => route.authority(),
             None => req.headers().get(header::HOST).ok_or(RefusalError)?.clone(),
         };
-        strip(req.headers_mut());
+        if upgrade {
+            strip_keeping_upgrade(req.headers_mut());
+        } else {
+            strip(req.headers_mut());
+            req.headers_mut().insert(
+                header::CONNECTION,
+                hyper::http::HeaderValue::from_static("close"),
+            );
+        }
         req.headers_mut().insert(header::HOST, host);
         if let Some(route) = route {
             // Only the jail asserts the subject; strip() already removed the guest's copies.
@@ -538,10 +591,6 @@ impl Engine {
             req.headers_mut()
                 .insert(models::SESSION_HEADER, route.session());
         }
-        req.headers_mut().insert(
-            header::CONNECTION,
-            hyper::http::HeaderValue::from_static("close"),
-        );
         *req.uri_mut() = uri.path_and_query().ok_or(RefusalError)?.as_str().parse()?;
         let mut done = false;
         exchange.phase(Phase::RequestBody);
@@ -566,22 +615,47 @@ impl Engine {
         };
         exchange.phase(Phase::ResponseBody);
         let (mut parts, incoming) = response.into_parts();
-        strip(&mut parts.headers);
-        Ok(Response::from_parts(
-            parts,
-            ForwardBody {
-                incoming,
-                driver,
-                done,
+        if parts.status == StatusCode::SWITCHING_PROTOCOLS {
+            if !upgrade || !has_token(&parts.headers, header::UPGRADE, "websocket") {
+                return Err(RefusalError.into());
             }
-            .boxed_unsync(),
+            if !done {
+                std::future::poll_fn(|cx| driver.poll_without_shutdown(cx)).await?;
+            }
+            let upstream = driver.into_parts();
+            strip_keeping_upgrade(&mut parts.headers);
+            return Ok((
+                Response::from_parts(
+                    parts,
+                    Full::new(Bytes::new())
+                        .map_err(|never: Infallible| match never {})
+                        .boxed_unsync(),
+                ),
+                Some(Buffered {
+                    prefix: upstream.read_buf,
+                    stream: upstream.io.into_inner(),
+                }),
+            ));
+        }
+        strip(&mut parts.headers);
+        Ok((
+            Response::from_parts(
+                parts,
+                ForwardBody {
+                    incoming,
+                    driver,
+                    done,
+                }
+                .boxed_unsync(),
+            ),
+            None,
         ))
     }
     async fn request(
         &self,
         req: Request<Incoming>,
         tunnel: Option<&Tunnel>,
-        upgrade: &Mutex<Option<Tunnel>>,
+        next: &Mutex<Option<Next>>,
         recorded: &Cell<bool>,
     ) -> Result<Response<HttpBody>, Infallible> {
         recorded.set(true);
@@ -621,11 +695,13 @@ impl Engine {
             port,
             req.method().as_str(),
             &url,
+            req.headers(),
             &self.omit.query_keys,
             Arc::clone(&self.rollups),
         );
         exchange.headers(req.headers(), HeaderSide::Request, &self.omit.headers);
         let head = req.method() == hyper::Method::HEAD;
+        let mut spliced = None;
         let decision = destination(&req, tunnel, |host, scheme, port| {
             allowed_destination(host, scheme, port, &self.egress.allow) || self.routes_models(host)
         });
@@ -638,11 +714,13 @@ impl Engine {
                     None,
                 )
             }
-            Ok(uri) if req.method() == hyper::Method::CONNECT => match upgrade.lock() {
+            Ok(uri) if req.method() == hyper::Method::CONNECT => match next.lock() {
                 Ok(mut slot) => {
-                    *slot = uri.authority().cloned().map(|authority| Tunnel {
-                        authority,
-                        sni: None,
+                    *slot = uri.authority().cloned().map(|authority| {
+                        Next::Tunnel(Tunnel {
+                            authority,
+                            sni: None,
+                        })
                     });
                     (reply(StatusCode::OK, String::new()), Outcome::Tunnel, None)
                 }
@@ -659,12 +737,16 @@ impl Engine {
             },
             Ok(uri) => {
                 let current = exchange.span();
+                let upgrade = websocket_upgrade(&req) && !self.routes_models(&host);
                 match self
-                    .forward(req, uri, &mut exchange)
+                    .forward(req, uri, upgrade, &mut exchange)
                     .instrument(current)
                     .await
                 {
-                    Ok(response) => (response, Outcome::Completed, None),
+                    Ok((response, upstream)) => {
+                        spliced = upstream;
+                        (response, Outcome::Completed, None)
+                    }
                     Err(error) if error.is::<AddressRefused>() || error.is::<DnsFailed>() => {
                         let reason = if error.is::<DnsFailed>() {
                             Refusal::Dns
@@ -693,6 +775,19 @@ impl Engine {
         exchange.status(response.status());
         exchange.headers(response.headers(), HeaderSide::Response, &self.omit.headers);
         exchange.phase(Phase::ResponseBody);
+        if let Some(upstream) = spliced {
+            let Ok(mut slot) = next.lock() else {
+                let Recorded = exchange.finish(Outcome::ProtocolError, None);
+                return Ok(reply(StatusCode::INTERNAL_SERVER_ERROR, String::new()));
+            };
+            *slot = Some(Next::Splice(Spliced {
+                upstream,
+                exchange,
+                sent: 0,
+                received: 0,
+            }));
+            return Ok(response);
+        }
         let (parts, body) = response.into_parts();
         if head || body.is_end_stream() {
             let Recorded = exchange.finish(outcome, error.as_deref());
@@ -743,6 +838,7 @@ impl Engine {
                                 Some(443),
                                 "",
                                 "https://",
+                                &hyper::HeaderMap::new(),
                                 &self.omit.query_keys,
                                 Arc::clone(&self.rollups),
                             );
@@ -761,9 +857,9 @@ impl Engine {
                 Ok(Classified::Closed) => return Ok(()),
                 Err(error) => return Err(error),
             };
-            let upgrade = Mutex::new(None);
+            let next = Mutex::new(None);
             let service =
-                service_fn(|req| self.request(req, tunnel.as_ref(), &upgrade, &record.request));
+                service_fn(|req| self.request(req, tunnel.as_ref(), &next, &record.request));
             let parts = hyper::server::conn::http1::Builder::new()
                 .serve_connection(TokioIo::new(stream), service)
                 .without_shutdown()
@@ -776,10 +872,21 @@ impl Engine {
                 prefix: parts.read_buf,
                 stream: parts.io.into_inner(),
             });
-            let next = upgrade.into_inner()?;
-            let Some(next) = next else {
-                stream.shutdown().await?;
-                return Ok(());
+            let next = match next.into_inner().map_err(|error| error.to_string())? {
+                Some(Next::Tunnel(next)) => next,
+                Some(Next::Splice(mut upstream)) => {
+                    record.spliced = true;
+                    #[expect(
+                        clippy::let_underscore_must_use,
+                        reason = "a socket ending after the 101 is the exchange's normal ending; Spliced records it on drop"
+                    )]
+                    let _ = tokio::io::copy_bidirectional(&mut stream, &mut upstream).await;
+                    return Ok(());
+                }
+                None => {
+                    stream.shutdown().await?;
+                    return Ok(());
+                }
             };
             record.host = Some(next.authority.host().to_owned());
             // CONNECT's envelope is complete; the inner byte stream has its own gate.
@@ -811,7 +918,7 @@ impl Engine {
                 }
             }
         };
-        tokio::select! {
+        let result = tokio::select! {
             biased;
             _ = tokio::time::sleep_until(started + lifetime) => Err(ConnectionTimeout::Lifetime.into()),
             _ = idle_timeout => Err(ConnectionTimeout::Idle.into()),
@@ -821,7 +928,8 @@ impl Engine {
                     gateway::Protocol::Dns(address) => gateway::tcp(self, stream, address).await,
                 }
             } => result,
-        }
+        };
+        if record.spliced { Ok(()) } else { result }
     }
     async fn serve(
         self: Arc<Self>,
@@ -1095,6 +1203,7 @@ struct ConnectionRecord {
     host: Option<String>,
     // HTTP/1 requests and this connection's classifier are driven by one worker.
     request: Cell<bool>,
+    spliced: bool,
 }
 impl ConnectionRecord {
     fn failed(&self, rollups: &Arc<Mutex<Rollups>>) {
@@ -1135,6 +1244,49 @@ impl AsyncWrite for Buffered {
     }
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.stream).poll_shutdown(cx)
+    }
+}
+struct Spliced {
+    upstream: Buffered,
+    exchange: Exchange,
+    sent: u64,
+    received: u64,
+}
+impl AsyncRead for Spliced {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let polled = Pin::new(&mut self.upstream).poll_read(cx, buf);
+        let read = (buf.filled().len() - before) as u64;
+        self.received = self.received.saturating_add(read);
+        polled
+    }
+}
+impl AsyncWrite for Spliced {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let polled = Pin::new(&mut self.upstream).poll_write(cx, buf);
+        if let Poll::Ready(Ok(written)) = polled {
+            self.sent = self.sent.saturating_add(written as u64);
+        }
+        polled
+    }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.upstream).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.upstream).poll_shutdown(cx)
+    }
+}
+impl Drop for Spliced {
+    fn drop(&mut self) {
+        let Recorded = self.exchange.spliced(self.sent, self.received);
     }
 }
 #[derive(Debug, thiserror::Error)]

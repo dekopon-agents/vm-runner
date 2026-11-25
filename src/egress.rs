@@ -884,7 +884,10 @@ impl Engine {
                 prefix: parts.read_buf,
                 stream: parts.io.into_inner(),
             });
-            let next = match next.into_inner().map_err(|error| error.to_string())? {
+            let next = match next
+                .into_inner()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+            {
                 Some(Next::Tunnel(next)) => next,
                 Some(Next::Splice(mut upstream)) => {
                     record.spliced = true;

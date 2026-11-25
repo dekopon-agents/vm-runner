@@ -133,6 +133,11 @@ impl Engine {
         self.models.is_some() && models::Route::addressed(host)
     }
 }
+#[derive(Clone, Copy)]
+enum Forwarding {
+    Close,
+    Upgrade,
+}
 enum Next {
     Tunnel(Tunnel),
     Splice(Spliced),
@@ -554,7 +559,7 @@ impl Engine {
         &self,
         mut req: Request<Incoming>,
         uri: Uri,
-        upgrade: bool,
+        forwarding: Forwarding,
         exchange: &mut Exchange,
     ) -> Result<(Response<HttpBody>, Option<Buffered>), Error> {
         let route = self
@@ -574,14 +579,15 @@ impl Engine {
             Some(route) => route.authority(),
             None => req.headers().get(header::HOST).ok_or(RefusalError)?.clone(),
         };
-        if upgrade {
-            strip_keeping_upgrade(req.headers_mut());
-        } else {
-            strip(req.headers_mut());
-            req.headers_mut().insert(
-                header::CONNECTION,
-                hyper::http::HeaderValue::from_static("close"),
-            );
+        match forwarding {
+            Forwarding::Upgrade => strip_keeping_upgrade(req.headers_mut()),
+            Forwarding::Close => {
+                strip(req.headers_mut());
+                req.headers_mut().insert(
+                    header::CONNECTION,
+                    hyper::http::HeaderValue::from_static("close"),
+                );
+            }
         }
         req.headers_mut().insert(header::HOST, host);
         if let Some(route) = route {
@@ -616,7 +622,9 @@ impl Engine {
         exchange.phase(Phase::ResponseBody);
         let (mut parts, incoming) = response.into_parts();
         if parts.status == StatusCode::SWITCHING_PROTOCOLS {
-            if !upgrade || !has_token(&parts.headers, header::UPGRADE, "websocket") {
+            if matches!(forwarding, Forwarding::Close)
+                || !has_token(&parts.headers, header::UPGRADE, "websocket")
+            {
                 return Err(RefusalError.into());
             }
             if !done {
@@ -737,9 +745,13 @@ impl Engine {
             },
             Ok(uri) => {
                 let current = exchange.span();
-                let upgrade = websocket_upgrade(&req) && !self.routes_models(&host);
+                let forwarding = if websocket_upgrade(&req) && !self.routes_models(&host) {
+                    Forwarding::Upgrade
+                } else {
+                    Forwarding::Close
+                };
                 match self
-                    .forward(req, uri, upgrade, &mut exchange)
+                    .forward(req, uri, forwarding, &mut exchange)
                     .instrument(current)
                     .await
                 {
@@ -929,7 +941,10 @@ impl Engine {
                 }
             } => result,
         };
-        if record.spliced { Ok(()) } else { result }
+        match result {
+            Err(error) if record.spliced && error.is::<ConnectionTimeout>() => Ok(()),
+            result => result,
+        }
     }
     async fn serve(
         self: Arc<Self>,

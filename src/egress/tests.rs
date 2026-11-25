@@ -1981,14 +1981,23 @@ async fn spliced_socket_ends_on_timeout(
     writes: &[u64],
     quiet: u64,
     last: u64,
-) -> SpanData {
+) {
     let exporter = InMemorySpanExporter::default();
     let provider = SdkTracerProvider::builder()
         .with_simple_exporter(exporter.clone())
         .build();
+    let log_exporter = InMemoryLogExporter::default();
+    let log_provider = SdkLoggerProvider::builder()
+        .with_simple_exporter(log_exporter.clone())
+        .build();
     let _default = tracing::subscriber::set_default(
         tracing_subscriber::registry()
-            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("splice-timeout"))),
+            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("splice-timeout")))
+            .with(
+                opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new(
+                    &log_provider,
+                ),
+            ),
     );
     let port = listener.local_addr().unwrap().port();
     let engine = Engine {
@@ -2045,18 +2054,30 @@ async fn spliced_socket_ends_on_timeout(
     upstream.read_to_end(&mut forwarded).await.unwrap();
     assert_eq!(forwarded, vec![b'x'; writes.len()]);
     provider.force_flush().unwrap();
-    let request = exporter
+    let requests: Vec<_> = exporter
         .get_finished_spans()
         .unwrap()
         .into_iter()
-        .find(|span| span.name == "egress.request")
-        .unwrap();
-    assert!(attribute(&request, "egress.exchange.outcome", "upgraded"));
+        .filter(|span| span.name == "egress.request")
+        .collect();
+    assert_eq!(requests.len(), 1);
+    assert!(attribute(
+        &requests[0],
+        "egress.exchange.outcome",
+        "upgraded"
+    ));
     assert_eq!(
-        span_attribute(&request, "http.request.body.size"),
+        span_attribute(&requests[0], "http.request.body.size"),
         Some(&i64::try_from(writes.len()).unwrap().into())
     );
-    request
+    let logs = log_exporter.get_emitted_logs().unwrap();
+    assert!(logs.iter().all(|log| {
+        log.record.event_name() != Some("egress.exchange.failed")
+            && log
+                .record
+                .severity_number()
+                .is_none_or(|severity| severity < opentelemetry::logs::Severity::Warn)
+    }));
 }
 #[tokio::test]
 async fn idle_spliced_socket_ends_as_one_upgraded_exchange_after_inactivity() {

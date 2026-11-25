@@ -89,7 +89,7 @@ async function ensureBrowser() {
   const child = spawn(process.env.BROWSE_CHROMIUM || chromium.executablePath(), [
     '--headless=new', '--no-sandbox', '--no-first-run', '--no-default-browser-check',
     '--disable-background-networking', '--disable-component-update', '--disable-sync',
-    '--disable-dev-shm-usage', '--password-store=basic', '--use-mock-keychain',
+    '--disable-dev-shm-usage', '--disable-blink-features=AutomationControlled',
     `--remote-debugging-port=${PORT}`, '--remote-debugging-address=127.0.0.1',
     `--user-data-dir=${PROFILE}`, '--lang=en-US', '--window-size=1280,900', 'about:blank',
   ], { detached: true, stdio: 'ignore' });

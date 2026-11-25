@@ -39,6 +39,7 @@ function exec(argv, expectedCode = 0) {
     assert.match(help, /\/artifacts\/NAME\.png/);
     assert.match(help, /browse shot NAME[^\n]+adds \.png unless \.png\/\.jpg\/\.jpeg \(case-insensitive\)/);
     await exec(['browse', 'open', page('Browse smoke')]);
+    assert.equal(await exec(['browse', 'eval', 'navigator.webdriver === false']), 'true\n');
     for (const [name, file, signature] of [
       ['staging-login', 'staging-login.png', '89504e470d0a1a0a'],
       ['release-1.2', 'release-1.2.png', '89504e470d0a1a0a'],

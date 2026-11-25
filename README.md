@@ -150,7 +150,15 @@ rotates the CA; its private key stays in memory. Upstream TLS uses WebPKI roots.
 
 HTTP/1.1 and TLS-in-CONNECT are inspected; unsupported protocols fail closed. Each inner Host
 must agree with CONNECT and TLS SNI, and every forwarded request loses W3C trace headers.
-There is no credential injection, HTTP/2 or WebSocket tunneling.
+There is no credential injection or HTTP/2. An HTTP/1.1 `GET` carrying `Upgrade: websocket` and a
+`Connection: upgrade` token keeps its `Upgrade`, `Connection` and `Sec-WebSocket-*` headers on
+the request and on the upstream's 101, under the same destination and allow-list checks; the
+model route never upgrades, and any other 101 is a 502. After a 101 the proxy splices the two
+sockets byte for byte. The accepted cost: bytes to an allow-listed origin after a 101 are
+uninspected, in every profile, with no config key to turn this off. The socket is one
+`egress.request` exchange whose outcome is `upgraded`, with the bytes each way in its body-size
+fields. Its URL query values and its request and 101 header values are recorded as `[redacted]`
+(`user_agent.original` and the content types stay as sent).
 After DNS resolution, every returned address must be global unicast before the proxy connects
 using those exact addresses. Profile `egress.allowPrivate` CIDRs are the only exceptions (empty
 by default); the origin allow-list still applies. Each entry must be `http://host[:port]` or
@@ -166,8 +174,9 @@ Successful client reads or writes reset the idle timeout, not the maximum lifeti
 Excess connections close immediately. One background worker coalesces their `refused:connections`
 `egress.refused` logs to at most one per second, with `egress.refused.count` giving the sockets
 refused since the previous log; export never blocks the accept loop. Egress exchanges finish when
-the response body ends; destination, DNS, connection and header/query noise totals are logged every
-60 seconds and at shutdown. The jail also reports named nftables drop-counter deltas. Shutdown stops
+the response body ends, or when an upgraded socket closes, idles out or reaches its maximum
+lifetime; destination, DNS, connection and header/query noise totals are logged every 60 seconds
+and at shutdown. The jail also reports named nftables drop-counter deltas. Shutdown stops
 accepting and drains the bounded workers and final counts before shutting down telemetry.
 
 ## Guest agent

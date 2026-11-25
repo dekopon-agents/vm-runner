@@ -37,6 +37,7 @@ pub(super) enum Outcome {
     ProtocolError,
     BodyError(Phase),
     Abandoned(Phase),
+    Upgraded,
 }
 impl Outcome {
     pub(super) const fn label(&self) -> &'static str {
@@ -49,6 +50,7 @@ impl Outcome {
             Self::ProtocolError => "protocol-error",
             Self::BodyError(_) => "body-error",
             Self::Abandoned(_) => "abandoned",
+            Self::Upgraded => "upgraded",
         }
     }
     fn phase(&self) -> Option<&'static str> {
@@ -59,7 +61,8 @@ impl Outcome {
             | Self::Refused(_)
             | Self::UpstreamFailed
             | Self::CertificateRejected
-            | Self::ProtocolError => None,
+            | Self::ProtocolError
+            | Self::Upgraded => None,
         }
     }
     fn decision(&self) -> &'static str {
@@ -71,7 +74,18 @@ impl Outcome {
             | Self::CertificateRejected
             | Self::ProtocolError
             | Self::BodyError(_)
-            | Self::Abandoned(_) => "allowed",
+            | Self::Abandoned(_)
+            | Self::Upgraded => "allowed",
+        }
+    }
+    const fn failed(&self) -> bool {
+        match self {
+            Self::Completed | Self::Tunnel | Self::Refused(_) | Self::Upgraded => false,
+            Self::UpstreamFailed
+            | Self::CertificateRejected
+            | Self::ProtocolError
+            | Self::BodyError(_)
+            | Self::Abandoned(_) => true,
         }
     }
 }
@@ -92,6 +106,7 @@ struct ExchangeData {
     response_head: BodyHead,
     request_text: bool,
     response_text: bool,
+    upgrade: bool,
     refused: Option<Refusal>,
     rollups: Arc<Mutex<Rollups>>,
 }
@@ -170,9 +185,11 @@ impl Exchange {
         port: Option<u16>,
         method: &str,
         url: &str,
+        headers: &hyper::HeaderMap,
         omit_query: &[OmitName],
         rollups: Arc<Mutex<Rollups>>,
     ) -> Self {
+        let upgrade = headers.contains_key(hyper::header::UPGRADE);
         let parsed = url::Url::parse(url)
             .ok()
             .filter(|url| matches!(url.scheme(), "http" | "https"));
@@ -216,7 +233,7 @@ impl Exchange {
                 if omitted(&key, omit_query) {
                     continue;
                 }
-                let value = if redact(&key) {
+                let value = if upgrade || redact(&key) {
                     "[redacted]".into()
                 } else {
                     value
@@ -239,6 +256,7 @@ impl Exchange {
                 response_head: BodyHead::new(),
                 request_text: false,
                 response_text: false,
+                upgrade,
                 refused: None,
                 rollups,
             }),
@@ -311,7 +329,7 @@ impl Exchange {
                 );
             }
             if full && !pairs.full() {
-                let value = if redact(name) {
+                let value = if data.upgrade || redact(name) {
                     "[redacted]".into()
                 } else {
                     cut_text(&String::from_utf8_lossy(value.as_bytes()))
@@ -358,6 +376,16 @@ impl Exchange {
                 egress.refused.count = 1_i64,
             }, "egress.refused");
         }
+    }
+    pub(super) fn spliced(&mut self, sent: u64, received: u64) -> Recorded {
+        if let Some(mut data) = self.data.take() {
+            if let Ok(mut measured) = data.request.lock() {
+                measured.bytes = measured.bytes.saturating_add(sent);
+            }
+            data.response_bytes = data.response_bytes.saturating_add(received);
+            record(data, Outcome::Upgraded, None);
+        }
+        Recorded
     }
     pub(super) fn finish(mut self, outcome: Outcome, error: Option<&str>) -> Recorded {
         if let Outcome::Refused(reason) = outcome {
@@ -426,12 +454,14 @@ fn record(data: ExchangeData, outcome: Outcome, error: Option<&str>) {
     }
     let failed = match outcome {
         Outcome::Completed => status.is_some_and(|status| status >= 400),
-        Outcome::Tunnel | Outcome::Refused(_) => false,
-        Outcome::UpstreamFailed
+        Outcome::Tunnel
+        | Outcome::Refused(_)
+        | Outcome::UpstreamFailed
         | Outcome::CertificateRejected
         | Outcome::ProtocolError
         | Outcome::BodyError(_)
-        | Outcome::Abandoned(_) => true,
+        | Outcome::Abandoned(_)
+        | Outcome::Upgraded => outcome.failed(),
     };
     if failed {
         let error = error.map(cut_text);
@@ -580,12 +610,7 @@ impl Rollups {
         let status = data.status.map(|status| status.as_u16());
         row.client_errors += u64::from(status.is_some_and(|status| (400..500).contains(&status)));
         row.server_errors += u64::from(status.is_some_and(|status| status >= 500));
-        row.errors += u64::from(
-            !matches!(
-                outcome,
-                Outcome::Completed | Outcome::Tunnel | Outcome::Refused(_)
-            ) || status.is_some_and(|status| status >= 400),
-        );
+        row.errors += u64::from(outcome.failed() || status.is_some_and(|status| status >= 400));
         row.request_bytes = row
             .request_bytes
             .saturating_add(data.request.lock().map_or(0, |measure| measure.bytes));

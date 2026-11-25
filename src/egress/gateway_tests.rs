@@ -1096,3 +1096,40 @@ fn models_upstream_is_an_https_origin_and_subject_is_namespace_name() {
         assert!(models::subject(invalid).is_err(), "{invalid}");
     }
 }
+#[tokio::test]
+async fn websocket_upgrade_to_the_models_route_is_forwarded_as_a_closing_request() {
+    let pki = ModelPki::new();
+    let dir = tempfile::tempdir().unwrap();
+    let _client = pki.client(dir.path());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let peer = tokio::spawn(model_upstream(listener, pki.server(), 1));
+    let route = models::Route::new(
+        &format!("https://localhost:{port}"),
+        "dekopon:gylmar-vm",
+        "019591f2-439b-7000-8000-000000000001",
+        dir.path().to_owned(),
+    )
+    .unwrap();
+    let gateway = Gateway::with_models(
+        local_egress(),
+        [IpAddr::V4(Ipv4Addr::LOCALHOST)].into(),
+        Some(route),
+    )
+    .await;
+    let stream = TcpStream::connect(gateway.proxy.addr).await.unwrap();
+    assert_eq!(
+        exchange(
+            stream,
+            "GET /v1/realtime HTTP/1.1\r\nHost: models.vm.internal\r\nUpgrade: websocket\r\nConnection: close, Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+        )
+        .await,
+        (200, "model".into())
+    );
+    let received = peer.await.unwrap();
+    assert_eq!(received.len(), 1);
+    assert_eq!(received[0].path, "/v1/realtime");
+    assert_eq!(received[0].headers[header::CONNECTION], "close");
+    assert!(!received[0].headers.contains_key(header::UPGRADE));
+    let _spans = gateway.proxy.finish().await;
+}
